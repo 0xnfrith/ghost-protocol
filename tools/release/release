@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# release: cuts a release tag. A dry run unless --apply is given.
+#
+#   release [--apply] [--commit <sha>] [--remote <name>] [--branch <name>] [--repo <owner/name>] [<tag>]
+#
+# Run it from a clone of the repository that is released (the public copy, for a public release). It
+#   1. fetches <branch> (default main) and the tags from <remote> (default origin) and takes the commit to release: the tip of
+#      <branch>, or --commit, which must be in <branch>'s history;
+#   2. reads the version in .claude-plugin/plugin.json at that commit, and checks that the tag is v<version> (<tag> defaults to
+#      that); a tag that differs from the version is refused;
+#   3. checks that the tag is new, on <remote> and here (a tag is never moved or deleted), and that its version is higher than
+#      every existing v* tag's (semantic-version order, a pre-release below its release);
+#   4. checks that the commit is green on GitHub: every check in .github/required-checks (as it is at that commit) has completed
+#      with success, from the app the list names, and no other check run on the commit has failed or is still running;
+#   5. prints the plan. With --apply it then makes an annotated tag on that commit and pushes it, plainly (never a force). The
+#      release workflow runs on that tag. This script is the only thing that cuts one.
+#
+# GitHub is read with gh (GH_HOST, GH_TOKEN as gh takes them); <owner/name> comes from <remote>'s address unless --repo is given.
+# Needs git, gh and jq. Exit 0: the plan holds (and was applied). Exit 2: refused, with the reason.
+set -euo pipefail
+
+die() { echo "release: $*" >&2; exit 2; }
+
+apply=false
+commit=""
+remote=origin
+branch=main
+repo=""
+tag=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --apply) apply=true; shift ;;
+    --commit) [ $# -ge 2 ] || die "--commit needs a value"; commit=$2; shift 2 ;;
+    --remote) [ $# -ge 2 ] || die "--remote needs a value"; remote=$2; shift 2 ;;
+    --branch) [ $# -ge 2 ] || die "--branch needs a value"; branch=$2; shift 2 ;;
+    --repo) [ $# -ge 2 ] || die "--repo needs a value"; repo=$2; shift 2 ;;
+    -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$tag" ] || die "one tag only"; tag=$1; shift ;;
+  esac
+done
+for tool in git gh jq; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"; done
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+case $remote in '' | -*) die "bad remote name" ;; esac
+case $branch in '' | -* | *[!A-Za-z0-9._/-]*) die "bad branch name" ;; esac
+url=$(git remote get-url "$remote" 2>/dev/null) || die "no remote named $remote"
+
+if [ -z "$repo" ]; then
+  u=${url%/}
+  u=${u%.git}
+  name=${u##*/}
+  rest=${u%/*}
+  owner=${rest##*[:/]}
+  repo=$owner/$name
+fi
+[[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]] || die "cannot tell the GitHub repository (owner/name) from $remote; give --repo"
+
+# 1. The commit.
+git fetch --quiet --tags --no-recurse-submodules "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch" \
+  || die "cannot fetch $branch from $remote"
+tip=$(git rev-parse --verify "refs/remotes/$remote/$branch^{commit}")
+if [ -z "$commit" ]; then
+  commit=$tip
+else
+  commit=$(git rev-parse --verify --quiet "$commit^{commit}") || die "no commit $commit"
+  git merge-base --is-ancestor "$commit" "$tip" || die "$commit is not in the history of $remote/$branch"
+fi
+
+# 2. The version and the tag.
+git cat-file -e "$commit:.claude-plugin/plugin.json" 2>/dev/null || die "$commit has no .claude-plugin/plugin.json"
+version=$(git show "$commit:.claude-plugin/plugin.json" | jq -er '.version') || die "plugin.json at $commit has no version"
+semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'
+[[ $version =~ ^$semver$ ]] || die "the version in plugin.json ('$version') is not x.y.z or x.y.z-pre"
+[ -n "$tag" ] || tag=v$version
+[[ $tag =~ ^v$semver$ ]] || die "the tag '$tag' is not v<x.y.z> or v<x.y.z>-<pre-release>"
+[ "$tag" = "v$version" ] || die "the tag $tag is not plugin.json's version at that commit (v$version); change the tag or the version"
+
+# 3. A new tag, and a higher one.
+remote_tag=$(git ls-remote --tags "$remote" "refs/tags/$tag") || die "cannot read the tags of $remote"
+[ -z "$remote_tag" ] || die "the tag $tag already exists on $remote; a tag is never moved"
+if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then die "the tag $tag already exists here; a tag is never moved"; fi
+
+# semver_cmp a b: prints -1, 0 or 1 (versions without the leading v).
+semver_cmp() {
+  local a=$1 b=$2 ca cb pa pb i x y
+  ca=${a%%-*}; cb=${b%%-*}
+  pa=""; pb=""
+  [ "$a" = "$ca" ] || pa=${a#*-}
+  [ "$b" = "$cb" ] || pb=${b#*-}
+  local -a na nb ia ib
+  IFS=. read -r -a na <<<"$ca"
+  IFS=. read -r -a nb <<<"$cb"
+  for i in 0 1 2; do
+    x=${na[$i]}; y=${nb[$i]}
+    if ((10#$x > 10#$y)); then echo 1; return; fi
+    if ((10#$x < 10#$y)); then echo -1; return; fi
+  done
+  if [ -z "$pa" ] && [ -z "$pb" ]; then echo 0; return; fi
+  if [ -z "$pa" ]; then echo 1; return; fi # a release is above its pre-releases
+  if [ -z "$pb" ]; then echo -1; return; fi
+  IFS=. read -r -a ia <<<"$pa"
+  IFS=. read -r -a ib <<<"$pb"
+  for ((i = 0; i < ${#ia[@]} && i < ${#ib[@]}; i++)); do
+    x=${ia[$i]}; y=${ib[$i]}
+    [ "$x" = "$y" ] && continue
+    if [[ $x =~ ^[0-9]+$ ]] && [[ $y =~ ^[0-9]+$ ]]; then
+      if ((10#$x > 10#$y)); then echo 1; else echo -1; fi
+    elif [[ $x =~ ^[0-9]+$ ]]; then echo -1 # numbers sort below words
+    elif [[ $y =~ ^[0-9]+$ ]]; then echo 1
+    elif [[ $x > $y ]]; then echo 1
+    else echo -1
+    fi
+    return
+  done
+  if [ ${#ia[@]} -gt ${#ib[@]} ]; then echo 1; elif [ ${#ia[@]} -lt ${#ib[@]} ]; then echo -1; else echo 0; fi
+}
+highest=""
+while IFS= read -r t; do
+  [[ $t =~ ^v$semver$ ]] || continue
+  if [ -z "$highest" ] || [ "$(semver_cmp "${t#v}" "${highest#v}")" = 1 ]; then highest=$t; fi
+done < <({ git tag --list 'v[0-9]*'; git ls-remote --tags --refs "$remote" 'refs/tags/v[0-9]*' | sed 's#.*refs/tags/##'; })
+if [ -n "$highest" ] && [ "$(semver_cmp "$version" "${highest#v}")" != 1 ]; then
+  die "$tag is not higher than the existing tag $highest"
+fi
+
+# 4. Green.
+git cat-file -e "$commit:.github/required-checks" 2>/dev/null \
+  || die "$commit has no .github/required-checks: there is no way to tell what green means"
+required=$(git show "$commit:.github/required-checks" | sed 's/#.*//' | awk 'NF >= 2 { print $1 "\t" $2 }')
+[ -n "$required" ] || die ".github/required-checks at $commit lists no check"
+runs=$(gh api --paginate "repos/$repo/commits/$commit/check-runs?per_page=100" 2>/dev/null | jq -s '[.[] | (.check_runs // [])[]]') \
+  || die "cannot read the checks of $commit on GitHub ($repo)"
+green_report=""
+bad=0
+while IFS=$'\t' read -r app name; do
+  state=$(jq -r --arg app "$app" --arg name "$name" \
+    '[.[] | select(.name == $name and ((.app.id | tostring) == $app))] | if length == 0 then "not reported" else (.[0] | if .status != "completed" then "not finished (" + .status + ")" elif .conclusion == "success" then "success" else "failed (" + (.conclusion // "?") + ")" end) end' <<<"$runs")
+  green_report+="  required: $name  $state"$'\n'
+  [ "$state" = success ] || bad=$((bad + 1))
+done <<<"$required"
+others=$(jq -r '.[] | select(.status != "completed" or (.conclusion | IN("success", "neutral", "skipped") | not)) | "  not green: " + .name + "  " + (if .status != "completed" then "not finished (" + .status + ")" else "failed (" + (.conclusion // "?") + ")" end)' <<<"$runs")
+if [ -n "$others" ]; then bad=$((bad + $(wc -l <<<"$others"))); fi
+
+# 5. The plan.
+short=$(git rev-parse --short "$commit")
+echo "release: $tag from $remote/$branch ($repo)"
+echo "  commit:   $short $(git log -1 --format=%s "$commit")"
+echo "  version:  $version (plugin.json at that commit)"
+echo "  highest tag so far: ${highest:-none}"
+printf '%s' "$green_report"
+if [ -n "$others" ]; then printf '%s\n' "$others"; fi
+if [ "$commit" != "$tip" ]; then echo "  note:     $short is not the tip of $remote/$branch ($(git rev-parse --short "$tip"))"; fi
+[ "$bad" -eq 0 ] || die "$short is not green: nothing is tagged"
+echo "  would:    make the annotated tag $tag on $short and push it to $remote; the release workflow runs on the tag"
+if ! $apply; then echo "release: dry run, nothing tagged (--apply tags and pushes)"; exit 0; fi
+
+git var GIT_COMMITTER_IDENT >/dev/null 2>&1 || die "git has no name and email to tag with (user.name and user.email)"
+git tag -a "$tag" -m "Release $tag" "$commit"
+if ! git push --quiet "$remote" "refs/tags/$tag"; then
+  git tag -d "$tag" >/dev/null
+  die "the push of $tag was refused; the local tag was removed, and nothing was forced"
+fi
+echo "release: pushed $tag to $remote"

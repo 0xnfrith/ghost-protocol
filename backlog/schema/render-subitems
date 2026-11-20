@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+// render-subitems: the `## SUB_ITEMS` renderer's command line (usage in render-subitems.mjs).
+import { main } from "./render-subitems.mjs";
+
+process.exitCode = main(process.argv.slice(2));

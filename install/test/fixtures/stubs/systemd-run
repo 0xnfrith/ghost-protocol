@@ -1,0 +1,22 @@
+#!/bin/sh
+# Test stand-in for systemd-run, for start's credential check (a dry run). It
+# records the call and the argument count, then the credential it was asked to
+# load and the user it would run as ("systemd-run credential <id> user <user>").
+# It fails for each id listed in $STUB_STATE/systemd-run.bad (one per line), as
+# systemd does for a credential that does not decrypt.
+S="${STUB_STATE:?}"
+echo "systemd-run $#" >>"$S/calls"
+id="" user="" prev=""
+for a in "$@"; do
+    if [ "$prev" = "-p" ]; then
+        case "$a" in
+            LoadCredentialEncrypted=*) v="${a#LoadCredentialEncrypted=}"; id="${v%%:*}" ;;
+            User=*) user="${a#User=}" ;;
+        esac
+    fi
+    prev="$a"
+done
+echo "systemd-run credential $id user $user" >>"$S/calls"
+[ -n "$id" ] || exit 1
+if [ -f "$S/systemd-run.bad" ] && grep -qxF "$id" "$S/systemd-run.bad"; then exit 1; fi
+exit 0

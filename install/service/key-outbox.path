@@ -1,0 +1,20 @@
+# The outbox's path unit (gp-key-<name>-outbox.path) of the Ghost Protocol
+# instance @NAME@: the key service's copy step. install/keyservice/setup makes
+# it from install/service/key-outbox.path.
+#
+# buzz-mcp's path and files arguments read only @SRV@/files, a folder the
+# instance's own user cannot write (else it could swap a file there for a link
+# between buzz-mcp's check and its read). So a file the session wants to send
+# goes into its outbox, @SRV@/outbox, and this unit has the key's user move it
+# across (its service of the same name, gp-key-<name>-outbox.service). Write a
+# file under a name starting with a dot, then rename it: names starting with a
+# dot are never taken.
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the key service's outbox
+
+[Path]
+PathChanged=@SRV@/outbox
+
+[Install]
+WantedBy=paths.target

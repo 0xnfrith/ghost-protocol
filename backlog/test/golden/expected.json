@@ -1,0 +1,552 @@
+{
+ "records": {
+  "backlog/items/ALPHA-901-decision-open.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-902-decision-bad.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-902-decision-bad.md does not match the backlog schema:\n  - `status: open` requires null `decided`/`decided_on` \u2014 a decision that has been made is `decided`, not `open`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-903-decision-decided.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-903-decision-decided.md does not match the backlog schema:\n  - `status: decided` requires `decided_on` \u2014 the date the call was made (YYYY-MM-DD)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-908-decision-decided-ok.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-904-decision-noq.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-904-decision-noq.md does not match the backlog schema:\n  - missing required field `question`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-905-decision-active.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-905-decision-active.md does not match the backlog schema:\n  - status `active` is not valid here (allowed: open, decided, cancelled, moved)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-906-wake-unpaired.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-906-wake-unpaired.md does not match the backlog schema:\n  - `wake_when` requires `review_after` \u2014 the condition is free text nothing evaluates, so pair it with the date that wakes the record anyway\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-907-wake-paired.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-910-chore.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-911-chore-nodue.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-911-chore-nodue.md does not match the backlog schema:\n  - `status: active` on a chore requires `next_due` (YYYY-MM-DD) \u2014 a reader needs it to know when it is due\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-912-chore-badcad.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-912-chore-badcad.md does not match the backlog schema:\n  - `cadence: whenever` is not a recognised cadence \u2014 daily | weekly | monthly | quarterly | yearly | every N days/weeks/months | once\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-913-chore-paused.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-914-chore-every.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-920.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-921.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-922.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-922.md does not match the backlog schema:\n  - `status: idea` cannot carry `blocked_on`/`waiting_since`/`waiting_on` \u2014 an uncommitted idea waits on nothing\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-923.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-924.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-924.md is valid, with a non-blocking warning:\n  - `next_action` is 320 characters \u2014 keep it to one physical action and move the rest to `ACTIVITY_LOG` (advisory, threshold 300)\n"
+  },
+  "backlog/items/ALPHA-925.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-925.md is valid, with a non-blocking warning:\n  - `next_action` is 620 characters \u2014 keep it to one physical action and move the rest to `ACTIVITY_LOG` (advisory, threshold 600 for a record without `owner`; 300 once it carries one)\n"
+  },
+  "backlog/items/ALPHA-930-first.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-930-first.md is valid, with a non-blocking warning:\n  - `id: ALPHA-930` is also carried by ALPHA-930-second.md \u2014 two records share one id; renumber one (allocate a fresh id with the backlog's allocate-id tool) so references stay unambiguous (this is a warning, not a block)\n"
+  },
+  "backlog/items/ALPHA-930-second.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-930-second.md is valid, with a non-blocking warning:\n  - `id: ALPHA-930` is also carried by ALPHA-930-first.md \u2014 two records share one id; renumber one (allocate a fresh id with the backlog's allocate-id tool) so references stay unambiguous (this is a warning, not a block)\n"
+  },
+  "backlog/items/ALPHA-93.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-940.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-941.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-941.md does not match the backlog schema:\n  - `status: moved` requires `tracker_ref` \u2014 the tracker identifier the record was handed off to\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-942.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-942.md does not match the backlog schema:\n  - `tracker_ref` is only valid on a moved record (status here: `active`) \u2014 a record that still lives in the backlog points at the tracker with `external_ref`, not `tracker_ref`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-943.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-943.md does not match the backlog schema:\n  - `tracker_ref` is only valid on a moved record (status here: `completed`) \u2014 a record that still lives in the backlog points at the tracker with `external_ref`, not `tracker_ref`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-944.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-944.md does not match the backlog schema:\n  - `tracker_ref: https://tracker.example.com/issue/ABC-12` is not a tracker identifier \u2014 it must match `^[A-Za-z][A-Za-z0-9]*-\\d+$`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-945.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-946.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-947.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-948.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-949.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-949.md does not match the backlog schema:\n  - status `moved` is not valid here (allowed: idea, draft, active, blocked, completed, deferred, cancelled)\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`XYZ-6`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-950.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-950.md does not match the backlog schema:\n  - status `moved` is not valid here (allowed: active, paused, retired)\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`XYZ-7`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1060-next_action.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1060-next_action.md does not match the backlog schema:\n  - `status: moved` requires a null `next_action` \u2014 the record is frozen and its work lives in the tracker; null it\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1061-waiting_on.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1061-waiting_on.md does not match the backlog schema:\n  - `status: moved` requires a null `waiting_on` \u2014 the record is frozen and its work lives in the tracker; null it\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1062-blocked_on.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1062-blocked_on.md does not match the backlog schema:\n  - `status: moved` requires a null `blocked_on` \u2014 the record is frozen and its work lives in the tracker; null it\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1063-waiting_since.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1063-waiting_since.md does not match the backlog schema:\n  - `status: moved` requires a null `waiting_since` \u2014 the record is frozen and its work lives in the tracker; null it\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-952.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-953.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-953.md does not match the backlog schema:\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`ABC-12`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-954.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-954.md does not match the backlog schema:\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`ABC-12`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-955.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-956.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-956.md does not match the backlog schema:\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`ABC-12`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/arcs/ARC-901.md": {
+   "code": 2,
+   "stderr": "\u2717 ARC-901.md does not match the backlog schema:\n  - `tracker_ref` is only valid on a moved record (status here: `active`) \u2014 a record that still lives in the backlog points at the tracker with `external_ref`, not `tracker_ref`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/arcs/ARC-902.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/initiatives/INIT-901.md": {
+   "code": 2,
+   "stderr": "\u2717 INIT-901.md does not match the backlog schema:\n  - `tracker_ref` is only valid on a moved record (status here: `active`) \u2014 a record that still lives in the backlog points at the tracker with `external_ref`, not `tracker_ref`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-960.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-961.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-962.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/ARC-950-copy.md": {
+   "code": 2,
+   "stderr": "\u2717 ARC-950-copy.md does not match the backlog schema (judged as an arc from its id \u2014 the file is outside backlog/):\n  - missing `status`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/arcs/ARC-950.md": {
+   "code": 2,
+   "stderr": "\u2717 ARC-950.md does not match the backlog schema:\n  - missing `status`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "scratch/ARC-951.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-980.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/ALPHA-980-staged.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-980-staged.md does not match the backlog schema (judged as an item from its id \u2014 the file is outside backlog/):\n  - missing `type`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-981.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-981.md is valid, with a non-blocking warning:\n  - `parent: ALPHA-9999` points at an item that doesn't exist in items/ \u2014 check for a typo or a renumbered parent (this is a warning, not a block; the record is otherwise valid)\n"
+  },
+  "scratch/ALPHA-981.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/ALPHA-tmp-1a2b3c4d.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-tmp-1a2b3c4d.md does not match the backlog schema (judged as an item from its id \u2014 the file is outside backlog/):\n  - missing `status`\n  - missing required section `## DESCRIPTION`\n  - missing required section `## CURRENT_STATE`\n  - missing required section `## REQUIREMENTS`\n  - missing required section `## DOD`\n  - missing required section `## UAT`\n  - missing required section `## DEPLOYMENT`\n  - missing required section `## REFERENCES`\n  - missing required section `## ACTIVITY_LOG`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "scratch/ALPHA-982-no-id-field.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-982-no-id-field.md does not match the backlog schema (judged as an item from its id \u2014 the file is outside backlog/):\n  - missing required field `id`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "scratch/INIT-950.md": {
+   "code": 2,
+   "stderr": "\u2717 INIT-950.md does not match the backlog schema (judged as an initiative from its id \u2014 the file is outside backlog/):\n  - missing `status`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "scratch/2026-11-01-session-copy.md": {
+   "code": 2,
+   "stderr": "\u2717 2026-11-01-session-copy.md does not match the backlog schema (judged as a session from its frontmatter \u2014 the file is outside backlog/):\n  - missing required field `start_ts`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "scratch/2026-11-01-session-ok.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/2026-11-01-notes.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/inbox.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/notes.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "scratch/ABC-12.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/searches/ALPHA-983.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-970.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-971.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-972.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-972.md does not match the backlog schema:\n  - status `moved` is not valid here (allowed: idea, draft, scoped, active, blocked, completed, deferred, cancelled)\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`XYZ-8`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-973.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-973.md does not match the backlog schema:\n  - `status: active` requires a non-null `next_action` \u2014 an active item with no next action is stuck by definition\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-974.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-974.md does not match the backlog schema:\n  - status `concluded` is not valid here (allowed: idea, draft, scoped, active, blocked, completed, deferred, cancelled)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-975.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-975.md does not match the backlog schema:\n  - missing required section `## REFERENCES`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-976.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-985.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-986.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-986.md does not match the backlog schema:\n  - status `moved` is not valid here (allowed: idea, draft, scoped, active, blocked, completed, deferred, cancelled, open, decided)\n  - `status: moved` requires an `ACTIVITY_LOG` line naming the tracker item (`XYZ-9`, with its link) \u2014 the pointer from the frozen record to where the work went\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-987.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-987.md does not match the backlog schema:\n  - `status: active` requires a non-null `next_action` \u2014 an active item with no next action is stuck by definition\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-988.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-989.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-989.md does not match the backlog schema:\n  - `status: open` on an `desk-ops` record makes it a decision, which requires `question` \u2014 the one-line question being decided\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-990.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-990.md does not match the backlog schema:\n  - `status: decided` requires `decided` \u2014 the option that was chosen\n  - `status: decided` requires `decided_on` \u2014 the date the call was made (YYYY-MM-DD)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-991.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-992.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-992.md does not match the backlog schema:\n  - `status: open` requires null `decided`/`decided_on` \u2014 a decision that has been made is `decided`, not `open`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-993.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-993.md does not match the backlog schema:\n  - status `concluded` is not valid here (allowed: idea, draft, scoped, active, blocked, completed, deferred, cancelled, open, decided)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-994.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-994.md does not match the backlog schema:\n  - missing required section `## DESCRIPTION` (a `desk-ops` record may carry `## CONTEXT` instead)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-995.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-996.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1001.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1001.md is valid, with a non-blocking warning:\n  - `status: completed` is finished, but the record still carries `next_action` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-next-action`)\n"
+  },
+  "backlog/items/ALPHA-1002.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1002.md is valid, with a non-blocking warning:\n  - `status: decided` is finished, but the record still carries `waiting_on` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-waiting`)\n"
+  },
+  "backlog/items/ALPHA-1003.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1003.md is valid, with a non-blocking warning:\n  - `status: retired` is finished, but the record still carries `next_action` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-next-action`)\n"
+  },
+  "backlog/items/ALPHA-1004.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1004.md is valid, with a non-blocking warning:\n  - `status: decided` is finished, but the record still carries `next_action` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-next-action`)\n"
+  },
+  "backlog/items/ALPHA-1005.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1006.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1006.md is valid, with a non-blocking warning:\n  - `waiting_since` dates a wait, but this record waits on nothing (it is not `blocked` and has no `waiting_on`) \u2014 clear it, or set `waiting_on` to the party\n"
+  },
+  "backlog/items/ALPHA-1007.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1008.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1009.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1009.md is valid, with a non-blocking warning:\n  - `waiting_since` dates a wait, but this record waits on nothing (it is not `blocked` and has no `waiting_on`) \u2014 clear it, or set `waiting_on` to the party\n"
+  },
+  "backlog/items/ALPHA-1070.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1070.md is valid, with non-blocking warnings:\n  - `status: completed` is finished, but the record still carries `next_action` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-next-action`)\n  - `status: completed` is finished, but the record still carries `waiting_on` \u2014 a finished record has no next action and waits on no one, so set it to null (backlog-record: `--clear-waiting`)\n"
+  },
+  "backlog/items/ALPHA-1010.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1015.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1015.md is valid, with a non-blocking warning:\n  - the status changed since the last commit: `completed` \u2192 `active` is not a legal move \u2014 from `completed`, a record of type `agent-ops` may go to: draft, cancelled (a local check: it compares this file with its copy at the last commit, so two legal edits made before one commit can read here as a single move the table does not allow)\n"
+  },
+  "backlog/items/ALPHA-1016.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1011.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1011.md is valid, with a non-blocking warning:\n  - the status changed since the last commit: `moved` \u2192 `active` is not a legal move \u2014 a moved record is frozen: its work goes on in the tracker, and its status never changes again (a local check: it compares this file with its copy at the last commit, so two legal edits made before one commit can read here as a single move the table does not allow)\n"
+  },
+  "backlog/items/ALPHA-1012.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1012.md is valid, with a non-blocking warning:\n  - the status changed since the last commit: `idea` \u2192 `deferred` is not a legal move \u2014 from `idea`, a record of type `agent-ops` may go to: draft, scoped, active, cancelled (a local check: it compares this file with its copy at the last commit, so two legal edits made before one commit can read here as a single move the table does not allow)\n"
+  },
+  "backlog/items/ALPHA-1013.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1014.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1017.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1018.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1019.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1019.md is valid, with a non-blocking warning:\n  - the status changed since the last commit: `open` \u2192 `completed` is not a legal move \u2014 from `open`, a record of type `desk-ops` may go to: decided, cancelled, active (a local check: it compares this file with its copy at the last commit, so two legal edits made before one commit can read here as a single move the table does not allow)\n"
+  },
+  "backlog/items/ALPHA-1000.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1020-four-digit-slug.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-007-three-digits-padded.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-tmp-1a2b3c4d.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1030.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1031.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1032.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1033.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1033.md does not match the backlog schema:\n  - recordings entry `nocolon` is not `<scheme>:<id>` \u2014 e.g. `fathom:123456789` (any scheme is accepted; only the shape is checked)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1034.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1034.md does not match the backlog schema:\n  - `recordings` must be a list \u2014 inline form `[fathom:<call_id>, \u2026]` (see schema.md `recordings`)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1035.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1036.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1036.md does not match the backlog schema:\n  - missing required field `id`\n  - missing required field `title`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1037.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1037.md does not match the backlog schema:\n  - missing `status`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1038.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1038.md does not match the backlog schema:\n  - unknown item type `gadget` (expected one of: app, infra, plugin, vendor, ops-desk, personal-ops, agent-ops, desk-ops, research, decision, chore)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1039.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1039.md does not match the backlog schema:\n  - status `bogus` is not valid here (allowed: idea, draft, scoped, active, blocked, completed, deferred, cancelled, moved)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1040.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1040.md does not match the backlog schema:\n  - `status: blocked` requires `blocked_on` \u2014 say who/what you're waiting on (and set `waiting_since`)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1041.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1041.md does not match the backlog schema:\n  - `status: idea` requires a null `next_action` \u2014 an idea with a next action is committed work; promote it to `draft`/`active` instead\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1050.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1051.md": {
+   "code": 2,
+   "stderr": "\u2717 ALPHA-1051.md does not match the backlog schema:\n  - `type: vendor` requires a non-null `vendor` once past `idea`/`draft`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/items/ALPHA-1052.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1053.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1100.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1101.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1102.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/items/ALPHA-1110.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1110.md is valid, with a non-blocking warning:\n  - `## SUB_ITEMS` is a generated projection and is now stale \u2014 it no longer matches the live sub-items (items whose `parent` is ALPHA-1110). Regenerate it via backlog-manage `regen-subitems ALPHA-1110` (it is read-only \u2014 never hand-edit between the sentinels).\n"
+  },
+  "backlog/items/ALPHA-1111.md": {
+   "code": 1,
+   "stderr": "\u26a0 ALPHA-1111.md is valid, with a non-blocking warning:\n  - parent `ALPHA-1110` carries a generated `## SUB_ITEMS` projection that is now stale after this change \u2014 regenerate it via backlog-manage `regen-subitems ALPHA-1110`.\n"
+  },
+  "backlog/arcs/ARC-001-first-arc.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/arcs/ARC-002.md": {
+   "code": 2,
+   "stderr": "\u2717 ARC-002.md does not match the backlog schema:\n  - status `done` is not valid here (allowed: active, paused, completed, cancelled)\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/initiatives/INIT-001.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/initiatives/INIT-002-slug.md": {
+   "code": 2,
+   "stderr": "\u2717 INIT-002-slug.md does not match the backlog schema:\n  - missing required section `## GOALS`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/sessions/2026-11-01-first-session.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/sessions/2026-11-02-no-start.md": {
+   "code": 2,
+   "stderr": "\u2717 2026-11-02-no-start.md does not match the backlog schema:\n  - missing required field `start_ts`\n\nFix the record to match the plugin's schema/schema.md, then re-save.\n"
+  },
+  "backlog/sessions/README.md": {
+   "code": 0,
+   "stderr": ""
+  },
+  "backlog/inbox.md": {
+   "code": 0,
+   "stderr": ""
+  }
+ }
+}

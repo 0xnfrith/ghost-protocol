@@ -1,0 +1,29 @@
+# The buzz-mcp socket (gp-key-<name>-buzz-mcp.socket) of the Ghost Protocol
+# instance @NAME@: Block's buzz-mcp (the Buzz tools), served by its key service.
+# install/keyservice/setup makes it from install/service/key-buzz-mcp.socket
+# and installs it in /etc/systemd/system.
+#
+# Each connection starts one gp-key-@NAME@-buzz-mcp@.service as the key's
+# user, with the connection as its stdin and stdout; buzz-mcp stops when its
+# connection closes. The session's side connects through the Buzz adapter's
+# pipe (buzz_key_socket = @RUN@): it holds no key.
+#
+# Only root and the group @AGENT_GROUP@ (the instance's own user's group, which
+# holds no other user) can connect. Up to 8 at once: the session's own, and
+# any other session of the same user (a --test run, say).
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the key service's buzz-mcp socket
+
+[Socket]
+ListenStream=@RUN@/buzz-mcp.sock
+Accept=yes
+MaxConnections=8
+SocketUser=root
+SocketGroup=@AGENT_GROUP@
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

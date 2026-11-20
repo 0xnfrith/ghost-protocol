@@ -1,0 +1,303 @@
+#!/bin/sh
+# Test stand-in for systemctl, for the earlyoom unit and for an instance's own
+# unit, <name>.service (any other unit is an unexpected call). It records the
+# subcommand and the argument count.
+#
+# An instance's unit: state in $STUB_STATE, unit-<name>.service.loaded (it is
+# installed) and unit-<name>.service.active (it runs). show -p LoadState
+# answers loaded or not-found, show -p User the unit's User= from
+# unit-<name>.service.user (nothing without it: the unit runs as root), cat prints unit-<name>.service.cat (the unit
+# and its drop-ins; a small unit without it), is-active reads the state, and try-restart
+# restarts it only when it runs, counting restarts in
+# unit-<name>.service.restarts. unit-<name>.service.dies makes it stop instead
+# of coming back. systemctl.fail-<subcommand> makes that subcommand fail.
+#
+# earlyoom: it models what systemd does with drop-ins:
+#   daemon-reload   reads the drop-ins under $GP_ETC/systemd/system/
+#                   earlyoom.service.d/ in name order; the last ExecStart= with
+#                   a command wins (none: the package's own command)
+#   show -p NeedDaemonReload   yes when the drop-ins changed since then
+#   restart         starts the loaded command: a new MainPID, and its command
+#                   line ("$$" read as "$") in $GP_PROC/<pid>/cmdline
+#   show -p MainPID, show -p ExecStart (argv[]= with "$" written "$$")
+# State, in $STUB_STATE: earlyoom.enabled, earlyoom.active, earlyoom.loaded,
+# earlyoom.pid, earlyoom.reloaded (the drop-ins as last read). These change
+# what it does:
+#   systemctl.fail-<subcommand>   that subcommand fails (exit 1)
+#   earlyoom.crashes              restart succeeds, but the unit does not stay
+#                                 active (an option it does not know)
+#   earlyoom.no-proc              no cmdline file is written (/proc unreadable)
+# A restart also records whether the guard's drop-in is in place under $GP_ETC.
+#
+# The auto-mode guard's units (<name>-automode-guard.service and .timer) are
+# modelled too: enable --now and disable --now set and clear
+# automode.<unit>.enabled and .active; start records whether the service file
+# is under $GP_ETC (automode.start-fails makes start fail); is-enabled,
+# is-active, stop and reset-failed work as for earlyoom.
+#
+# The memory backup's units (<name>-memory-backup.service, .timer and .path,
+# <name>-memory-verify.service and .timer), several to a call: enable --now
+# and disable --now set and clear memunit.<unit>.enabled and .active; start
+# records "systemctl start: <unit> in place" or "... missing" (its file under
+# $GP_ETC; memunit.start-fails makes start fail); stop clears .active;
+# is-enabled, is-active and reset-failed work as for the key service.
+#
+# The key service's units (gp-key-<name>-*): enable --now and disable --now
+# set and clear keyunit.<unit>.enabled and .active; start and stop set and
+# clear .active; stop of a pattern (gp-key-<name>-channel@*.service, the
+# open connections) is recorded as "systemctl stop-pattern <pattern>". Each
+# start records whether the unit file is under $GP_ETC ("systemctl start:
+# <unit> in place" or "... missing"). keyunit.start-fails makes start fail.
+# show -p <property> --value for a key service unit answers as systemd
+# loads it: FragmentPath is its file under $GP_ETC/systemd/system (an instance
+# name, <unit>@<x>.service, is read from its template <unit>@.service), or
+# the path in keyunit-fragment.<template>; DropInPaths lists the drop-ins in
+# that file's .d folder in name order, then the paths in
+# keyunit-dropins.<template>; NeedDaemonReload is no, or yes while
+# keyunit.need-reload is there; NConnections is the number in
+# keyunit.<unit>.connections (default 0). list-units for a key service
+# pattern prints the lines of keyunit.running that start with the pattern's
+# text before its *, recorded as "systemctl list-units <pattern>". Each show is recorded as
+# "systemctl show <property> <unit>". cat for a key service unit prints, as
+# systemctl does, "# <FragmentPath>" and that file, then for each drop-in an
+# empty line, "# <path>" and the drop-in, each line as systemd reads it (a CR
+# LF, a CR or a NUL ends one; with keyunit.cat-raw, the bytes as they are,
+# as a systemctl that passes them through prints them). A drop-in it cannot
+# read ends it with exit 1, as does keyunit.cat-fails. It is recorded as
+# "systemctl cat <unit>".
+# --version answers "systemd <n>", n from $STUB_STATE/systemd.version
+# (default 255).
+S="${STUB_STATE:?}"
+if [ "${1:-}" = --version ]; then
+    echo "systemctl --version 1" >>"$S/calls"
+    printf 'systemd %s (stub)\n' "$(cat "$S/systemd.version" 2>/dev/null || echo 255)"
+    exit 0
+fi
+case "${1:-}" in
+    enable|disable|start|stop|is-active|is-enabled)
+        case "${2:-}${3:-}" in
+            *gp-key-*)
+                sub="$1"; shift
+                echo "systemctl $sub $#" >>"$S/calls"
+                [ -f "$S/systemctl.fail-$sub" ] && { echo "systemctl stub: $sub fails" >&2; exit 1; }
+                now=0
+                [ "${1:-}" = --now ] && { now=1; shift; }
+                [ "${1:-}" = --quiet ] && shift
+                rc=0
+                for u in "$@"; do
+                    f="$S/keyunit.$u"
+                    case "$u" in *"*"*) echo "systemctl stop-pattern $u" >>"$S/calls"; continue ;; esac
+                    case "$sub" in
+                        enable)  touch "$f.enabled"; [ "$now" = 1 ] && touch "$f.active" ;;
+                        disable) rm -f "$f.enabled"; [ "$now" = 1 ] && rm -f "$f.active" ;;
+                        start)
+                            [ -f "$S/keyunit.start-fails" ] && { echo "systemctl stub: start fails" >&2; exit 1; }
+                            if [ -f "${GP_ETC:-/nonexistent}/systemd/system/$u" ]; then echo "systemctl start: $u in place" >>"$S/calls"
+                            else echo "systemctl start: $u missing" >>"$S/calls"; fi
+                            touch "$f.active" ;;
+                        stop) rm -f "$f.active" ;;
+                        is-active)  [ -f "$f.active" ] || rc=3 ;;
+                        is-enabled) [ -f "$f.enabled" ] || rc=1 ;;
+                    esac
+                done
+                exit "$rc" ;;
+        esac ;;
+esac
+case "${1:-}" in
+    enable|disable|start|stop|is-active|is-enabled|reset-failed)
+        case "$*" in
+            *-memory-backup.*|*-memory-verify.*)
+                sub="$1"; shift
+                echo "systemctl $sub $#" >>"$S/calls"
+                [ -f "$S/systemctl.fail-$sub" ] && { echo "systemctl stub: $sub fails" >&2; exit 1; }
+                now=0
+                [ "${1:-}" = --now ] && { now=1; shift; }
+                [ "${1:-}" = --quiet ] && shift
+                rc=0
+                for u in "$@"; do
+                    f="$S/memunit.$u"
+                    case "$sub" in
+                        enable)  touch "$f.enabled"; if [ "$now" = 1 ]; then touch "$f.active"; fi ;;
+                        disable) rm -f "$f.enabled"; if [ "$now" = 1 ]; then rm -f "$f.active"; fi ;;
+                        start)
+                            [ -f "$S/memunit.start-fails" ] && { echo "systemctl stub: start fails" >&2; exit 1; }
+                            if [ -f "${GP_ETC:-/nonexistent}/systemd/system/$u" ]; then echo "systemctl start: $u in place" >>"$S/calls"
+                            else echo "systemctl start: $u missing" >>"$S/calls"; fi ;;
+                        stop) rm -f "$f.active" ;;
+                        reset-failed) ;;
+                        is-active)  [ -f "$f.active" ] || rc=3 ;;
+                        is-enabled) [ -f "$f.enabled" ] || rc=1 ;;
+                    esac
+                done
+                exit "$rc" ;;
+        esac ;;
+esac
+D="${GP_ETC:-/nonexistent}/systemd/system/earlyoom.service.d"
+PROC="${GP_PROC:-${GP_ETC:-/nonexistent}/proc}"
+PACKAGE_CMD="/usr/bin/earlyoom -r 3600"
+sub="${1:-}"
+echo "systemctl $sub $#" >>"$S/calls"
+[ -f "$S/systemctl.fail-$sub" ] && { echo "systemctl stub: $sub fails" >&2; exit 1; }
+unit=""
+for a in "$@"; do unit="$a"; done
+case "$sub:$unit" in
+    show:gp-key-*)
+        prop="" prev=""
+        for a in "$@"; do [ "$prev" = -p ] && prop="$a"; prev="$a"; done
+        echo "systemctl show $prop $unit" >>"$S/calls"
+        tmpl="$(printf '%s' "$unit" | sed 's/@[^.]*\./@./')"
+        U="${GP_ETC:-/nonexistent}/systemd/system"
+        case "$prop" in
+            FragmentPath)
+                if [ -f "$S/keyunit-fragment.$tmpl" ]; then cat "$S/keyunit-fragment.$tmpl"
+                elif [ -f "$U/$tmpl" ]; then echo "$U/$tmpl"
+                else echo; fi ;;
+            DropInPaths)
+                l=""
+                for f in "$U/$tmpl.d"/*.conf; do [ -f "$f" ] && l="$l $f"; done
+                [ -f "$S/keyunit-dropins.$tmpl" ] && l="$l $(tr '\n' ' ' <"$S/keyunit-dropins.$tmpl")"
+                printf '%s\n' "${l# }" ;;
+            NeedDaemonReload) if [ -f "$S/keyunit.need-reload" ]; then echo yes; else echo no; fi ;;
+            NConnections) cat "$S/keyunit.$unit.connections" 2>/dev/null || echo 0 ;;
+            *) echo "systemctl stub: unexpected property" >&2; exit 64 ;;
+        esac
+        exit 0 ;;
+    list-units:gp-key-*)
+        echo "systemctl list-units $unit" >>"$S/calls"
+        [ -f "$S/keyunit.running" ] && LC_ALL=C awk -v p="${unit%%\**}" 'index($0, p) == 1' "$S/keyunit.running"
+        exit 0 ;;
+    cat:gp-key-*)
+        echo "systemctl cat $unit" >>"$S/calls"
+        [ -f "$S/keyunit.cat-fails" ] && { echo "systemctl stub: cat fails" >&2; exit 1; }
+        tmpl="$(printf '%s' "$unit" | sed 's/@[^.]*\./@./')"
+        U="${GP_ETC:-/nonexistent}/systemd/system"
+        frag="$U/$tmpl"
+        [ -f "$S/keyunit-fragment.$tmpl" ] && frag="$(cat "$S/keyunit-fragment.$tmpl")"
+        [ -f "$frag" ] || { echo "No files found for $unit." >&2; exit 1; }
+        lines() {
+            if [ -f "$S/keyunit.cat-raw" ]; then cat -- "$1"
+            else LC_ALL=C tr '\000' '\n' <"$1" | LC_ALL=C awk '{ sub(/\r$/, ""); gsub(/\r/, "\n"); print }'; fi
+        }
+        printf '# %s\n' "$frag"; lines "$frag"
+        {
+            for f in "$U/$tmpl.d"/*.conf; do [ -f "$f" ] && printf '%s\n' "$f"; done
+            cat "$S/keyunit-dropins.$tmpl" 2>/dev/null
+        } | while IFS= read -r f; do
+            if [ ! -f "$f" ] || [ ! -r "$f" ]; then echo "Failed to cat $f" >&2; exit 1; fi
+            printf '\n# %s\n' "$f"; lines "$f"
+        done
+        exit $? ;;
+esac
+case "$unit" in
+    *-automode-guard.service|*-automode-guard.timer)
+        f="$S/automode.$unit"
+        case "$sub" in
+            enable)        touch "$f.enabled"; if [ "$2" = "--now" ]; then touch "$f.active"; fi ;;
+            disable)       rm -f "$f.enabled"; if [ "$2" = "--now" ]; then rm -f "$f.active"; fi ;;
+            start)
+                [ -f "$S/automode.start-fails" ] && { echo "systemctl stub: start fails" >&2; exit 1; }
+                if [ -f "${GP_ETC:-/nonexistent}/systemd/system/$unit" ]; then
+                    echo "systemctl start: unit in place" >>"$S/calls"
+                else
+                    echo "systemctl start: no unit" >>"$S/calls"
+                fi ;;
+            stop)          rm -f "$f.active" ;;
+            reset-failed)  ;;
+            is-enabled)    [ -f "$f.enabled" ] ;;
+            is-active)     [ -f "$f.active" ] ;;
+            *)             echo "systemctl stub: unexpected call" >&2; exit 64 ;;
+        esac
+        exit $? ;;
+esac
+case "$unit" in
+    *.service)
+        [ "$unit" != "earlyoom.service" ] || { echo "systemctl stub: earlyoom is named without .service" >&2; exit 64; }
+        u="$S/unit-$unit"
+        case "$sub" in
+            show)
+                prop=""
+                while [ $# -gt 0 ]; do [ "$1" = "-p" ] && { prop="$2"; shift; }; shift; done
+                case "$prop" in
+                    LoadState) if [ -f "$u.loaded" ]; then echo loaded; else echo not-found; fi ;;
+                    User) cat "$u.user" 2>/dev/null || echo ;;
+                    *) echo "systemctl stub: unexpected property" >&2; exit 64 ;;
+                esac ;;
+            is-active)
+                [ -f "$u.active" ] ;;
+            cat)
+                [ -f "$u.loaded" ] || { echo "No files found for $unit." >&2; exit 1; }
+                if [ -f "$u.cat" ]; then cat "$u.cat"
+                else printf '# %s/systemd/system/%s\n[Service]\nExecStart=/bin/true\n' "${GP_ETC:-/etc}" "$unit"; fi ;;
+            try-restart)
+                [ -f "$u.loaded" ] || { echo "Unit $unit not found." >&2; exit 5; }
+                [ -f "$u.active" ] || exit 0
+                n=$(( $(cat "$u.restarts" 2>/dev/null || echo 0) + 1 ))
+                echo "$n" >"$u.restarts"
+                if [ -f "$u.dies" ]; then rm -f "$u.active"; fi ;;
+            *)
+                echo "systemctl stub: unexpected call for $unit" >&2
+                exit 64 ;;
+        esac
+        exit $? ;;
+esac
+case "$sub" in
+    daemon-reload) ;;
+    *) [ "$unit" = "earlyoom" ] || { echo "systemctl stub: unexpected unit '$unit'" >&2; exit 64; } ;;
+esac
+dropins() { cat "$D"/*.conf 2>/dev/null; }
+loaded() { if [ -f "$S/earlyoom.loaded" ]; then cat "$S/earlyoom.loaded"; else echo "$PACKAGE_CMD"; fi; }
+case "$sub" in
+    daemon-reload)
+        cmd="$PACKAGE_CMD"
+        for f in "$D"/*.conf; do
+            [ -f "$f" ] || continue
+            while IFS= read -r l; do
+                case "$l" in
+                    ExecStart=) cmd="" ;;
+                    ExecStart=*) cmd="${l#ExecStart=}" ;;
+                esac
+            done <"$f"
+        done
+        printf '%s\n' "$cmd" >"$S/earlyoom.loaded"
+        dropins >"$S/earlyoom.reloaded"
+        exit 0 ;;
+    enable)
+        touch "$S/earlyoom.enabled" ;;
+    restart)
+        if [ -f "$D/ghost-protocol.conf" ]; then
+            echo "systemctl restart: drop-in in place" >>"$S/calls"
+        else
+            echo "systemctl restart: no drop-in" >>"$S/calls"
+        fi
+        if [ -f "$S/earlyoom.crashes" ]; then
+            rm -f "$S/earlyoom.active"; echo 0 >"$S/earlyoom.pid"; exit 0
+        fi
+        pid=$(( $(cat "$S/earlyoom.pid" 2>/dev/null || echo 4200) + 1 ))
+        [ "$pid" -gt 4200 ] || pid=4201
+        echo "$pid" >"$S/earlyoom.pid"
+        if [ ! -f "$S/earlyoom.no-proc" ]; then
+            mkdir -p "$PROC/$pid"
+            loaded | sed 's/\$\$/$/g' | tr -d '\n' | tr ' ' '\000' >"$PROC/$pid/cmdline"
+            printf '\000' >>"$PROC/$pid/cmdline"
+        fi
+        touch "$S/earlyoom.active" ;;
+    is-enabled)
+        [ -f "$S/earlyoom.enabled" ] ;;
+    is-active)
+        [ -f "$S/earlyoom.active" ] ;;
+    show)
+        prop=""
+        while [ $# -gt 0 ]; do [ "$1" = "-p" ] && { prop="$2"; shift; }; shift; done
+        case "$prop" in
+            NeedDaemonReload)
+                if dropins | cmp -s - "$S/earlyoom.reloaded" 2>/dev/null; then echo no; else echo yes; fi ;;
+            MainPID)
+                if [ -f "$S/earlyoom.active" ]; then cat "$S/earlyoom.pid" 2>/dev/null || echo 0; else echo 0; fi ;;
+            ExecStart)
+                printf '{ path=/usr/bin/earlyoom ; argv[]=%s ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n' "$(loaded)" ;;
+            *) echo "systemctl stub: unexpected property" >&2; exit 64 ;;
+        esac ;;
+    *)
+        echo "systemctl stub: unexpected call" >&2
+        exit 64 ;;
+esac

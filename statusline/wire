@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# wire: point Claude Code's status line at this checkout's statusline.sh, or
+# take it out again.
+#
+# Usage:
+#   statusline/wire wire   [--settings <file>] [--replace] [--dry-run]
+#   statusline/wire unwire [--settings <file>] [--dry-run]
+#
+# A plugin cannot set the main status line: Claude Code applies only the agent
+# and subagentStatusLine keys of a plugin's settings. So the installer runs this
+# to write the statusLine key into the user's settings instead (default
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json):
+#   { "type": "command", "command": "<this folder>/statusline.sh", "refreshInterval": 1 }
+# refreshInterval 1 redraws the line every second, for the clocks and the name's
+# glitch animation.
+#
+# wire:
+#   - A status line already pointing at this script: nothing to do (its own
+#     refreshInterval, if it has one, is kept).
+#   - Ours from another checkout (a statusline.sh that carries the line
+#     "# Statusline-ID: ghost-protocol", or one that is gone): pointed here,
+#     keeping its other keys, such as padding.
+#   - Any other status line is left alone, unless --replace.
+#   - Every change keeps the old file beside it as <file>.bak-statusline-<time>.
+#     A link is followed: the link stays, and its file changes.
+# unwire takes out only a status line of ours.
+# Both need jq, which the status line itself needs to draw.
+#
+# Exit codes: 0 done, or nothing to do (the first words of the output say which:
+# wired, already wired, would wire, unwired, would unwire, not wired);
+# 2 usage; 3 not done (the reason is printed).
+set -uo pipefail
+
+SELF_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT="$SELF_DIR/statusline.sh"
+ID_LINE="# Statusline-ID: ghost-protocol"
+
+usage_error() { echo "wire: $*" >&2; echo "Try: statusline/wire --help" >&2; exit 2; }
+
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+SETTINGS="" DRY=0 REPLACE=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --settings) [ $# -ge 2 ] || usage_error "--settings needs a value"; SETTINGS="$2"; shift 2 ;;
+        --replace)  REPLACE=1; shift ;;
+        --dry-run)  DRY=1; shift ;;
+        *)          usage_error "unknown option: $1" ;;
+    esac
+done
+case "$CMD" in
+    -h|--help) sed -n '2,31p' "$SELF_DIR/wire" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    wire|unwire) ;;
+    *) usage_error "the first word must be wire or unwire" ;;
+esac
+case "$SETTINGS" in
+    '') SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" ;;
+    \~/*) SETTINGS="$HOME/${SETTINGS#\~/}" ;;
+esac
+
+# The file a path names, with every link followed (at most 20 of them).
+real_file() {
+    local f="$1" t i=0
+    while [ -L "$f" ]; do
+        i=$((i + 1))
+        [ "$i" -le 20 ] || return 1
+        t="$(readlink "$f")" || return 1
+        case "$t" in /*) f="$t" ;; *) f="$(dirname "$f")/$t" ;; esac
+    done
+    printf '%s' "$f"
+}
+
+# Write $2 (JSON text) to the file $1 names, keeping the old text as
+# $1.bak-statusline-<time> beside the path as named (never inside a folder a
+# link points into). The new text goes through a temp file beside the real file,
+# made as a copy of it, so it keeps its mode.
+replace_json() {
+    local f tmp bak
+    f="$(real_file "$1")" || return 1
+    bak="$1.bak-statusline-$(date +%Y%m%d-%H%M%S)"
+    [ ! -e "$bak" ] || bak="$bak-$$"
+    tmp="$(mktemp "$(dirname "$f")/.settings.XXXXXX")" || return 1
+    if ! { cp -p "$f" "$tmp" && printf '%s\n' "$2" >"$tmp" && cp -p "$f" "$bak"; }; then
+        rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$f"
+}
+
+# Is this statusLine command ours? A bare path to statusline/statusline.sh that
+# carries our ID line, or one that no longer exists (an old checkout).
+is_ours() {
+    local c="$1" re='^/[A-Za-z0-9._/-]+$'
+    case "$c" in */statusline/statusline.sh) ;; *) return 1 ;; esac
+    [[ $c =~ $re ]] || return 1
+    [ -e "$c" ] || return 0
+    grep -qxF -- "$ID_LINE" "$c" 2>/dev/null
+}
+
+need_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    echo "not wired: the status line needs jq to draw; install jq, then run statusline/wire wire"
+    return 3
+}
+
+do_wire() {
+    local f="$SETTINGS" re='^/[A-Za-z0-9._/-]+$' kind cur merged keep
+    need_jq || return 3
+    [[ $SCRIPT =~ $re ]] || { echo "not wired: the script's path ($SCRIPT) holds characters a command cannot carry unquoted"; return 3; }
+    [ -x "$SCRIPT" ] || { echo "not wired: $SCRIPT is missing or not executable"; return 3; }
+    if [ ! -e "$f" ]; then
+        if [ "$DRY" = "1" ]; then echo "would wire: write $f with the status line"; return 0; fi
+        mkdir -p "$(dirname "$f")" || return 3
+        jq -n --arg c "$SCRIPT" '{statusLine: {type: "command", command: $c, refreshInterval: 1}}' >"$f" \
+            || { echo "not wired: could not write $f"; return 3; }
+        echo "wired: wrote $f"
+        return 0
+    fi
+    jq -e 'type == "object"' "$f" >/dev/null 2>&1 || { echo "not wired: $f is not a JSON object"; return 3; }
+    kind="$(jq -r '.statusLine | type' "$f" 2>/dev/null)"
+    cur="$(jq -r 'if (.statusLine | type) == "object" then (.statusLine.command // "") | tostring else "" end' "$f" 2>/dev/null)"
+    if jq -e --arg c "$SCRIPT" '.statusLine | type == "object" and .type == "command" and .command == $c and .refreshInterval != null' "$f" >/dev/null 2>&1; then
+        echo "already wired: $f"
+        return 0
+    fi
+    if [ "$kind" != "null" ] && ! is_ours "$cur" && [ "$REPLACE" != "1" ]; then
+        echo "not wired: $f already has another status line, left as it is; run statusline/wire wire --replace to use this one"
+        return 3
+    fi
+    # Ours: keep its other keys (padding, its own refreshInterval). Another one:
+    # replaced whole.
+    if [ "$kind" = "object" ] && is_ours "$cur"; then keep=1; else keep=0; fi
+    merged="$(jq --arg c "$SCRIPT" --argjson keep "$keep" '
+        .statusLine = ((if $keep == 1 then .statusLine else {} end) + {type: "command", command: $c})
+        | .statusLine.refreshInterval //= 1' "$f")" \
+        || { echo "not wired: jq could not edit $f"; return 3; }
+    if [ "$DRY" = "1" ]; then echo "would wire: set the status line in $f"; return 0; fi
+    replace_json "$f" "$merged" || { echo "not wired: could not write $f"; return 3; }
+    echo "wired: set the status line in $f (the old copy is beside it as .bak-statusline-<time>)"
+}
+
+do_unwire() {
+    local f="$SETTINGS" cur out
+    [ -e "$f" ] || { echo "not wired: there is no $f"; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo "not unwired: changing $f needs jq"; return 3; }
+    jq -e 'type == "object"' "$f" >/dev/null 2>&1 || { echo "not unwired: $f is not a JSON object"; return 3; }
+    cur="$(jq -r 'if (.statusLine | type) == "object" then (.statusLine.command // "") | tostring else "" end' "$f" 2>/dev/null)"
+    if [ -z "$cur" ] || ! is_ours "$cur"; then
+        echo "not wired: $f has no GHOST Protocol status line"
+        return 0
+    fi
+    out="$(jq 'del(.statusLine)' "$f")" || { echo "not unwired: jq could not edit $f"; return 3; }
+    if [ "$DRY" = "1" ]; then echo "would unwire: take the status line out of $f"; return 0; fi
+    replace_json "$f" "$out" || { echo "not unwired: could not write $f"; return 3; }
+    echo "unwired: took the status line out of $f"
+}
+
+case "$CMD" in
+    wire)   do_wire ;;
+    unwire) do_unwire ;;
+esac

@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# watch: compare Claude Code's auto-mode rules with a snapshot. Read-only.
+#
+# Claude Code's auto mode reads three lists of plain-English rules from the
+# user's settings file (~/.claude/settings.json): autoMode.allow,
+# autoMode.soft_deny and autoMode.hard_deny. An instance keeps a copy of them,
+# the snapshot, in its own repo. This tool says whether the two drifted apart,
+# either way:
+#   VANISHED  a snapshot rule that is missing from the settings file;
+#   NEW       a rule in the settings file that is not in the snapshot yet
+#             (not backed up).
+#
+# Usage:
+#   watch --against <snapshot> [--settings <file>]          counts, then each NEW
+#                                                           and VANISHED rule
+#   watch --against <snapshot> --json [--settings <file>]   one JSON report (below)
+#   watch --snapshot [--settings <file>]                    the JSON a snapshot file
+#                                                           holds, from the settings
+#
+# Exit: 0 = no drift, 1 = a rule drifted (either way), 2 = error.
+# --snapshot exits 0, or 2 when a rule holds a control or format character
+# (Unicode Cc or Cf), which a snapshot must never carry.
+#
+# What it reads and prints:
+#   - Only the autoMode key of the settings file, and of that only the three
+#     lists. Nothing else in the file (its env block may hold live keys) is
+#     read into the output, autoMode.environment included.
+#   - Every rule it prints is JSON-quoted, with invisible characters
+#     (Unicode Cc, Cf, Co, Cs, Cn, Zl, Zp) escaped, so a rule cannot hide or
+#     rewrite what is around it on a terminal.
+#   - It writes nothing, anywhere.
+#
+# The --json report, for programs (the session hook):
+#   {"drift": bool, "live": {counts}, "snapshot": {counts},
+#    "vanished": [{"list", "shown"}], "new": [{"list", "shown"}], "digest"}
+# "shown" is the whole rule as printed above, never cut short. "digest" is a
+# sha256 of the full rules that drifted, tagged by direction and list, or null
+# with no drift: two drifts that share a long beginning never look the same.
+# Each list is compared as a set, so a rule listed twice changes nothing.
+set -euo pipefail
+
+usage() { echo "usage: watch --against <snapshot> [--json] [--settings <file>] | watch --snapshot [--settings <file>]" >&2; }
+
+MODE="" AGAINST="" SETTINGS_FILE="$HOME/.claude/settings.json"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --against)  [ $# -ge 2 ] || { usage; exit 2; }; AGAINST="$2"; shift 2 ;;
+        --settings) [ $# -ge 2 ] || { usage; exit 2; }; SETTINGS_FILE="$2"; shift 2 ;;
+        --json)     [ -z "$MODE" ] || { usage; exit 2; }; MODE=json; shift ;;
+        --snapshot) [ -z "$MODE" ] || { usage; exit 2; }; MODE=snapshot; shift ;;
+        -h|--help)  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)          usage; exit 2 ;;
+    esac
+done
+[ -n "$MODE" ] || MODE=check
+if [ "$MODE" = snapshot ]; then
+    [ -z "$AGAINST" ] || { usage; exit 2; }
+else
+    [ -n "$AGAINST" ] || { usage; exit 2; }
+fi
+command -v python3 >/dev/null 2>&1 || { echo "watch: python3 is needed" >&2; exit 2; }
+
+AM_SETTINGS="$SETTINGS_FILE" AM_SNAPSHOT="$AGAINST" AM_MODE="$MODE" exec python3 -I - <<'PY'
+import hashlib, json, os, sys, unicodedata
+
+KEYS = ("allow", "hard_deny", "soft_deny")   # sorted, as a snapshot stores them
+SHOW = ("allow", "soft_deny", "hard_deny")   # display order
+settings = os.environ["AM_SETTINGS"]
+snapshot = os.environ["AM_SNAPSHOT"]
+mode = os.environ["AM_MODE"]
+INVISIBLE = ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp")
+
+
+def fail(msg):
+    print("watch: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def read_json(path, what):
+    # Error messages carry the path and a position only, never file content.
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        fail(f"{what} not found: {path}")
+    except json.JSONDecodeError as e:
+        fail(f"{what} is not valid JSON: {path} (line {e.lineno}, column {e.colno})")
+    except UnicodeDecodeError:
+        fail(f"{what} is not UTF-8 text: {path}")
+    except OSError as e:
+        fail(f"cannot read {what} {path}: {e.strerror}")
+
+
+def three_lists(obj, where):
+    """The allow / hard_deny / soft_deny lists of obj; a missing key or null is []."""
+    if obj is None:
+        obj = {}
+    if not isinstance(obj, dict):
+        fail(f"{where} is not a JSON object")
+    out = {}
+    for k in KEYS:
+        v = obj.get(k)
+        if v is None:
+            v = []
+        if not isinstance(v, list) or not all(isinstance(s, str) for s in v):
+            fail(f"{where}.{k} is not a list of strings")
+        out[k] = list(v)
+    return out
+
+
+def escape_invisible(text):
+    out = []
+    for c in text:
+        if unicodedata.category(c) in INVISIBLE:
+            o = ord(c)
+            out.append(f"\\u{o:04x}" if o <= 0xFFFF else f"\\U{o:08x}")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def q(s):
+    """A rule for display: JSON-quoted, invisible characters escaped."""
+    return escape_invisible(json.dumps(s, ensure_ascii=False))
+
+
+def missing(a, b):
+    """(list, rule) for each distinct rule of a that b lacks, in a's order."""
+    out = []
+    for k in KEYS:
+        have, seen = set(b[k]), set()
+        for s in a[k]:
+            if s not in have and s not in seen:
+                out.append((k, s))
+            seen.add(s)
+    return out
+
+
+def counts(lists):
+    return ", ".join(f"{k} {len(lists[k])}" for k in SHOW)
+
+
+data = read_json(settings, "settings file")
+if not isinstance(data, dict):
+    fail(f"settings file is not a JSON object: {settings}")
+live = three_lists(data.get("autoMode"), "autoMode")
+del data
+
+if mode == "snapshot":
+    for k in KEYS:
+        for i, s in enumerate(live[k], 1):
+            if any(unicodedata.category(c) in ("Cc", "Cf") for c in s):
+                fail(f"{k} rule {i} holds a control or format character: {q(s)[:120]}; "
+                     "a snapshot must not carry one, so none is printed")
+    sys.stdout.write(json.dumps(live, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    sys.exit(0)
+
+snap = three_lists(read_json(snapshot, "snapshot"), "snapshot")
+vanished = missing(snap, live)
+new = missing(live, snap)
+drift = bool(vanished or new)
+
+if mode == "json":
+    tagged = sorted([["vanished", k, s] for k, s in vanished] + [["new", k, s] for k, s in new])
+    report = {
+        "drift": drift,
+        "live": {k: len(live[k]) for k in SHOW},
+        "snapshot": {k: len(snap[k]) for k in SHOW},
+        "vanished": [{"list": k, "shown": q(s)} for k, s in vanished],
+        "new": [{"list": k, "shown": q(s)} for k, s in new],
+        "digest": (hashlib.sha256(json.dumps(tagged, ensure_ascii=False).encode("utf-8")).hexdigest()
+                   if drift else None),
+    }
+    print(json.dumps(report, ensure_ascii=True, indent=2))
+    sys.exit(1 if drift else 0)
+
+print(f"auto-mode rules now: {counts(live)}")
+print(f"snapshot:            {counts(snap)}")
+for k, s in vanished:
+    print(f"VANISHED {k}: {q(s)}")
+for k, s in new:
+    print(f"NEW {k}: {q(s)}")
+if drift:
+    print(f"DRIFT: {len(vanished)} vanished from the settings file, {len(new)} not in the snapshot yet.")
+else:
+    print("OK: the settings file and the snapshot hold the same rules.")
+sys.exit(1 if drift else 0)
+PY

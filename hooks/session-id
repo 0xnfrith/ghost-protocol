@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# session-id: a Claude Code SessionStart hook. It keeps the session id that
+# install/service/start resumes current: after a /clear or a /resume, Claude
+# Code goes on in another conversation with another id, and start's file,
+# ~/.local/state/ghost-protocol/<name>/session-id, would still name the old one.
+# So a restart or a crash recovery would bring back the conversation from before
+# the clear or the resume. On either, this hook writes the new id there, and
+# removes the old conversation's turn marker (the file turn, see turn-state).
+#
+# Which sessions: only the instance's own, as start launched it.
+#   - GP_INSTANCE_NAME is set: start passes it to the pane's claude alone, and
+#     --test's clean environment never carries it.
+#   - The hook was run by that claude itself (hooks/lib/own-claude.sh): the
+#     first claude above the hook is the one whose pid start wrote to
+#     <state>/pane-pid. Not a claude in another window of the same tmux
+#     server, and not one the instance's claude started (claude -p, or claude
+#     --resume, from a Bash call, which inherits GP_INSTANCE_NAME).
+#   - The source is clear or resume. A start is the session start launched,
+#     and start has written its id already; start's own --resume of that id
+#     changes nothing here.
+#   - Not a subagent (no agent_id), a session id in UUID form, start's file
+#     there already, and the new conversation sits beside the one the file
+#     names (its transcript is in the same project folder).
+# The file is replaced in one step. It prints nothing, and always exits 0.
+#
+# Needs jq; without it, it does nothing.
+# Test: install/test/hook-session-id.test.sh
+set -uo pipefail
+name="${GP_INSTANCE_NAME:-}"
+case "$name" in '' | -* | *[!a-z0-9-]*) exit 0 ;; esac
+command -v jq >/dev/null 2>&1 || exit 0
+# shellcheck source=lib/own-claude.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/own-claude.sh" || exit 0
+
+input=$(cat)
+[ -n "$input" ] || exit 0
+fields=$(printf '%s' "$input" | jq -r '[(.source // ""), (.session_id // ""), (.agent_id // ""), (.transcript_path // "")]
+    | map(tostring) | join("\u001f")' 2>/dev/null) || exit 0
+IFS=$'\037' read -r source sid agent transcript <<<"$fields"
+case "$source" in clear | resume) ;; *) exit 0 ;; esac
+[ -z "$agent" ] || exit 0
+re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[[ $sid =~ $re ]] || exit 0
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol/$name"
+file="$state/session-id"
+[ -f "$file" ] && [ ! -L "$file" ] || exit 0
+cur=$(tr -d '[:space:]' <"$file")
+[[ $cur =~ $re ]] || exit 0
+[ "$cur" != "$sid" ] || exit 0
+[ -n "$transcript" ] && [ -f "$(dirname "$transcript")/$cur.jsonl" ] || exit 0
+own_claude "$state" || exit 0
+
+tmp=$(mktemp "$state/.session-id.XXXXXX") || exit 0
+if printf '%s\n' "$sid" >"$tmp" && mv -f "$tmp" "$file"; then
+    rm -f "$state/turn"
+    exit 0
+fi
+rm -f "$tmp"
+exit 0

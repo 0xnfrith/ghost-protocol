@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# worktree-hook: Claude Code's WorktreeCreate and WorktreeRemove hooks for the
+# root layout (docs/layout.md): every new worktree of a repo under the root
+# goes to <root>/worktrees/<repo>/<branch>.
+#
+# Usage:
+#   worktree-hook create --root <root>   WorktreeCreate: reads the hook's JSON
+#                                        on stdin, prints the worktree's path
+#   worktree-hook remove --root <root>   WorktreeRemove: reads the hook's JSON
+#                                        on stdin, removes that worktree
+#   worktree-hook wire --root <root> [--settings <file>] [--dry-run]
+#                                        add both hooks to Claude Code's user
+#                                        settings (default ~/.claude/settings.json)
+#   worktree-hook unwire [--settings <file>] [--dry-run]
+#                                        take them out again
+#
+# create:
+#   - The repo is the main checkout of the session's folder (cwd in the JSON),
+#     also when the session already works in a worktree of it.
+#   - A layout repo gets <root>/worktrees/<repo>/<name> on a branch called
+#     <name>. A layout repo is the instance's home (a folder directly in <root>
+#     that holds .ghost-protocol/instance.toml) or <root>/repos/<owner>/<repo>.
+#   - Any other repo, a root with no worktrees/ folder, or a <name> already
+#     taken there by another repo of the same folder name, gets the place
+#     Claude Code itself uses: <repo>/.claude/worktrees/<name> on branch
+#     worktree-<name>. So the hook never stops a worktree from being made.
+#   - A new branch starts from the remote's default branch as last fetched
+#     (origin/HEAD, else origin/main, else HEAD), with no upstream set. A branch
+#     that already exists is checked out as it is. A folder that is already a
+#     worktree of the repo is reused.
+#   - The files a repo's .worktreeinclude names (ignored files such as .env)
+#     are copied into a new worktree, as Claude Code does. A link is never
+#     followed on either side, so a copy never lands outside the worktree.
+#   - A path that passes through a link below the repo (or below worktrees/)
+#     is refused, as Claude Code refuses it.
+#   - Stdout carries only the path; everything git says goes to stderr.
+# remove:
+#   - Removes only a linked worktree under <root>/worktrees/ or a repo's
+#     .claude/worktrees/, never a main checkout. Its branch is deleted only when
+#     it is merged into the main checkout's HEAD; otherwise it is kept, with a
+#     line on stderr.
+# Unlike Claude Code's own worktrees: worktree.baseRef is not read (a new
+# branch always starts from the remote's default branch), and Claude Code
+# keeps the worktrees a hook made for subagents and workflows; remove them with
+# git worktree remove when the work is done.
+# The hook JSON is read without jq: a value holding a backslash (an escape) is
+# refused, so a quote can never hide inside one. Needs git 2.31 or later.
+#
+# Exit codes: 0 ok; 1 refused or failed (Claude Code then fails the worktree
+# step); 2 usage; 3 wire or unwire could not be done (the reason is printed).
+set -uo pipefail
+
+SELF_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SELF="$SELF_DIR/worktree-hook"
+GP_DIR="$(CDPATH='' cd -- "$SELF_DIR/../.." && pwd -P)"
+# shellcheck source=../lib/common.sh
+. "$GP_DIR/install/lib/common.sh"
+export GIT_TERMINAL_PROMPT=0
+
+fail() { echo "worktree-hook: $*" >&2; exit 1; }
+usage_error() { echo "worktree-hook: $*" >&2; echo "Try: worktree-hook --help" >&2; exit 2; }
+
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+ROOT="" SETTINGS="" DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)     [ $# -ge 2 ] || usage_error "--root needs a value"; ROOT="$2"; shift 2 ;;
+        --settings) [ $# -ge 2 ] || usage_error "--settings needs a value"; SETTINGS="$2"; shift 2 ;;
+        --dry-run)  DRY=1; shift ;;
+        *)          usage_error "unknown option: $1" ;;
+    esac
+done
+case "$CMD" in
+    -h|--help) sed -n '2,49p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    create|remove|wire) [ -n "$ROOT" ] || usage_error "$CMD needs --root <root>" ;;
+    unwire) ;;
+    *) usage_error "the first word must be create, remove, wire or unwire" ;;
+esac
+ROOT="$(expand_home "$ROOT")"
+case "$ROOT" in ""|/*) ;; *) usage_error "--root must be an absolute path or start with ~/" ;; esac
+[ -z "$ROOT" ] || ROOT="$(phys "$ROOT")"
+
+# ---------------------------------------------------------------- hook input
+
+INPUT=""
+read_input() {
+    INPUT="$(cat | tr -d '\r\n')"
+    case "$INPUT" in
+        *\\*) fail "the hook input holds an escaped character; refusing it" ;;
+    esac
+}
+# A top-level string field of the input (no escapes, so no quote inside one).
+field() {
+    printf '%s' "$INPUT" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+# The main checkout of the repo that holds a folder, and its shared git
+# folder; a submodule or a --separate-git-dir clone works too. Sets MAIN and
+# COMMON, both real paths.
+find_main() {
+    local gd list wt
+    COMMON="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+        || fail "$1 is not in a git repo"
+    COMMON="$(phys "$COMMON")"
+    gd="$(phys "$(git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)")"
+    if [ "$gd" = "$COMMON" ]; then
+        # In the main checkout itself.
+        MAIN="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)"
+    else
+        # In a linked worktree: git lists the main checkout first, except for a
+        # submodule, where it lists the git folder and core.worktree names it.
+        list="$(git -C "$1" worktree list --porcelain 2>/dev/null)"
+        [ "$(printf '%s\n' "$list" | sed -n '2p')" != "bare" ] || fail "the repo at $1 is a bare repo"
+        MAIN="$(printf '%s\n' "$list" | sed -n '1s/^worktree //p')"
+        if [ -n "$MAIN" ] && [ "$(phys "$MAIN")" = "$COMMON" ]; then
+            wt="$(git --git-dir="$COMMON" config --get core.worktree 2>/dev/null || true)"
+            case "$wt" in "") MAIN="" ;; /*) MAIN="$wt" ;; *) MAIN="$COMMON/$wt" ;; esac
+        fi
+    fi
+    if [ -z "$MAIN" ] || [ ! -d "$MAIN" ]; then fail "the repo at $1 has no main checkout (a bare repo?)"; fi
+    MAIN="$(phys "$MAIN")"
+}
+
+# 0 when some part of path below base (base itself not counted) is a link.
+link_below() {   # base path
+    local p="$2"
+    while [ "${#p}" -gt "${#1}" ]; do
+        [ -L "$p" ] && return 0
+        p="${p%/*}"
+    done
+    return 1
+}
+
+# 0 when the main checkout is a layout repo: the instance's home, directly in
+# the root and holding a manifest, or a repo at <root>/repos/<owner>/<repo>.
+layout_repo() {
+    local rest
+    [ -n "$ROOT" ] && [ -d "$ROOT/worktrees" ] || return 1
+    case "$MAIN/" in "$ROOT"/?*) ;; *) return 1 ;; esac
+    rest="${MAIN#"$ROOT"/}"
+    case "$rest" in
+        repos/*/*/*) return 1 ;;
+        repos/*/*) return 0 ;;
+        */*) return 1 ;;
+        *) [ -f "$MAIN/.ghost-protocol/instance.toml" ] ;;
+    esac
+}
+
+# 0 when a folder is the top of a worktree of the repo at $COMMON.
+our_worktree() {
+    [ -d "$1" ] && [ ! -L "$1" ] && same_repo "$1" \
+        && [ "$(phys "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)")" = "$(phys "$1")" ]
+}
+
+# Copy the ignored files the repo's .worktreeinclude names into a new worktree.
+# Links are never followed, on either side: a source that is a link or sits
+# under a linked folder is skipped, and so is a destination that already
+# exists (a dangling link included) or whose path holds a link (the branch may
+# carry one). The destination's folder, by its real path, must stay inside the
+# worktree.
+copy_includes() {   # dest
+    local f n=0 skipped=0 wt d
+    [ -f "$MAIN/.worktreeinclude" ] || return 0
+    wt="$(phys "$1")"
+    while IFS= read -r -d '' f; do
+        case "/$f/" in */../*|*/./*|*//*) skipped=$((skipped + 1)); continue ;; esac
+        if [ ! -f "$MAIN/$f" ] || link_below "$MAIN" "$MAIN/$f" || ! git -C "$MAIN" check-ignore -q -- "$f"; then
+            skipped=$((skipped + 1)); continue
+        fi
+        if [ -e "$wt/$f" ] || [ -L "$wt/$f" ] || link_below "$wt" "$wt/$f"; then
+            skipped=$((skipped + 1)); continue
+        fi
+        d="$(dirname "$wt/$f")"
+        if ! mkdir -p "$d"; then skipped=$((skipped + 1)); continue; fi
+        case "$(phys "$d")/" in "$wt"/*) ;; *) skipped=$((skipped + 1)); continue ;; esac
+        if link_below "$wt" "$d"; then skipped=$((skipped + 1)); continue; fi
+        if cp -p "$MAIN/$f" "$wt/$f"; then n=$((n + 1)); else skipped=$((skipped + 1)); fi
+    done < <(git -C "$MAIN" ls-files -z --others --ignored --exclude-from="$MAIN/.worktreeinclude" 2>/dev/null)
+    [ "$n" -eq 0 ] || echo "worktree-hook: copied $n file(s) named by .worktreeinclude" >&2
+    [ "$skipped" -eq 0 ] || echo "worktree-hook: skipped $skipped file(s) named by .worktreeinclude (a link, or not a plain ignored file)" >&2
+}
+
+# A branch-like worktree name: letters, digits, . _ - and / between parts.
+name_ok() {
+    local re='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$'
+    [[ $1 =~ $re ]] || return 1
+    case "$1" in *..*|*.lock|*.lock/*|*/) return 1 ;; esac
+    [ "${#1}" -le 100 ]
+}
+
+# 0 when a folder is a worktree (or the main checkout) of the repo at $COMMON.
+same_repo() {
+    local c
+    c="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+    [ "$(phys "$c")" = "$COMMON" ]
+}
+
+# ---------------------------------------------------------------- create
+
+do_create() {
+    local cwd name repo dest branch default base ref
+    read_input
+    cwd="$(field cwd)"
+    name="$(field name)"
+    if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then fail "the hook input names no folder that exists (cwd)"; fi
+    name_ok "$name" || fail "unusable worktree name: '$name'"
+    find_main "$cwd"
+    repo="${MAIN##*/}"
+    dest=""
+    if layout_repo; then
+        dest="$ROOT/worktrees/$repo/$name"
+        branch="$name"
+        if link_below "$ROOT/worktrees" "$dest"; then
+            fail "$dest passes through a link below $ROOT/worktrees; refusing it"
+        fi
+        if { [ -e "$dest" ] || [ -L "$dest" ]; } && ! our_worktree "$dest"; then
+            echo "worktree-hook: $dest is taken (not a worktree of $MAIN); using Claude Code's own place" >&2
+            dest=""
+        fi
+    fi
+    if [ -z "$dest" ]; then
+        dest="$MAIN/.claude/worktrees/$name"
+        branch="worktree-$name"
+        if link_below "$MAIN" "$dest"; then
+            fail "$dest passes through a link below $MAIN; refusing it"
+        fi
+    fi
+    git check-ref-format --branch "$branch" >/dev/null 2>&1 || fail "'$branch' is not a usable branch name"
+    default="$(git -C "$MAIN" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    default="${default#origin/}"
+    if [ "$branch" = "${default:-main}" ] || [ "$branch" = "$(git -C "$MAIN" symbolic-ref -q --short HEAD 2>/dev/null || true)" ]; then
+        fail "'$branch' is the default branch or the main checkout's branch; pick another worktree name"
+    fi
+
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if our_worktree "$dest"; then
+            echo "worktree-hook: reusing the worktree at $dest" >&2
+            phys "$dest"; echo
+            return 0
+        fi
+        fail "$dest exists and is not a worktree of $MAIN"
+    fi
+    mkdir -p "$(dirname "$dest")" || fail "could not make $(dirname "$dest")"
+    if git -C "$MAIN" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$MAIN" worktree add "$dest" "$branch" >&2 \
+            || fail "git worktree add $dest $branch failed (is the branch checked out somewhere else?)"
+    else
+        base=""
+        ref="$(git -C "$MAIN" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null || true)"
+        [ -n "$ref" ] && base="$ref"
+        if [ -z "$base" ] && git -C "$MAIN" show-ref --verify --quiet refs/remotes/origin/main; then
+            base=refs/remotes/origin/main
+        fi
+        [ -n "$base" ] || base=HEAD
+        git -C "$MAIN" worktree add --no-track -b "$branch" "$dest" "$base" >&2 \
+            || fail "git worktree add -b $branch $dest $base failed"
+    fi
+    copy_includes "$dest"
+    phys "$dest"; echo
+}
+
+# ---------------------------------------------------------------- remove
+
+do_remove() {
+    local path wt gd branch d stop
+    read_input
+    path="$(field worktree_path)"
+    case "$path" in /*) ;; *) fail "the hook input names no absolute worktree_path" ;; esac
+    [ -e "$path" ] || { echo "worktree-hook: $path is already gone" >&2; return 0; }
+    wt="$(phys "$path")"
+    find_main "$wt"
+    gd="$(git -C "$wt" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || fail "$wt is not a worktree"
+    [ "$(phys "$gd")" != "$COMMON" ] || fail "$wt is a main checkout, not a linked worktree; refusing to remove it"
+    [ "$(phys "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)")" = "$wt" ] \
+        || fail "$wt is not the top of a worktree"
+    stop=""
+    case "$wt/" in
+        "$ROOT/worktrees/"?*) stop="$ROOT/worktrees" ;;
+        "$MAIN/.claude/worktrees/"?*) stop="$MAIN/.claude/worktrees" ;;
+        *) fail "$wt is not under $ROOT/worktrees/ or $MAIN/.claude/worktrees/; this hook removes only worktrees it places" ;;
+    esac
+    branch="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+    git -C "$MAIN" worktree remove --force "$wt" >&2 || fail "git worktree remove $wt failed"
+    if [ -n "$branch" ]; then
+        if git -C "$MAIN" merge-base --is-ancestor "refs/heads/$branch" HEAD 2>/dev/null \
+            && git -C "$MAIN" branch -D "$branch" >/dev/null 2>&1; then
+            echo "worktree-hook: deleted branch $branch (merged into $MAIN's HEAD)" >&2
+        else
+            echo "worktree-hook: kept branch $branch (not merged into $MAIN's HEAD)" >&2
+        fi
+    fi
+    # Empty parent folders up to worktrees/ go too.
+    d="$(dirname "$wt")"
+    while [ "$d" != "$stop" ] && [ "${#d}" -gt "${#stop}" ] && rmdir "$d" 2>/dev/null; do
+        d="$(dirname "$d")"
+    done
+    [ ! -e "$wt" ] || fail "$wt is still there"
+}
+
+# ---------------------------------------------------------------- wire / unwire
+
+MARK="/install/layout/worktree-hook "
+settings_file() { printf '%s' "${SETTINGS:-$HOME/.claude/settings.json}"; }
+
+# Write $2 (JSON text) to the file $1 names. A link is followed, so the link
+# stays and its file changes. The new text goes through a temp file beside
+# that file, made as a copy of it (so it keeps its mode); the old text is kept
+# as <$1>.bak-<time>, beside the path as named (not inside a dotfiles repo a
+# link points into).
+replace_json() {
+    local f tmp
+    f="$(real_file "$1")" || return 1
+    tmp="$(mktemp "$(dirname "$f")/.settings.XXXXXX")" || return 1
+    if ! { cp -p "$f" "$tmp" && printf '%s\n' "$2" >"$tmp" && cp -p "$f" "$1.bak-$(date +%Y%m%d-%H%M%S)"; }; then
+        rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$f"
+}
+
+do_wire() {
+    local f create remove merged re='^/[A-Za-z0-9._/-]+$'
+    f="$(settings_file)"
+    [[ $SELF =~ $re ]] || { echo "not wired: the hook's path ($SELF) holds characters a hook command cannot carry unquoted"; return 3; }
+    [[ $ROOT =~ $re ]] || { echo "not wired: the root ($ROOT) holds characters a hook command cannot carry unquoted"; return 3; }
+    create="$SELF create --root $ROOT"
+    remove="$SELF remove --root $ROOT"
+    if [ ! -e "$f" ]; then
+        if [ "$DRY" = "1" ]; then echo "would wire: write $f with the WorktreeCreate and WorktreeRemove hooks"; return 0; fi
+        mkdir -p "$(dirname "$f")" || return 1
+        printf '{\n  "hooks": {\n    "WorktreeCreate": [\n      { "hooks": [ { "type": "command", "command": "%s" } ] }\n    ],\n    "WorktreeRemove": [\n      { "hooks": [ { "type": "command", "command": "%s" } ] }\n    ]\n  }\n}\n' \
+            "$create" "$remove" >"$f" || return 1
+        echo "wired: wrote $f"
+        return 0
+    fi
+    # Both commands there, as JSON strings: already wired (this needs no jq).
+    if grep -qF -- "\"$create\"" "$f" && grep -qF -- "\"$remove\"" "$f"; then
+        echo "already wired: $f"
+        return 0
+    fi
+    command -v jq >/dev/null 2>&1 || { echo "not wired: $f exists, and adding to it needs jq"; return 3; }
+    jq -e . "$f" >/dev/null 2>&1 || { echo "not wired: $f is not valid JSON"; return 3; }
+    if jq -e --arg c "$create" --arg r "$remove" '
+        any(.hooks.WorktreeCreate[]?.hooks[]?.command; . == $c)
+        and any(.hooks.WorktreeRemove[]?.hooks[]?.command; . == $r)' "$f" >/dev/null 2>&1; then
+        echo "already wired: $f"
+        return 0
+    fi
+    if jq -e --arg m "$MARK" '[.hooks.WorktreeCreate[]?.hooks[]?.command | tostring | select(contains($m) | not)] | length > 0' "$f" >/dev/null 2>&1; then
+        echo "not wired: $f already has another WorktreeCreate hook; Claude Code would run both, so this one is not added"
+        return 3
+    fi
+    merged="$(jq --arg c "$create" --arg r "$remove" --arg m "$MARK" '
+        def ours: any(.hooks[]?; (.command | tostring | contains($m)));
+        .hooks = (.hooks // {})
+        | .hooks.WorktreeCreate = ([.hooks.WorktreeCreate[]? | select(ours | not)] + [{hooks: [{type: "command", command: $c}]}])
+        | .hooks.WorktreeRemove = ([.hooks.WorktreeRemove[]? | select(ours | not)] + [{hooks: [{type: "command", command: $r}]}])' "$f")" \
+        || { echo "not wired: jq could not merge the hooks into $f"; return 3; }
+    if [ "$DRY" = "1" ]; then echo "would wire: add the WorktreeCreate and WorktreeRemove hooks to $f"; return 0; fi
+    replace_json "$f" "$merged" || return 1
+    echo "wired: added the hooks to $f (the old copy is beside it as .bak-<time>)"
+}
+
+do_unwire() {
+    local f out
+    f="$(settings_file)"
+    [ -e "$f" ] || { echo "not wired: there is no $f"; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo "not unwired: changing $f needs jq"; return 3; }
+    if ! jq -e --arg m "$MARK" '[.hooks.WorktreeCreate[]?, .hooks.WorktreeRemove[]? | .hooks[]?.command | tostring | select(contains($m))] | length > 0' "$f" >/dev/null 2>&1; then
+        echo "not wired: $f has no worktree-hook entries"
+        return 0
+    fi
+    out="$(jq --arg m "$MARK" '
+        def ours: any(.hooks[]?; (.command | tostring | contains($m)));
+        def prune($k): if (.hooks[$k] | type) == "array" then
+                .hooks[$k] |= map(select(ours | not)) | (if .hooks[$k] == [] then del(.hooks[$k]) else . end)
+            else . end;
+        prune("WorktreeCreate") | prune("WorktreeRemove")
+        | if .hooks == {} then del(.hooks) else . end' "$f")" \
+        || { echo "not unwired: jq could not edit $f"; return 3; }
+    if [ "$DRY" = "1" ]; then echo "would unwire: take the worktree-hook entries out of $f"; return 0; fi
+    replace_json "$f" "$out" || return 1
+    echo "unwired: took the worktree-hook entries out of $f"
+}
+
+case "$CMD" in
+    create) do_create ;;
+    remove) do_remove ;;
+    wire)   do_wire ;;
+    unwire) do_unwire ;;
+esac

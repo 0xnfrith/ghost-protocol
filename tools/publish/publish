@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# publish: copies the public part of this repository's history into another repository, one commit per internal commit.
+#
+#   publish [--apply] [--ref <ref>] [--branch <name>] [--scan <program>] [--words <file>]... <target>
+#
+# <target> is a repository to push to (a URL or a path). It is a dry run unless --apply is given: everything is built and scanned,
+# and the plan is printed, but nothing is pushed.
+#
+# What it does, from the root of a full clone:
+#   1. reads the target's branch (default main). If the target is empty, the one new commit is the first one: the export of
+#      <ref> (default HEAD) with no history, which must hold LICENSE. If it is not empty, the target's head must be an export
+#      of one of the commits of <ref>'s first-parent history (found by comparing trees; nothing else is trusted). Every commit after
+#      that one is then published, in order. A commit whose export equals the one before it (it changed nothing public) is skipped,
+#      so there is never an empty commit.
+#   2. each new public commit holds the export of its internal commit (tools/publish/export), is made by the bot identity below
+#      (author and committer both), has the internal commit's author date, and carries the subject line only: no body, no trailer,
+#      and the " (#<number>)" that the merge adds to the subject is cut. A subject that still holds an internal pull request
+#      number in the merge's own forms is refused: a number after a # alone in brackets anywhere else in it ("(#12)", as in a
+#      revert's subject), or a merge subject ("Merge pull request #12", "Merge pull-request #3", "Merge PR #3", in any case); so
+#      is U+266F (the music sharp sign) used as a # before a number. The stop names the way past it: a line "<the commit's full
+#      id> <a public subject>" in tools/publish/internal/subjects (never public), merged to main, gives that commit its public
+#      subject, made and scanned as any other. Then each # before a number at the start of a word is taken out ("follow-up to
+#      #149" becomes "follow-up to 149", "[#12]" becomes "[12]", "(#12, #13)" becomes "(12, 13)"), as it would link to a pull
+#      request in the public repository; "C#9" stays. Both read the subject as the scan does (full-width, or split by an
+#      invisible character): tools/publish/scan subject makes it, and the scan's --public rule is the backstop.
+#      A commit with an encoding header other than UTF-8 is refused: its text is never decoded, so it is never published.
+#   3. before anything is pushed, the scan (tools/publish/scan, or --scan) runs on the files each commit adds or changes (the whole
+#      tree for the first commit), and on each public commit it made, which is what goes public of the commit's fields: its whole raw
+#      object, so the cut subject, the bot as author and committer, and the dates. That commit's message must be one line, read back
+#      from the object. When the subject was several lines of the internal message (git joins them with spaces), those lines are
+#      scanned each as its own line too. The internal commit's body, trailers, author and committer are never published, so they
+#      are not scanned. One hit stops everything, and nothing is pushed. With no scan,
+#      nothing is published, dry run or not. --words files go to the scan.
+#   4. with --apply, one plain push of the new head to the target's branch. Never a force: a target that moved meanwhile refuses it.
+#
+# The bot identity is GP_PUBLISH_NAME and GP_PUBLISH_EMAIL (default: "GP Publisher" and a users.noreply.github.com address). The
+# email must be a noreply address. The internal repository is only read; the work is done in a scratch repository.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+die() { echo "publish: $*" >&2; exit 2; }
+
+apply=false
+ref=HEAD
+branch=main
+scan=$here/scan
+words=()
+target=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --apply) apply=true; shift ;;
+    --ref) [ $# -ge 2 ] || die "--ref needs a value"; ref=$2; shift 2 ;;
+    --branch) [ $# -ge 2 ] || die "--branch needs a value"; branch=$2; shift 2 ;;
+    --scan) [ $# -ge 2 ] || die "--scan needs a program"; scan=$2; shift 2 ;;
+    --words) [ $# -ge 2 ] || die "--words needs a file"; words+=(--words "$2"); shift 2 ;;
+    -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$target" ] || die "one target only"; target=$1; shift ;;
+  esac
+done
+[ -n "$target" ] || die "no target"
+case $target in -*) die "the target cannot start with -" ;; esac
+case $branch in '' | -* | *[!A-Za-z0-9._/-]*) die "bad branch name" ;; esac
+
+# The bot identity, built so that this file holds no address.
+bot_name=${GP_PUBLISH_NAME:-GP Publisher}
+bot_email=${GP_PUBLISH_EMAIL:-gp-publisher@users.""noreply.github.com}
+[[ $bot_name =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]*$ ]] || die "bad bot name"
+[[ $bot_email =~ ^[A-Za-z0-9._+-]+@users\.noreply\.github\.com$ ]] || die "the bot's email must be a users.noreply.github.com address"
+
+[ -x "$scan" ] || die "no scan program at $scan: nothing is published without a scan"
+
+src_objects=$(git rev-parse --path-format=absolute --git-path objects) || die "not in a git repository"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+git init -q --bare "$work/w.git"
+printf '%s\n' "$src_objects" >"$work/w.git/objects/info/alternates"
+G() { git --git-dir="$work/w.git" "$@"; }
+export GIT_TERMINAL_PROMPT=0
+
+head=$(git rev-parse --verify --quiet "$ref^{commit}") || die "no commit $ref"
+export_tree() { GIT_DIR=$work/w.git "$here/export" --tree "$1"; }
+run_scan() { GIT_DIR=$work/w.git "$scan" "$@" ${words[@]+"${words[@]}"}; }
+encoding_ok() { # internal commit: it has no encoding header, or only UTF-8 ones. Another encoding is refused, not decoded; so is
+  # a commit that cannot be read.
+  local hdr e
+  hdr=$(G cat-file commit "$1" | sed -n -e '/^$/q' -e 's/^encoding\( \|$\)/e:/p') || return 1
+  while IFS= read -r e; do
+    case ${e,,} in '' | e:utf-8 | e:utf8) ;; *) return 1 ;; esac
+  done <<<"$hdr"
+}
+# Public subjects given by hand, for a commit whose own subject is refused (the way past it): read from <ref>'s tree, so a line
+# merged to main is used by the next run. Each line is "<the commit's full id> <its public subject>"; # starts a comment.
+declare -A given=()
+n=0
+while IFS= read -r l; do
+  n=$((n + 1))
+  [[ $l =~ ^[[:space:]]*(#|$) ]] && continue
+  [[ $l =~ ^([0-9a-f]{40}|[0-9a-f]{64})\ (.*[^[:space:]].*)$ ]] || die "line $n of tools/publish/internal/subjects is not \"<full commit id> <subject>\""
+  given[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+done < <(G show "$head:tools/publish/internal/subjects" 2>/dev/null || true)
+given_subject() { # internal commit: prints the subject given for it, if a line names it
+  local id
+  id=$(G rev-parse "$1")
+  [ -n "${given[$id]+x}" ] || return 1
+  printf '%s' "${given[$id]}"
+}
+public_subject() { # text: the public subject made from it (tools/publish/scan subject: the end number cut, refused if an internal
+  # pull request number is left or U+266F is used as a #, the # taken out of a # before a number at the start of a word); exit 1
+  # when it is refused
+  printf '%s' "$1" | "$here/scan" subject 2>/dev/null
+}
+subject_of() { # the public subject of internal commit $1
+  local s rc=0 short id
+  short=$(G rev-parse --short "$1")
+  id=$(G rev-parse "$1")
+  s=$(given_subject "$1") || s=$(G log -1 --format=%s "$1")
+  s=$(public_subject "$s") || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    die "the subject of $short still holds an internal pull request number (a number after a # alone in brackets, as in a \
+revert's subject, or a merge subject) or U+266F used as a #: it is not published, and nothing after it is. The way past: give \
+that commit a public subject, a line \"$id <the public subject>\" in tools/publish/internal/subjects, merged to main; the next \
+run publishes it with that subject"
+  fi
+  [ "$rc" -eq 0 ] || die "cannot make the public subject of $short (tools/publish/scan subject failed): not published"
+  [ -n "$s" ] || s="Update"
+  printf '%s' "$s"
+}
+one_line() { # commit: its message, read back from the object itself, is exactly one line that is not blank
+  G cat-file commit "$1" | sed '1,/^$/d' | awk 'NR == 1 { l = $0 } END { exit !(NR == 1 && l ~ /[^[:space:]]/) }'
+}
+subject_lines() { # internal commit, its public subject, tree, date: when %s joined several lines of the message's first paragraph
+  # with spaces, the scan reads them each as its own line too, so that a rule tied to a line (^, $, a line break) sees them as
+  # they were written. What is scanned is still only the public subject: the same text, made the same way, with its line breaks.
+  # A subject given by hand is one line: nothing to do.
+  local text lines id
+  given_subject "$1" >/dev/null && return 0
+  text=$(G cat-file commit "$1" | sed '1,/^$/d' | awk '!b && /^[[:space:]]*$/ { next } /^[[:space:]]*$/ { exit } { b = 1; sub(/[[:space:]]+$/, ""); print }')
+  [[ $text == *$'\n'* ]] || return 0
+  lines=$(public_subject "$text") || die "cannot read the subject of $(G rev-parse --short "$1") line by line: not published"
+  [ "${lines//$'\n'/ }" = "$2" ] || die "cannot read the subject of $(G rev-parse --short "$1") line by line: not published"
+  id=$(make_commit "$3" "" "$lines" "$4")
+  run_scan commit "$id" || die "the scan stopped the publish (the subject of $(G rev-parse --short "$1"), line by line)"
+}
+make_commit() { # tree parent-or-empty subject date: prints the new commit's id
+  local args=(-m "$3")
+  [ -z "$2" ] || args=(-p "$2" "${args[@]}")
+  GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email GIT_AUTHOR_DATE=$4 \
+    GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email GIT_COMMITTER_DATE=$4 \
+    G commit-tree "${args[@]}" "$1"
+}
+
+# 1. The target.
+remote_head=$(G ls-remote --heads "$target" "refs/heads/$branch") || die "cannot read the target"
+parent=""
+prev_tree=""
+base_note="the target is empty: this is the first public commit"
+todo=()
+if [ -n "$remote_head" ]; then
+  G fetch -q --no-tags --depth 1 "$target" "+refs/heads/$branch:refs/gp/target" || die "cannot fetch the target's $branch"
+  parent=$(G rev-parse refs/gp/target)
+  prev_tree=$(G rev-parse "refs/gp/target^{tree}")
+  mapfile -t chain < <(G rev-list --first-parent --max-count="${GP_PUBLISH_MAX_SEARCH:-2000}" "$head")
+  found=-1
+  for i in "${!chain[@]}"; do
+    if t=$(export_tree "${chain[$i]}" 2>/dev/null) && [ "$t" = "$prev_tree" ]; then found=$i; break; fi
+  done
+  [ "$found" -ge 0 ] || die "the target's $branch is not an export of any commit in the history of $ref: not touching it (no force)"
+  base_note="the target's $branch is the export of $(G rev-parse --short "${chain[$found]}")"
+  for ((i = found - 1; i >= 0; i--)); do todo+=("${chain[$i]}"); done
+else
+  todo=("$head")
+fi
+
+# 2 and 3. Build and scan.
+published=()
+skipped=0
+first=false
+[ -n "$parent" ] || first=true
+for c in ${todo[@]+"${todo[@]}"}; do
+  t=$(export_tree "$c") || die "cannot export $(G rev-parse --short "$c")"
+  if [ "$t" = "$prev_tree" ]; then skipped=$((skipped + 1)); continue; fi
+  encoding_ok "$c" || die "the commit $(G rev-parse --short "$c") has an encoding other than UTF-8: not decoded, not published"
+  date=$(G log -1 --format=%aI "$c")
+  if $first; then
+    G cat-file -e "$t:LICENSE" 2>/dev/null || die "the first commit would not hold LICENSE: not published"
+    subject="First public commit"
+    run_scan tree "$t" || die "the scan stopped the publish (the first tree)"
+  else
+    subject=$(subject_of "$c")
+    run_scan tree "$t" --since "$prev_tree" || die "the scan stopped the publish (the files of $(G rev-parse --short "$c"))"
+  fi
+  new=$(make_commit "$t" "$parent" "$subject" "$date")
+  # The scan below reads only this commit, so its message must be one line, however it was built: checked on the made object.
+  one_line "$new" || die "the public commit of $(G rev-parse --short "$c") has a message of more than one line: not published"
+  run_scan commit "$new" --public --allow-email "$bot_email" || die "the scan stopped the publish (a public commit)"
+  $first || subject_lines "$c" "$subject" "$t" "$date"
+  published+=("$new")
+  parent=$new
+  prev_tree=$t
+  first=false
+done
+
+# The plan.
+echo "publish: $base_note"
+echo "publish: ${#published[@]} new public commit(s); $skipped internal commit(s) skipped (nothing public changed)"
+for p in ${published[@]+"${published[@]}"}; do echo "  $(G rev-parse --short "$p") $(G log -1 --format=%s "$p")"; done
+if [ ${#published[@]} -eq 0 ]; then echo "publish: nothing to publish"; exit 0; fi
+if ! $apply; then echo "publish: dry run, nothing pushed (--apply pushes)"; exit 0; fi
+
+# 4. The push: plain, so a moved target refuses it.
+G push -q "$target" "${published[${#published[@]} - 1]}:refs/heads/$branch" || die "the push was refused; nothing was forced"
+echo "publish: pushed ${#published[@]} commit(s) to $branch"

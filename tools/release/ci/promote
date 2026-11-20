@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# The step after a release is promoted: adds the plain version tag, <image>:<version>, to the image the release pinned. An agent's
+# release check offers only plain x.y.z tags, so this is the moment every install is offered the release. The release run pushed
+# the image as <image>:pre-<version> (tools/release/ci/run); this tag names the same image, byte for byte (the same digest).
+#
+# Meant for the release workflow, on a release that is promoted (GitHub's "released" event), and runnable by hand with a
+# registry sign-in. In its environment:
+#   GP_RELEASE_TAG       the release's tag (v<x.y.z> or v<x.y.z>-<pre-release>)
+#   GH_TOKEN             write access to the repository's packages (and read of its releases); used to sign in to the registry
+#                        (from stdin) and by gh; never in a command line
+#   GITHUB_REPOSITORY    owner/name (or GP_RELEASE_REPO)
+#   GITHUB_ACTOR         the user name for the registry sign-in (default gp-release)
+#   GP_RELEASE_REGISTRY  the registry (default ghcr.io); the image is <registry>/<owner>/<name> in lower case
+#   GP_RELEASE_LOGIN     0: do not sign in to the registry (a local registry, or one signed in already)
+#   GP_RELEASE_GITHUB    0: no GitHub release to read; the digest is GP_RELEASE_DIGEST (a local proof)
+#   GP_RELEASE_DRY       1: check and print the plan; tag nothing
+#
+# It refuses (exit 2) when the release is still a pre-release, a draft or withdrawn; when its get.sh does not pin
+# <image>:<version>@<digest>; when that image is not in the registry; and when <image>:<version> is there already for another
+# digest: a tag is never moved. When the tag is there for this digest, there is nothing to do (exit 0).
+# Needs jq and Docker with buildx; gh unless GP_RELEASE_GITHUB=0.
+set -euo pipefail
+
+die() { echo "promote: $*" >&2; exit 2; }
+say() { echo "promote: $*"; }
+
+tag=${GP_RELEASE_TAG:-}
+[ -n "$tag" ] || die "GP_RELEASE_TAG is not set"
+semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'
+[[ $tag =~ ^v$semver$ ]] || die "the tag '$tag' is not v<x.y.z> or v<x.y.z>-<pre-release>"
+version=${tag#v}
+repo=${GP_RELEASE_REPO:-${GITHUB_REPOSITORY:-}}
+[[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]] || die "GITHUB_REPOSITORY (owner/name) is not set"
+registry=${GP_RELEASE_REGISTRY:-ghcr.io}
+[[ $registry =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$ ]] || die "GP_RELEASE_REGISTRY is not a registry host"
+login=${GP_RELEASE_LOGIN:-1}
+github=${GP_RELEASE_GITHUB:-1}
+dry=${GP_RELEASE_DRY:-0}
+image="$registry/$(tr '[:upper:]' '[:lower:]' <<<"$repo")"
+ref="$image:$version"
+for tool in jq docker; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"; done
+
+# 1. The release is promoted, and the digest it pins.
+if [ "$github" = 0 ]; then
+  digest=${GP_RELEASE_DIGEST:-}
+  say "no GitHub release read (GP_RELEASE_GITHUB=0): the digest is GP_RELEASE_DIGEST"
+else
+  command -v gh >/dev/null 2>&1 || die "gh is not installed"
+  rel=$(gh release view "$tag" --repo "$repo" --json isPrerelease,isDraft,body 2>/dev/null) || die "no release $tag in $repo"
+  [ "$(jq -r .isDraft <<<"$rel")" = false ] || die "$tag is a draft"
+  [ "$(jq -r .isPrerelease <<<"$rel")" = false ] ||
+    die "$tag is still a pre-release: it is promoted (tools/release/mark promote) once one of our agents has run it cleanly"
+  case $(jq -r .body <<<"$rel") in "WITHDRAWN:"*) die "$tag was withdrawn" ;; esac
+  getsh=$(gh release download "$tag" --repo "$repo" --pattern get.sh --output - 2>/dev/null) || die "cannot read the get.sh of $tag"
+  pins=$(grep -oE '[a-z0-9][a-z0-9.:/_-]*:[0-9A-Za-z.-]+@sha256:[0-9a-f]{64}' <<<"$getsh" | sort -u || true)
+  [ "$(grep -c . <<<"$pins")" = 1 ] || die "the get.sh of $tag does not pin one image"
+  [ "${pins%@*}" = "$ref" ] || die "the get.sh of $tag pins ${pins%@*}, not $ref"
+  digest=${pins##*@}
+fi
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "the digest '$digest' is not sha256:<64 hex>"
+say "$tag pins $ref@$digest"
+
+# 2. The image is there, and the tag is not yet, or names it already.
+if [ "$login" != 0 ]; then
+  : "${GH_TOKEN:?GH_TOKEN is not set}"
+  printf '%s' "$GH_TOKEN" | docker login "$registry" -u "${GITHUB_ACTOR:-gp-release}" --password-stdin >/dev/null
+fi
+digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er '.digest'; }
+have=$(digest_of "$image@$digest" 2>/dev/null) || die "$image@$digest is not in the registry"
+[ "$have" = "$digest" ] || die "the registry gives $have for $image@$digest"
+if now=$(digest_of "$ref" 2>/dev/null); then
+  [ "$now" = "$digest" ] || die "$ref is in the registry already, as $now, not $digest: a tag is never moved"
+  say "$ref is already $digest: nothing to do"
+  exit 0
+fi
+
+# 3. The tag: the same manifest, under the plain version.
+say "would: tag $image@$digest as $ref (every install's release check then offers $version)"
+if [ "$dry" = 1 ]; then say "dry run: nothing tagged"; exit 0; fi
+docker buildx imagetools create --tag "$ref" "$image@$digest" >/dev/null
+now=$(digest_of "$ref") || die "cannot read $ref back"
+[ "$now" = "$digest" ] || die "$ref is $now after tagging, not $digest"
+say "$ref is $digest"

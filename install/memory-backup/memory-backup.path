@@ -1,0 +1,26 @@
+# A memory backup right after a memory write, for the Ghost Protocol instance
+# @NAME@ (this unit is @UNIT@.path). Made by the installer from
+# install/memory-backup/memory-backup.path.
+#
+# The plugin's hook (hooks/memory-backup) runs after each Write or Edit in a
+# Claude Code session. When the file it wrote is inside the memory folder that
+# a root-owned settings file names, it writes the time into the trigger file
+# below, in the backup's state folder; this unit then starts
+# @UNIT@.service. A hook cannot start a system unit itself, and
+# this way every backup runs in the same sandbox, one at a time.
+#
+# A write that lands while a backup runs is picked up by the next one: the
+# next memory write, or the timer within 15 minutes. Writes that never pass
+# through the hook (Claude Code's own background memory work) are the timer's.
+#
+# Check: systemctl status @UNIT@.path
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: a memory backup right after a memory write
+
+[Path]
+PathChanged=@STATE@/trigger
+Unit=@UNIT@.service
+
+[Install]
+WantedBy=paths.target

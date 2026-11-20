@@ -1,0 +1,328 @@
+{
+  "name": "ghost-protocol",
+  "displayName": "Ghost Protocol",
+  "version": "0.15.2",
+  "description": "A personal agent system for Claude Code. First adapter: Buzz, a channel that pushes Buzz mentions into a running session.",
+  "author": {
+    "name": "0xnfrith"
+  },
+  "repository": "https://github.com/0xnfrith/ghost-protocol",
+  "license": "Elastic-2.0",
+  "keywords": [
+    "agent",
+    "channel",
+    "buzz",
+    "nostr"
+  ],
+  "userConfig": {
+    "buzz_relay_url": {
+      "type": "string",
+      "title": "Buzz relay URL",
+      "description": "Your Buzz relay, for example https://relay.example.com. Needed unless Key service socket folder is set; then the key service has its own.",
+      "default": ""
+    },
+    "buzz_key_command": {
+      "type": "string",
+      "title": "Key command",
+      "description": "A command that prints the agent's relay private key (hex or nsec1), for example: op read op://<vault>/<item>/<field>. Its output is kept in memory only. Needed unless Key service socket folder is set; then leave it empty, so this side holds no way to the key.",
+      "default": ""
+    },
+    "buzz_key_socket": {
+      "type": "string",
+      "title": "Key service socket folder",
+      "description": "Leave empty (the default) to use the key command. With a key service, which runs the Buzz servers as another OS user that holds the key, the folder of its sockets, for example /run/ghost-protocol-key/<instance>. The session then holds no key, and the relay, channels and the other Buzz settings are the key service's.",
+      "default": ""
+    },
+    "buzz_channels": {
+      "type": "string",
+      "title": "Channels",
+      "description": "Comma-separated ids of the Buzz channels to listen in, or * for every channel the agent is in (followed live). Only mentions, and direct messages, in these channels reach the session. Needed unless Key service socket folder is set.",
+      "default": ""
+    },
+    "buzz_watch_pubkey": {
+      "type": "string",
+      "title": "Watched public key",
+      "description": "Whose mentions to deliver (hex or npub1). Leave empty to use the public key of the key above.",
+      "default": ""
+    },
+    "buzz_dm_messages": {
+      "type": "string",
+      "title": "Direct messages",
+      "description": "mentions (the default): only messages that mention the agent, as in channels. all: in a one-to-one DM with someone in Trusted people, every message they send reaches the session.",
+      "options": [
+        "all",
+        "mentions"
+      ],
+      "default": "mentions"
+    },
+    "buzz_trusted_pubkeys": {
+      "type": "string",
+      "title": "Trusted people",
+      "description": "Comma-separated public keys (hex or npub1) whose one-to-one DMs deliver every message when Direct messages is all. Nobody else is trusted, the agent's owner included.",
+      "default": ""
+    },
+    "buzz_allowed_pubkeys": {
+      "type": "string",
+      "title": "Allowed senders",
+      "description": "Comma-separated public keys (hex or npub1) of the people whose messages may reach the agent. When this or Allowlist file is set, messages from anyone else, except Trusted people, are dropped. Leave both empty to let anyone who mentions the agent reach it.",
+      "default": ""
+    },
+    "buzz_allowlist_file": {
+      "type": "string",
+      "title": "Allowlist file",
+      "description": "Path to a JSON file of allowed senders, shaped {\"entries\":[{\"pubkey\":\"<hex or npub1>\"}]}. Only pubkey is read. It is read again when it changes; replace it in one step (write a new file, then rename it over the old one).",
+      "default": ""
+    },
+    "buzz_mcp_path": {
+      "type": "string",
+      "title": "buzz-mcp path",
+      "description": "Path to a built buzz-mcp.mjs. Leave empty to use the one adapters/buzz/scripts/build-buzz-mcp.sh builds.",
+      "default": ""
+    },
+    "reply_guard": {
+      "type": "string",
+      "title": "Reply guard",
+      "description": "on (the default): a turn in which your operator messaged the agent on Buzz cannot end until each message has an answer on Buzz. off: no check.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "buzz_operator_pubkeys": {
+      "type": "string",
+      "title": "Operator",
+      "description": "Comma-separated public keys (hex or npub1) of the operator, whose Buzz messages the reply guard makes sure get an answer. Leave empty to use Trusted people.",
+      "default": ""
+    },
+    "buzz_operator_names": {
+      "type": "string",
+      "title": "Operator names",
+      "description": "Comma-separated Buzz display names of the operator, so a reply that tags @Name counts as an answer. The labels of the operator's keys in the Allowlist file count too.",
+      "default": ""
+    },
+    "reply_guard_helpers": {
+      "type": "string",
+      "title": "Reaction helpers",
+      "description": "Comma-separated names of your own reaction scripts, such as react.sh. For the reply guard, a Bash call of one (<helper> <event id> [<state>]) counts as a reaction when its output holds a success line: the event id's first 8 hex, a colon and a space, then <old> -> <new> or + <reaction>. Empty (the default): only the Buzz send and react tools count.",
+      "default": ""
+    },
+    "root_limit": {
+      "type": "string",
+      "title": "Root limit",
+      "description": "on (the default): a top-level Buzz post (a send with no reply, in a channel or a DM, and a send with neither channel nor reply) longer than Root limit lines or Root limit characters is refused, and the agent is told to post a short root and put the rest in a reply. Each attached file counts as a line. Replies are never limited. off: no check.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "root_limit_lines": {
+      "type": "string",
+      "title": "Root limit lines",
+      "description": "The most non-empty lines a top-level post may have. Empty (the default): 5.",
+      "default": ""
+    },
+    "root_limit_chars": {
+      "type": "string",
+      "title": "Root limit characters",
+      "description": "The most characters a top-level post may have, counted as characters (code points), not bytes; each of a post's first three links (URL characters only, up to 200) counts as 20, and an attached file that is not an image or video counts its name. Empty (the default): 400.",
+      "default": ""
+    },
+    "root_limit_exempt": {
+      "type": "string",
+      "title": "Root limit exempt channels",
+      "description": "Comma-separated ids of the channels (or DMs) whose top-level posts are not limited, such as a channel whose roots are generated boards. Empty (the default): none.",
+      "default": ""
+    },
+    "root_limit_channels": {
+      "type": "string",
+      "title": "Root limit per channel",
+      "description": "Comma-separated limits for single channels, each <channel id>=<lines>:<chars>, for example 6f1e...=10:800. A channel listed here uses its own limits instead of the two above. Empty (the default): none.",
+      "default": ""
+    },
+    "task_roots": {
+      "type": "string",
+      "title": "DM task roots",
+      "description": "off (the default): no task states, and the agent still answers a DM in its own thread. on: every top-level direct message from your operator is a task root. The agent sets its state with the Buzz channel's task tool (open, then done when nothing is left), answers only in its thread, and gives a new topic its own root; the reply guard checks the state and the in-thread answer. Needs Direct messages set to all, with the operator in Trusted people, or a top-level DM without a mention never reaches the agent. With a key service, also set BUZZ_TASK_ROOTS (and the emoji) in its settings: the channel reads them there, the reply guard reads this setting.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "off"
+    },
+    "task_open_emoji": {
+      "type": "string",
+      "title": "Task open emoji",
+      "description": "The reaction that marks a task root open: a plain emoji, or the name of your workspace's custom emoji (lower-case letters, digits, _ and -), which then needs its image's URL below. Empty (the default): ⭕.",
+      "default": ""
+    },
+    "task_open_emoji_url": {
+      "type": "string",
+      "title": "Task open emoji image",
+      "description": "Only for a custom Task open emoji: its image's https:// address, which the reaction carries (without it, Buzz shows the name as text). Empty (the default) for a plain emoji.",
+      "default": ""
+    },
+    "task_done_emoji": {
+      "type": "string",
+      "title": "Task done emoji",
+      "description": "The reaction that marks a task root done: a plain emoji, or the name of your workspace's custom emoji (lower-case letters, digits, _ and -), which then needs its image's URL below. Empty (the default): ✅.",
+      "default": ""
+    },
+    "task_done_emoji_url": {
+      "type": "string",
+      "title": "Task done emoji image",
+      "description": "Only for a custom Task done emoji: its image's https:// address, which the reaction carries (without it, Buzz shows the name as text). Empty (the default) for a plain emoji.",
+      "default": ""
+    },
+    "status_line": {
+      "type": "string",
+      "title": "Status line",
+      "description": "off (the default): no status line. on: the agent publishes a short public status line (working, idle or waiting, on what task, for what) and its presence to the relay, where every member can read them. Built only from fixed words, event ids and the words the agent gives its status tool, never from a message's text. Only for an instance that install/service/start runs, and not with a key service. See adapters/buzz/README.md, Status line.",
+      "options": ["off", "on"],
+      "default": "off"
+    },
+    "status_agents": {
+      "type": "string",
+      "title": "Status agents",
+      "description": "Comma-separated public keys (hex or npub1) of the agents whose status lines the channel's agent_status tool reads by default, besides the agent itself. Setting it alone gives the read tool, and publishes nothing.",
+      "default": ""
+    },
+    "time_stamp": {
+      "type": "string",
+      "title": "Time stamp",
+      "description": "on (the default): every prompt gets a line with the current time. off: no line.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "time_zone": {
+      "type": "string",
+      "title": "Time zone",
+      "description": "Your time zone for the time stamp, as an IANA name such as Europe/Berlin. Leave empty for the session's (its TZ, else the machine's).",
+      "default": ""
+    },
+    "auto_pull": {
+      "type": "string",
+      "title": "Auto-pull",
+      "description": "on (the default): right after the agent runs gh pr merge, the instance's clean checkout of that repo on its default branch is fast-forwarded. off: no pull.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "chrome_guard": {
+      "type": "string",
+      "title": "Chrome guard",
+      "description": "on (the default): the instance's main thread may not drive Chrome through Claude in Chrome; a subagent does, unless you allow one job in chat. off: no check.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "unattended": {
+      "type": "string",
+      "title": "Unattended",
+      "description": "off (the default): the instance's dialogs show as usual. on: for an instance nobody watches, run by install/service/start. start then passes --permission-mode auto, turns off the auto-mode-setup offer, lets a safeguard flag switch the model without asking, and every permission dialog is denied with a message telling the agent to report on Buzz that the step needs a person. Set it in the instance's settings file: start reads it there and in Claude Code's managed settings only, never in your user settings or a project's, so a session a person starts keeps its dialogs.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "off"
+    },
+    "automode_drift": {
+      "type": "string",
+      "title": "Auto-mode drift check",
+      "description": "on (the default): when the instance's main thread starts, any drift between Claude Code's auto-mode rules and the instance's snapshot ([automode_guard] in the manifest) is printed into the session. off: no check.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "memory_backup": {
+      "type": "string",
+      "title": "Memory backup trigger",
+      "description": "on (the default): right after a session writes a file in a memory folder that an installed memory backup watches ([memory_backup] in the manifest), that backup runs. off: only its timer runs it, every 15 minutes.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "memory_limit_index_lines": {
+      "type": "string",
+      "title": "Memory limit: MEMORY.md lines",
+      "description": "When MEMORY.md, the auto memory's index, first has more lines than this, the agent tells its operator once, in its DM with them on Buzz (Claude Code loads only the first 200 lines or 25KB). 150 by default. off or 0: no limit. With all four memory limits off, nothing is measured.",
+      "default": "150"
+    },
+    "memory_limit_index_bytes": {
+      "type": "string",
+      "title": "Memory limit: MEMORY.md bytes",
+      "description": "The same, for MEMORY.md's size in bytes. 20000 by default. off or 0: no limit.",
+      "default": "20000"
+    },
+    "memory_limit_notes": {
+      "type": "string",
+      "title": "Memory limit: notes",
+      "description": "The same, for the number of notes (the .md files in the auto-memory folder and below it, MEMORY.md not counted). 150 by default. off or 0: no limit.",
+      "default": "150"
+    },
+    "memory_limit_folder_kib": {
+      "type": "string",
+      "title": "Memory limit: folder size (KiB)",
+      "description": "The same, for the size of every file in the auto-memory folder and below it, in KiB (1024 bytes). 800 by default. off or 0: no limit.",
+      "default": "800"
+    },
+    "load_proof": {
+      "type": "string",
+      "title": "Load proof",
+      "description": "off (the default): nothing is recorded, and the last proof.json is removed, so a reader sees no proof (not proved), never an error. on: when the instance's own claude starts, proof.json in the instance's state folder records the sha256 and first line of its class file (CLAUDE.md in its home) and of the team repo's AGENTS.md (the @ import in ~/.claude/rules/team-repo.md), and the plugin's version and commit. For a fleet of instances that share class files and a team repo; one agent on its own has no use for it.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "off"
+    },
+    "load_proof_channel": {
+      "type": "string",
+      "title": "Load proof channel",
+      "description": "The Buzz channel that gets the one-line load proof at each start of the instance's own claude, a channel id. Needs the relay URL and key command above, and no key service (the one-shot send has no socket there). Empty (the default): the file only, no post.",
+      "default": ""
+    },
+    "backlog_prefix": {
+      "type": "string",
+      "title": "Backlog id prefix",
+      "description": "The prefix of the backlog's item ids (PREFIX-001): 2 to 12 capital letters, not ARC or INIT. A bad value is ignored, with a warning. Empty (the default): BL.",
+      "default": ""
+    },
+    "backlog_dir": {
+      "type": "string",
+      "title": "Backlog data folder",
+      "description": "The folder that holds the backlog's records (items/, arcs/, initiatives/), relative to the repository root: 1 to 3 segments of letters, digits, . _ and -, no . or .. segment. Empty (the default): backlog.",
+      "default": ""
+    },
+    "backlog_operator_names": {
+      "type": "string",
+      "title": "Backlog operator names",
+      "description": "Comma-separated names the operator goes by in the backlog's owner and waiting-on fields, at most 8. Each starts with an ASCII letter, ends with an ASCII letter or digit, and holds only letters, digits, space, . ' and - between. The word operator always counts. Empty (the default): only the word.",
+      "default": ""
+    },
+    "backlog_profile": {
+      "type": "string",
+      "title": "Backlog profile",
+      "description": "Absolute path of a JSON profile file that adds record types and rules to the backlog's generic ones (see backlog/schema/profile.mjs). Empty (the default): the generic types only.",
+      "default": ""
+    }
+  },
+  "channels": [
+    {
+      "server": "buzz-channel",
+      "displayName": "Buzz"
+    }
+  ]
+}

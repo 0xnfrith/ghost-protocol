@@ -1,0 +1,62 @@
+# The release workflow, a skeleton: on a version tag (v*) it runs tools/release/ci/run, which builds the image for linux/amd64 and
+# linux/arm64 from the tagged tree, pushes it, writes the release notes and attaches the install files. Until that script is in
+# the tree, this workflow passes with a notice and makes nothing. The tag itself is cut by tools/release/release, never here.
+#
+# tools/release/ci/run runs from the root of a full clone of the tag, with node 22, python3, jq, git and Docker (with buildx) on
+# the PATH, and these in its environment:
+#   GH_TOKEN        this run's own token: write access to the repository's releases and packages, nothing else
+#   GP_RELEASE_TAG  the tag being released
+# No other secret: the image goes to this repository's own package registry, with this run's token.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # By hand, from the Actions tab, on a tag: to re-run a release whose run failed.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # GitHub's runner, never GP_CI_RUNS_ON: a release runs on a tag, and tags are cut on the public copy (and its staging copy), not in
+    # the repository the variable is set in. Its build also needs buildx, arm64 emulation it registers itself (a privileged container)
+    # and gh, and its token writes the public image and release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # the release and its files
+      packages: write # the image
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: tools/release/ci/run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GP_RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::A release runs on a tag; this run is on a $REF_TYPE ($GP_RELEASE_TAG). Pick the tag when you run it by hand."
+            exit 1
+          fi
+          if [ ! -e tools/release/ci/run ]; then
+            echo "::notice title=Nothing released::No tools/release/ci/run in this tree."
+            exit 0
+          fi
+          if [ ! -x tools/release/ci/run ]; then
+            echo "::error file=tools/release/ci/run::tools/release/ci/run is not executable (chmod +x, and commit the mode)"
+            exit 1
+          fi
+          exec ./tools/release/ci/run

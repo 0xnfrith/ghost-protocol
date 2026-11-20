@@ -1,0 +1,122 @@
+#!/bin/sh
+# Test stand-in for gh in ruleset.test.sh, copied in as gh. It answers
+# `gh api` only, and records each call as "gh api <method> <kind> <argument
+# count>", never a value or the environment; a call it does not stand in for
+# is recorded too, then refused. Its world is in $STUB_STATE:
+#   repo              the one repo that exists ("owner/name"); any other is a 404
+#   repo.json         GET repos/<repo>
+#   user.json         GET user (missing: a 403, as for an integration token)
+#   rulesets.json     GET repos/<repo>/rulesets (an array)
+#   ruleset-<id>.json GET repos/<repo>/rulesets/<id> (missing: a 404)
+#   runs.json         GET repos/<repo>/commits/<branch>/check-runs (missing: a 404)
+# GET repos/<repo>/rules/branches/<branch> answers, as GitHub does, with the
+# rules of every active stored ruleset whose include names that branch.
+# POST and PUT save the body they read as body.json and store the ruleset the
+# way GitHub does: the body plus an id, links, times, and the parameters GitHub
+# fills in when they are not sent.
+# Switches: post.fail or put.fail makes that write fail; store-drops-codeowner
+# stores require_code_owner_review as false, whatever was sent;
+# store-adds-setting stores one more pull_request setting, a_new_default: true,
+# that the body did not send (as when GitHub adds a setting with a default);
+# hide-bypass leaves bypass_actors out of a ruleset read (as for a login that
+# is not an admin); unenforced makes the rules in force always empty (as on a
+# private repo with a free plan), unenforced-<id> leaves out that ruleset's.
+S="${STUB_STATE:?}"
+argc=$#
+if [ "${1:-}" != api ]; then
+    echo "gh other $argc" >>"$S/calls"
+    echo "gh stub: only gh api is stood in" >&2
+    exit 64
+fi
+shift
+method=GET path="" input="" badflag=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --method|-X) method="${2:-}"; shift 2 ;;
+        --input)     input="${2:-}"; shift 2 ;;
+        --paginate)  shift ;;
+        -*)          badflag=y; shift ;;
+        *)           path="$1"; shift ;;
+    esac
+done
+p="${path%%\?*}"
+repo="$(cat "$S/repo")"
+id="" branch=""
+case "$p" in
+    user)                          kind=user ;;
+    "repos/$repo/rulesets/"*)      kind=ruleset; id="${p##*/}" ;;
+    "repos/$repo/rulesets")        kind=rulesets ;;
+    "repos/$repo/commits/"*/check-runs) kind="check-runs" ;;
+    "repos/$repo/rules/branches/"*) kind="branch-rules"; branch="${p##*/rules/branches/}" ;;
+    "repos/$repo")                 kind=repo ;;
+    *)                             kind=unknown ;;
+esac
+# A flag it does not know may make the call a write (gh api -f posts), so the
+# call is recorded as neither GET nor a known write, and refused.
+if [ -n "$badflag" ]; then method="UNKNOWN-FLAG"; fi
+echo "gh api $method $kind $argc" >>"$S/calls"
+if [ -n "$badflag" ]; then echo "gh stub: unexpected flag" >&2; exit 64; fi
+
+nope() { echo "{\"message\":\"$2\",\"status\":\"$1\"}"; echo "gh: $2 (HTTP $1)" >&2; exit 1; }
+serve() { if [ -f "$1" ]; then cat "$1"; else nope "$2" "$3"; fi; }
+
+# The body as GitHub keeps it: an id, a source, times, links, and the
+# parameters it fills in when they are not sent.
+store() {
+    jq --argjson id "$1" --arg repo "$repo" --arg drop "$([ -f "$S/store-drops-codeowner" ] && echo y)" \
+        --arg add "$([ -f "$S/store-adds-setting" ] && echo y)" '
+        . + { id: $id, source_type: "Repository", source: $repo,
+              created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z",
+              current_user_can_bypass: "never",
+              _links: { self: { href: "https://api.github.com/repos/\($repo)/rulesets/\($id)" } } }
+        | .rules |= map(
+            if .type == "pull_request" then
+                .parameters = ({ allowed_merge_methods: ["merge", "squash", "rebase"],
+                                 automatic_copilot_code_review_enabled: false, required_reviewers: [],
+                                 require_extra_approval_for_unattributed_changes: true } + .parameters)
+                | if $drop == "y" then .parameters.require_code_owner_review = false else . end
+                | if $add == "y" then .parameters.a_new_default = true else . end
+            elif .type == "required_status_checks" then .parameters = ({ do_not_enforce_on_create: false } + .parameters)
+            else . end)' "$S/body.json" >"$S/ruleset-$1.json" || exit 70
+    jq --argjson id "$1" --arg name "$(jq -r .name "$S/body.json")" \
+        '[ .[] | select(.id != $id) ] + [ { id: $id, name: $name, target: "branch", source_type: "Repository", enforcement: "active" } ]' \
+        "$S/rulesets.json" >"$S/rulesets.new" && mv "$S/rulesets.new" "$S/rulesets.json"
+    cat "$S/ruleset-$1.json"
+}
+
+# The rules in force on a branch: from each active stored ruleset that names it.
+in_force() {
+    if [ -f "$S/unenforced" ]; then echo '[]'; return; fi
+    for f in "$S"/ruleset-*.json; do
+        [ -f "$f" ] || continue
+        n="${f##*/ruleset-}"; n="${n%.json}"
+        [ -f "$S/unenforced-$n" ] || cat "$f"
+    done \
+        | jq -s --arg ref "refs/heads/$1" --arg repo "$repo" '
+            [ .[] | select(.enforcement == "active" and any((.conditions.ref_name.include // [])[]; . == $ref))
+              | .id as $id | .rules[] | . + { ruleset_source_type: "Repository", ruleset_source: $repo, ruleset_id: $id } ]'
+}
+
+case "$method $kind" in
+    "GET user")         serve "$S/user.json" 403 "Resource not accessible by integration" ;;
+    "GET repo")         serve "$S/repo.json" 404 "Not Found" ;;
+    "GET rulesets")     serve "$S/rulesets.json" 404 "Not Found" ;;
+    "GET ruleset")
+        if [ ! -f "$S/ruleset-$id.json" ]; then nope 404 "Not Found"; fi
+        if [ -f "$S/hide-bypass" ]; then jq 'del(.bypass_actors)' "$S/ruleset-$id.json"; else cat "$S/ruleset-$id.json"; fi ;;
+    "GET check-runs")   serve "$S/runs.json" 404 "No commit found" ;;
+    "GET branch-rules") in_force "$branch" ;;
+    "POST rulesets")
+        [ "$input" = - ] || { echo "gh stub: the body must come on stdin" >&2; exit 64; }
+        cat >"$S/body.json"
+        if [ -f "$S/post.fail" ]; then nope 422 "Validation Failed"; fi
+        store "$(( $(jq length "$S/rulesets.json") + 101 ))" ;;
+    "PUT ruleset")
+        [ "$input" = - ] || { echo "gh stub: the body must come on stdin" >&2; exit 64; }
+        cat >"$S/body.json"
+        if [ ! -f "$S/ruleset-$id.json" ]; then nope 404 "Not Found"; fi
+        if [ -f "$S/put.fail" ]; then nope 422 "Validation Failed"; fi
+        store "$id" ;;
+    *)                  nope 404 "Not Found" ;;
+esac
+exit 0

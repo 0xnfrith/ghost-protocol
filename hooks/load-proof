@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# load-proof: a Claude Code SessionStart hook. At a start of the instance's own
+# claude (a new session, a resume or a clear) it records which rule files that
+# start found on disk, and says so on Buzz. An agent counts as "behind" until
+# it proves which class file and which team-repo AGENTS.md it started with;
+# this hook makes the proof automatic.
+#
+# The two files, as Claude Code loads them at that start:
+#   - class: CLAUDE.md in the instance's home, found through the manifest as
+#     the other hooks find it (hooks/lib/hook.sh: hook_instance).
+#   - agents: the @ import in <claude config>/rules/team-repo.md (~/.claude by
+#     default), the line that makes Claude Code load the team repo's AGENTS.md.
+#     One whole-line @path outside a code fence. With no rulebook, no import,
+#     several, or an import whose file is missing, it records "none" and the
+#     reason; it never guesses another path.
+# For each it records the sha256 of the exact bytes, the first line (control
+# characters and backticks removed, a double quote turned into a single one,
+# cut at 120 characters) and the path.
+#
+# proof.json, in the instance's state folder (~/.local/state/ghost-protocol/
+# <name>/, start's), mode 0600, replaced in one step, is the source of truth:
+# the session id, the pid of the pane's claude, the time, both records, this
+# plugin's version and commit, and whether the Buzz line was posted (posted,
+# and an error class when not). A proof counts only when its session id is the
+# instance's current session (the file session-id there) and its claude_pid is
+# the pid in pane-pid there, which start rewrites at every start of claude. An
+# own start removes the old proof.json first, so a start that could not write a
+# new one leaves none, never the last start's. A missing proof.json (the switch
+# off, a start that could not write one, an instance that does not run this
+# hook yet) means "not proved" to a reader, never an error that stops its run.
+#
+# The Buzz line, once, with the adapter's one-shot send (launch.mjs send), the
+# path the auto-mode guard uses:
+#   load-proof <instance> session <id8>: class <sha12> "<first line>"; agents <owner>/<repo> <sha12> "<first line>"
+# The channel is the plugin option load_proof_channel; empty means file only.
+# No path, key or setting of the machine is in it. A key service's session
+# holds no key and the one-shot send has no socket there, so with buzz_key_socket
+# set nothing is posted (error class key-service). A post that fails still
+# leaves the file, with posted false, and one line is printed into the session:
+#   load proof written; not posted: <reason>
+#
+# Which sessions: only the instance's own claude, as start launched it, the
+# rule of the session-id and turn-state hooks: GP_INSTANCE_NAME is set, the first
+# claude above the hook is the pane's (hooks/lib/own-claude.sh), not a subagent.
+# Anywhere else it writes nothing, removes nothing and posts nothing. A
+# compaction is not a start and gets nothing.
+#
+# Bounded: the post gets 5 seconds (through timeout, else perl's alarm; with
+# neither it is not tried; LOAD_PROOF_SECS, 1 to 8, is for the tests) and
+# hooks.json gives the hook 10. It always exits 0. It proves that a session
+# started after those exact files were on disk; it does not prove that the
+# model read them.
+#
+# Needs jq; without it, it does nothing. It is off by default: only an explicit
+# load_proof of on turns it on (a fleet's settings do). Off, or unset, an own
+# start only removes the last proof.
+# Test: install/test/hook-load-proof.test.sh, adapters/buzz/test/load-proof.test.mjs
+set -uo pipefail
+name="${GP_INSTANCE_NAME:-}"
+case "$name" in '' | -* | *[!a-z0-9-]*) exit 0 ;; esac
+command -v jq >/dev/null 2>&1 || exit 0
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+# shellcheck source=lib/own-claude.sh
+. "$HOOKS_DIR/lib/own-claude.sh" || exit 0
+home="${HOME:-}"
+[ -n "$home" ] || exit 0
+
+input=$(cat)
+[ -n "$input" ] || exit 0
+fields=$(printf '%s' "$input" | jq -r '[(.source // ""), (.session_id // ""), (.agent_id // ""), (.cwd // "")]
+    | map(tostring) | join("\u001f")' 2>/dev/null) || exit 0
+IFS=$'\037' read -r source sid agent cwd <<<"$fields"
+case "$source" in startup | resume | clear) ;; *) exit 0 ;; esac
+[ -z "$agent" ] || exit 0
+re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[[ $sid =~ $re ]] || exit 0
+
+state="${XDG_STATE_HOME:-$home/.local/state}/ghost-protocol/$name"
+[ -d "$state" ] || exit 0
+own_claude "$state" || exit 0
+# The pane's pid as start wrote it; own_claude has checked that it is one.
+claude_pid=$(tr -d '[:space:]' <"$state/pane-pid" 2>/dev/null)
+
+# From here on this is the instance's own start. The last start's proof is void,
+# also with the switch off: it would only say what an earlier start found.
+proof="$state/proof.json"
+[ ! -d "$proof" ] || exit 0
+rm -f "$proof"
+hook_on_explicit load_proof || exit 0
+work=$(mktemp -d "${TMPDIR:-/tmp}/load-proof.XXXXXX") || exit 0
+trap 'rm -rf "$work"' EXIT
+
+# sha256_of FILE: the hex digest, else nothing.
+sha256_of() {
+    local d=""
+    if command -v sha256sum >/dev/null 2>&1; then d=$(sha256sum <"$1" 2>/dev/null)
+    elif command -v shasum >/dev/null 2>&1; then d=$(shasum -a 256 <"$1" 2>/dev/null)
+    elif command -v openssl >/dev/null 2>&1; then d=$(openssl dgst -sha256 -r <"$1" 2>/dev/null)
+    fi
+    d="${d%% *}"
+    case "$d" in '' | *[!0-9a-f]*) return 1 ;; esac
+    [ "${#d}" -eq 64 ] || return 1
+    printf '%s' "$d"
+}
+
+# The first line, for the file and for the Buzz line alike: tabs to spaces,
+# then control (Cc), format (Cf, which holds the zero-width and the direction
+# overrides), line and paragraph separators and backticks removed, a double
+# quote (the Buzz line's delimiter) turned into a single one, cut at $n
+# characters. jq counts characters, not bytes.
+# shellcheck disable=SC2016  # $n is jq's variable
+FIRST_LINE='split("\n")[0] // "" | gsub("\t"; " ") | gsub("[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}`]"; "") | gsub("\""; ([39] | implode)) | .[0:$n]'
+
+# file_record FILE: reads FILE once, as a regular file (a link to one counts),
+# and sets R_SHA (the sha256 of its bytes) and R_FIRST. Returns 1 with R_WHY
+# set (missing, not-a-file, unreadable, no-sha256) when it cannot.
+R_SHA="" R_FIRST="" R_WHY=""
+file_record() {
+    local copy="$work/copy"
+    R_SHA="" R_FIRST="" R_WHY=""
+    if [ ! -e "$1" ]; then R_WHY=missing; return 1; fi
+    if [ ! -f "$1" ]; then R_WHY=not-a-file; return 1; fi
+    if ! cat -- "$1" >"$copy" 2>/dev/null; then R_WHY=unreadable; return 1; fi
+    R_SHA=$(sha256_of "$copy") || { R_WHY=no-sha256; return 1; }
+    R_FIRST=$(head -c 16384 "$copy" 2>/dev/null | jq -Rrs --argjson n 120 "$FIRST_LINE" 2>/dev/null) || { R_WHY=unreadable; return 1; }
+    return 0
+}
+
+# repo_label FILE: owner/repo of the checkout the file is in: its origin's last
+# two path parts, else the layout's <root>/repos/<owner>/<repo>/, else unknown.
+repo_label() {
+    local d u rest owner repo
+    d=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || { printf 'unknown'; return 0; }
+    if GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel >/dev/null 2>&1; then
+        u=$(GIT_OPTIONAL_LOCKS=0 git -C "$d" config --get remote.origin.url 2>/dev/null)
+        u="${u%/}"; u="${u%.git}"
+        repo="${u##*[/:]}"; u="${u%"$repo"}"; u="${u%[/:]}"; owner="${u##*[/:]}"
+    fi
+    if [ -z "${owner:-}" ] || [ -z "${repo:-}" ]; then
+        owner="" repo=""
+        case "$d/" in
+            */repos/*/*/*)
+                rest="${d##*/repos/}"
+                owner="${rest%%/*}"; rest="${rest#*/}"; repo="${rest%%/*}" ;;
+        esac
+    fi
+    case "$owner/$repo" in
+        */ | /* | *[!A-Za-z0-9._/-]*) printf 'unknown' ;;
+        *) printf '%s/%s' "$owner" "$repo" ;;
+    esac
+}
+
+# The class file.
+C_ST=none C_WHY=no-home C_SHA="" C_FIRST="" C_PATH=""
+if hook_instance "${CLAUDE_PROJECT_DIR:-$cwd}" && [ "$HOOK_NAME" = "$name" ]; then
+    C_PATH="$HOOK_HOME/CLAUDE.md"
+    if file_record "$C_PATH"; then
+        C_ST=ok C_WHY="" C_SHA="$R_SHA" C_FIRST="$R_FIRST"
+    else
+        C_WHY="$R_WHY"
+    fi
+fi
+
+# The team file: the one @ import of the rulebook.
+A_ST=none A_WHY=no-rulebook A_SHA="" A_FIRST="" A_PATH="" A_REPO=""
+rules="${CLAUDE_CONFIG_DIR:-$home/.claude}/rules/team-repo.md"
+if [ -f "$rules" ]; then
+    # Whole-line @path outside a code fence, spaces escaped with a backslash.
+    imports=$(awk '
+        { line = $0; sub(/\r$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line) }
+        line ~ /^(```|~~~)/ { fence = !fence; next }
+        fence { next }
+        line ~ /^@[^ \t]/ { t = line; gsub(/\\ /, "", t); if (t !~ /[ \t]/) print substr(line, 2) }
+    ' "$rules" 2>/dev/null) || imports=""
+    n=0
+    [ -z "$imports" ] || n=$(printf '%s\n' "$imports" | grep -c .)
+    if [ "$n" -eq 0 ]; then A_WHY=no-import
+    elif [ "$n" -gt 1 ]; then A_WHY=several-imports
+    else
+        p="${imports//\\ / }"
+        A_WHY=""
+        case "$p" in
+            \~/*) p="$home/${p#\~/}" ;;
+            /*) ;;
+            \~*) A_WHY=unsupported-path ;;
+            *) p="$(dirname "$rules")/$p" ;;
+        esac
+        if [ -z "$A_WHY" ]; then
+            A_PATH="$p"
+            if file_record "$p"; then
+                A_ST=ok A_SHA="$R_SHA" A_FIRST="$R_FIRST"
+                A_REPO=$(repo_label "$p")
+            elif [ "$R_WHY" = missing ]; then A_WHY=import-missing
+            else A_WHY=import-unreadable
+            fi
+        fi
+    fi
+fi
+
+# This plugin's version and commit. The commit is the installed copy's own
+# (installed_plugins.json names it), else the HEAD of a checkout of the plugin.
+P_VERSION=$(jq -r '.version // empty' "$GP_DIR/.claude-plugin/plugin.json" 2>/dev/null)
+case "$P_VERSION" in '' | *[!0-9A-Za-z.+-]*) P_VERSION="" ;; esac
+P_COMMIT=""
+installed="${CLAUDE_CONFIG_DIR:-$home/.claude}/plugins/installed_plugins.json"
+if [ -f "$installed" ]; then
+    P_COMMIT=$(jq -r --arg a "$GP_DIR" --arg b "${CLAUDE_PLUGIN_ROOT:-}" \
+        '[.plugins[]?[]? | select(.installPath == $a or .installPath == $b) | .gitCommitSha // empty] | first // empty' \
+        "$installed" 2>/dev/null)
+fi
+if ! [[ $P_COMMIT =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    P_COMMIT=""
+    top=$(GIT_OPTIONAL_LOCKS=0 git -C "$GP_DIR" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -n "$top" ] && [ "$(phys "$top")" = "$GP_DIR" ]; then
+        P_COMMIT=$(GIT_OPTIONAL_LOCKS=0 git -C "$GP_DIR" rev-parse HEAD 2>/dev/null)
+        [[ $P_COMMIT =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || P_COMMIT=""
+    fi
+fi
+
+when=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# write_proof POSTED ERROR: proof.json, replaced in one step, mode 0600.
+write_proof() {
+    local tmp
+    tmp=$(mktemp "$state/.proof.XXXXXX") || return 1
+    if jq -n --arg inst "$name" --arg sid "$sid" --arg src "$source" --arg when "$when" \
+        --arg pv "$P_VERSION" --arg pc "$P_COMMIT" --arg cpid "$claude_pid" \
+        --arg cst "$C_ST" --arg cwhy "$C_WHY" --arg csha "$C_SHA" --arg cfirst "$C_FIRST" --arg cpath "$C_PATH" \
+        --arg ast "$A_ST" --arg awhy "$A_WHY" --arg asha "$A_SHA" --arg afirst "$A_FIRST" --arg apath "$A_PATH" --arg arepo "$A_REPO" \
+        --argjson posted "$1" --arg err "$2" '
+        def nul: if . == "" then null else . end;
+        def rec($st; $why; $sha; $first; $path):
+            if $st == "ok" then {status: "ok", sha256: $sha, first_line: $first, path: $path}
+            else {status: "none", reason: $why, path: ($path | nul)} end;
+        {schema: "ghost-protocol/load-proof/v1", instance: $inst, session_id: $sid, claude_pid: ($cpid | if . == "" then null else tonumber end), source: $src, time: $when,
+         plugin: {version: ($pv | nul), commit: ($pc | nul)},
+         class: rec($cst; $cwhy; $csha; $cfirst; $cpath),
+         agents: (rec($ast; $awhy; $asha; $afirst; $apath) | if .status == "ok" then . + {repo: $arepo} else . end),
+         posted: $posted, error: ($err | nul)}' >"$tmp" 2>/dev/null \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$proof"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+channel=$(hook_option load_proof_channel)
+if [ -z "$channel" ]; then
+    write_proof false no-channel
+    exit 0
+fi
+if ! [[ $channel =~ ^[A-Za-z0-9-]{1,64}$ ]]; then
+    write_proof false bad-channel
+    printf 'load proof written; not posted: load_proof_channel is not a channel id\n'
+    exit 0
+fi
+# The file first, as not posted: a hook cut short still leaves a true file.
+write_proof false pending || exit 0
+
+# The Buzz line: no path of the machine, only names, hashes and the first lines.
+side() {   # label status why repo sha first
+    if [ "$2" = ok ]; then
+        if [ -n "$4" ]; then printf '%s %s %s "%s"' "$1" "$4" "${5:0:12}" "$6"
+        else printf '%s %s "%s"' "$1" "${5:0:12}" "$6"; fi
+    else printf '%s none (%s)' "$1" "$3"
+    fi
+}
+line="load-proof $name session ${sid:0:8}: $(side class "$C_ST" "$C_WHY" "" "$C_SHA" "$C_FIRST"); $(side agents "$A_ST" "$A_WHY" "$A_REPO" "$A_SHA" "$A_FIRST")"
+
+# do_send RELAY KEYCMD MS NODE LAUNCH CHANNEL LIMIT...: one run of the adapter's send, bounded by
+# LIMIT (a command and its argument), with the text from $work/line and the answer in $work/out.
+# The subshell exports the relay URL and the key command, so they are never on a command line,
+# and drops what the session may hold of a key.
+do_send() {
+    local relay="$1" keycmd="$2" ms="$3" node="$4" launch="$5" ch="$6"
+    shift 6
+    (
+        unset BUZZ_KEY_SOCKET BUZZ_PRIVATE_KEY
+        export BUZZ_RELAY_URL="$relay" BUZZ_KEY_COMMAND="$keycmd" BUZZ_SEND_TIMEOUT_MS="$ms"
+        exec "$@" "$node" "$launch" send --channel "$ch" <"$work/line" >"$work/out"
+    )
+}
+
+# send_line TEXT CHANNEL: one send with the adapter's one-shot send, as the
+# auto-mode guard sends. Sets SEND_ERR to an error class when it fails.
+SEND_ERR=""
+send_line() {
+    local relay keycmd sock node adapter launch rc="" secs="${LOAD_PROOF_SECS:-5}" ms
+    case "$secs" in [1-8]) ;; *) secs=5 ;; esac
+    ms=$((secs * 1000 - 1000))
+    [ "$ms" -ge 500 ] || ms=500
+    sock=$(hook_option buzz_key_socket)
+    if [ -n "$sock" ]; then SEND_ERR=key-service; return 1; fi
+    relay=$(hook_option buzz_relay_url)
+    keycmd=$(hook_option buzz_key_command)
+    if [ -z "$relay" ] || [ -z "$keycmd" ]; then SEND_ERR=not-configured; return 1; fi
+    node=$(command -v node) || { SEND_ERR=no-node; return 1; }
+    adapter="$GP_DIR/adapters/buzz"
+    launch="$adapter/src/launch.mjs"
+    [ -f "$launch" ] || { SEND_ERR=no-adapter; return 1; }
+    # The launcher installs its dependencies on first run, which can take minutes and
+    # holds a lock the servers wait for: never start it here without them.
+    if [ ! -f "$adapter/node_modules/nostr-tools/package.json" ] || [ ! -f "$adapter/node_modules/@modelcontextprotocol/sdk/package.json" ]; then
+        SEND_ERR=no-deps; return 1
+    fi
+    # Only the configured key command may give the key, and what it is stays out of every
+    # command line (do_send exports it). The group's stderr is closed so that the shell's own
+    # report of a send killed by the alarm stays out of the session.
+    printf '%s' "$1" >"$work/line"
+    if command -v timeout >/dev/null 2>&1; then
+        { do_send "$relay" "$keycmd" "$ms" "$node" "$launch" "$2" timeout "$secs"; rc=$?; } 2>/dev/null
+    elif command -v perl >/dev/null 2>&1; then
+        { do_send "$relay" "$keycmd" "$ms" "$node" "$launch" "$2" perl -e 'alarm(shift); exec(@ARGV) || exit(127)' "$secs"; rc=$?; } 2>/dev/null
+    else
+        SEND_ERR=no-timeout; return 1
+    fi
+    case "$rc" in
+        0) if grep -Eq '^sent [0-9a-f]{64}$' "$work/out"; then return 0; fi; SEND_ERR=no-event-id ;;
+        1) SEND_ERR=relay ;;
+        2) SEND_ERR=config ;;
+        3) SEND_ERR=refused ;;
+        124 | 137 | 142) SEND_ERR=timeout ;;
+        *) SEND_ERR=send-failed ;;
+    esac
+    return 1
+}
+
+if send_line "$line" "$channel"; then
+    write_proof true ""
+    exit 0
+fi
+write_proof false "$SEND_ERR"
+case "$SEND_ERR" in
+    key-service) why="the session holds no key, and the one-shot send has no key-service socket" ;;
+    not-configured) why="the plugin has no buzz_relay_url and buzz_key_command" ;;
+    no-node) why="node is not on the PATH" ;;
+    no-adapter) why="the Buzz adapter is missing" ;;
+    no-deps) why="the Buzz adapter's dependencies are not installed yet" ;;
+    no-timeout) why="there is neither timeout nor perl to bound it" ;;
+    no-event-id) why="the send printed no event id" ;;
+    relay) why="the relay could not be reached, or refused the login" ;;
+    config) why="the send refused its settings or key" ;;
+    refused) why="the relay refused the message" ;;
+    timeout) why="the send did not finish in time" ;;
+    *) why="the send failed" ;;
+esac
+printf 'load proof written; not posted: %s\n' "$why"
+exit 0

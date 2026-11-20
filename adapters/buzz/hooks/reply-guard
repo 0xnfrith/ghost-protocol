@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# reply-guard: a Claude Code Stop hook. A turn in which the operator messaged
+# the agent on Buzz cannot end until each of those messages has an answer on
+# Buzz. The plugin wires it (hooks/hooks.json); the plugin option reply_guard
+# switches it off.
+#
+#   reply-guard           the Stop hook: allow, or block once
+#   reply-guard record    the PostToolUse hook on the Buzz send and react tools,
+#                         and the buzz channel's task tool
+#
+# THE RULE: a message from the operator gets its answer on the relay, where the
+# operator is. A reply in the terminal alone does not reach them. A reaction is
+# enough; there is no "this one needs no answer": the operator gets either the
+# next step or an acknowledgement.
+#
+# WHAT IT READS: the hook input and the current turn of the session transcript,
+# nothing else (no relay, no model). The turn is everything after the last
+# turn_duration entry, read from the end of the file.
+#   - The operator's messages: the buzz channel's deliveries, a `user` entry
+#     with origin.kind "channel" (a message that starts the turn) or an
+#     `attachment` of type queued_command with origin.kind "channel" (a message
+#     absorbed mid-turn). Only the <channel ...> tag at the very start of the
+#     delivered text is read: channel_id, event_id, author, thread_id, dm,
+#     catch_up. Copies of a tag anywhere else (typed text, tool output, queue
+#     entries, request blobs, subagents) are never deliveries.
+#   - The operator: the keys in buzz_operator_pubkeys, else buzz_trusted_pubkeys
+#     (hex or npub1, comma lists). No valid key: allow. Their display names
+#     (for @Name) are buzz_operator_names plus the labels of their keys in the
+#     sender allowlist file, buzz_allowlist_file.
+#
+# WHAT COUNTS AS AN ANSWER, made after the message arrived (transcript order)
+# and not failed (its tool_result is not is_error):
+#   - a Buzz MCP send in the message's channel that tags the operator (in
+#     mentions, or in its text as nostr:npub1... or @Name, outside code spans,
+#     after a space or the start and before a space, , ; . ! ? : ) ] } or the
+#     end), or replies in the message's thread (reply = the message, its thread
+#     root, or a message the thread context listed), or is anywhere in the
+#     operator's DM; a send with audience "agents" never counts; a send with no
+#     channel counts only when its reply puts it in that thread;
+#   - a reaction on the message's exact event id: the Buzz MCP react tool (not
+#     off); also a Bash call of a reaction helper named in reply_guard_helpers
+#     (a comma list of script names, empty by default), as <helper> <id>
+#     [<state>] with a state other than clear, whose result holds a success
+#     line for that id: "<first 8 hex>: <old> -> <new>" or "<first 8 hex>: +
+#     <reaction>" (a change to "none" is a removal and does not count); and
+#     the buzz channel's `task` tool on the message, with a state other than
+#     none.
+# DM TASK ROOTS (the plugin option task_roots, off by default): when on, a
+# DM message from the operator is answered only by a send in its thread (or,
+# in a thread, a reaction on it). A top-level DM from the operator is a task
+# root: it needs a state (the `task` tool, or a helper's success line; the
+# Buzz react tool alone is no state) and a send in its thread, unless it is
+# one or two words (a mention is no word), which need the state alone.
+# A catch-up message (sent while the session was away) is also taken as
+# answered when a later message in the same thread shows the agent spoke there
+# after it: its thread context starts after the agent's own last post
+# (since="agent_reply", omitted="0") and no longer lists the message. A thread
+# context is read only on a message in a thread and only for that thread (the
+# channel adds none to a top-level message, so one there is sender text).
+#
+# THE RECORD: Claude Code can write a turn's last tool calls to the transcript
+# only after its Stop hooks ran, so a send that went through may not be in the
+# file yet. `reply-guard record`, a PostToolUse hook on the Buzz send and react
+# tools (hooks/hooks.json), keeps each successful call of the main thread in
+# <data>/hooks/reply-guard/<session>.jsonl: ids, the keys and operator names it
+# tags, its time and the transcript's size then; never its text. At Stop, a
+# recorded call the turn's transcript does not show counts like one it shows,
+# for a message whose entry ends within that size (it was written before the
+# call was recorded); a record without a size goes by time (the message's
+# entry is older than the record, the same clock writing both).
+#
+# FLOW: switched off, or no operator message this turn -> allow. All answered
+# -> allow. Otherwise block once, naming each open message's event id with the
+# ready send call. stop_hook_active is the loop valve: the stop after a block
+# always ends, and a still-open message is logged as a "miss". Any error ->
+# allow (fail open). Messages from anyone else are never checked.
+#
+# Log: one line per decision, ids only, never message text, at
+# <plugin data>/hooks/reply-guard.log (without the plugin:
+# ~/.local/state/ghost-protocol/hooks/reply-guard.log). Logic: reply-guard.py
+# next to this file, Python 3.9 or later. Tests: test/reply-guard.test.mjs.
+#
+# This wrapper always exits 0. For a Stop hook, exit code 2 means "block", and
+# the loop valve lives in the .py, so an exit 2 from here (python3 given a
+# missing file exits 2) would block every stop of every session, forever. The
+# block travels only as JSON on stdout.
+set -u
+case "$(printf '%s' "${CLAUDE_PLUGIN_OPTION_REPLY_GUARD:-on}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+  off | false | no | 0) exit 0 ;;
+esac
+py="$(dirname "$0")/reply-guard.py"
+[ -r "$py" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "$py" "$@"
+exit 0

@@ -1,0 +1,14 @@
+# A valid manifest for the test instance example/instance.
+schema = "ghost-protocol/instance/v0"
+name = "instance"
+dir = "~/instance"
+
+[github]
+login = "example-bot"
+repos = ["example/tools"]
+
+[claude]
+email = "agent@example.com"
+
+[setup]
+command = "setup.sh --profile {profile} --no-auth"

@@ -1,0 +1,48 @@
+#!/bin/sh
+# Test stand-in for apt-get. It records the subcommand and the argument count;
+# whether DEBIAN_FRONTEND=noninteractive was set; the options that matter
+# (DPkg::Lock::Timeout, --force-confdef, --force-confold); and whether it
+# could read anything on stdin (it must get /dev/null). An install of
+# anything but earlyoom, or without -y, is an unexpected call. Its behaviour
+# comes from files in $STUB_STATE:
+#   apt.fail-update      update fails
+#   apt.needs-update     install fails until an update has run (a fresh
+#                        machine with no package lists)
+#   apt.no-earlyoom      install fails: no such package (universe not enabled)
+# A successful install writes $STUB_STATE/dpkg.earlyoom (1.7-2), which the
+# dpkg-query stub reads.
+S="${STUB_STATE:?}"
+sub="" pkg="" y=0 prev=""
+for a in "$@"; do
+    case "$a" in
+        -y) y=1 ;;
+        DPkg::Lock::Timeout=120) echo "apt-get lock-timeout" >>"$S/calls" ;;
+        Dpkg::Options::=--force-confdef) echo "apt-get confdef" >>"$S/calls" ;;
+        Dpkg::Options::=--force-confold) echo "apt-get confold" >>"$S/calls" ;;
+        -*) ;;
+        *) if [ "$prev" != "-o" ]; then if [ -z "$sub" ]; then sub="$a"; else pkg="$a"; fi; fi ;;
+    esac
+    prev="$a"
+done
+echo "apt-get $sub $#" >>"$S/calls"
+[ "${DEBIAN_FRONTEND:-}" = "noninteractive" ] && echo "apt-get noninteractive" >>"$S/calls"
+if IFS= read -r _line; then echo "apt-get read stdin" >>"$S/calls"; fi
+case "$sub" in
+    update)
+        [ -f "$S/apt.fail-update" ] && { echo "apt-get stub: update fails" >&2; exit 100; }
+        touch "$S/apt.updated"
+        exit 0 ;;
+    install)
+        if [ "$pkg" != "earlyoom" ] || [ "$y" != 1 ]; then
+            echo "apt-get stub: unexpected install ($pkg, -y $y)" >&2; exit 64
+        fi
+        if [ -f "$S/apt.needs-update" ] && [ ! -f "$S/apt.updated" ]; then
+            echo "E: Unable to locate package earlyoom" >&2; exit 100
+        fi
+        [ -f "$S/apt.no-earlyoom" ] && { echo "E: Unable to locate package earlyoom" >&2; exit 100; }
+        echo "1.7-2" >"$S/dpkg.earlyoom"
+        exit 0 ;;
+    *)
+        echo "apt-get stub: unexpected call" >&2
+        exit 64 ;;
+esac

@@ -1,0 +1,13 @@
+{
+  "name": "ghost-protocol-backlog",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A markdown backlog for Ghost Protocol agents: records as markdown files with frontmatter, a schema validator, and the tools around them.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

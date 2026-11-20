@@ -1,0 +1,70 @@
+#!/bin/sh
+# Test stand-in for ssh, for the installer's deploykey mode. It never opens a
+# connection. git runs it as
+#   <the ssh command> [options] git@github.com "git-upload-pack 'owner/repo.git'"
+# (or git-receive-pack), and it checks what the real ssh and GitHub would:
+#   - -F /dev/null, so no ssh config file is read (else "ssh config read");
+#   - StrictHostKeyChecking=yes, and a UserKnownHostsFile holding the line in
+#     $STUB_STATE/github-hostkey (the host key github.com shows), else
+#     "Host key verification failed.";
+#   - IdentitiesOnly=yes and IdentityAgent=none, and an -i private key whose
+#     public half is in $STUB_STATE/deploykeys, one "<rw|ro> <owner/repo>
+#     <type> <base64>" line per added deploy key, else "Permission denied
+#     (publickey).";
+#   - a deploy key reaches its own repo only ("Repository not found."), and a
+#     read-only one gets GitHub's refusal for git-receive-pack.
+# Then it runs the git service on the local bare repo for owner/repo under
+# $STUB_STATE/../remote/github. It records "ssh <argument count>".
+echo "ssh $#" >>"$STUB_STATE/calls"
+key=""; kh=""; strict=""; only=""; agent=""; cfg=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i) key="$2"; shift 2 ;;
+        -F) cfg="$2"; shift 2 ;;
+        -o)
+            case "$2" in
+                UserKnownHostsFile=*) kh="${2#*=}" ;;
+                StrictHostKeyChecking=*) strict="${2#*=}" ;;
+                IdentitiesOnly=*) only="${2#*=}" ;;
+                IdentityAgent=*) agent="${2#*=}" ;;
+            esac
+            shift 2 ;;
+        -p) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+host="$1"; cmd="$2"
+if [ "$host" != "git@github.com" ]; then
+    echo "stub ssh: unexpected host $host" >&2; exit 255
+fi
+if [ "$cfg" != "/dev/null" ]; then
+    echo "stub ssh: ssh config read (no -F /dev/null)" >&2; exit 255
+fi
+if [ "$strict" != "yes" ] || [ -z "$kh" ] || ! grep -qxF "$(cat "$STUB_STATE/github-hostkey")" "$kh" 2>/dev/null; then
+    echo "Host key verification failed." >&2; exit 255
+fi
+if [ "$only" != "yes" ] || [ "$agent" != "none" ] || [ -z "$key" ] || [ ! -f "$key" ]; then
+    echo "git@github.com: Permission denied (publickey)." >&2; exit 255
+fi
+pub="$(ssh-keygen -y -f "$key" 2>/dev/null | cut -d' ' -f1,2)"
+line="$(grep -F " $pub" "$STUB_STATE/deploykeys" 2>/dev/null | head -n 1)"
+if [ -z "$pub" ] || [ -z "$line" ]; then
+    echo "git@github.com: Permission denied (publickey)." >&2; exit 255
+fi
+access="$(printf '%s' "$line" | cut -d' ' -f1)"
+keyrepo="$(printf '%s' "$line" | cut -d' ' -f2)"
+service="${cmd%% *}"
+path="${cmd#* }"; path="${path#\'}"; path="${path%\'}"; path="${path#/}"
+if [ "${path%.git}" != "$keyrepo" ]; then
+    echo "ERROR: Repository not found." >&2; exit 1
+fi
+case "$service" in
+    git-upload-pack) ;;
+    git-receive-pack)
+        if [ "$access" != "rw" ]; then
+            echo "ERROR: The key you are authenticating with has been marked as read only." >&2; exit 1
+        fi ;;
+    *) echo "stub ssh: unexpected command" >&2; exit 255 ;;
+esac
+exec git "${service#git-}" "$STUB_STATE/../remote/github/$path"

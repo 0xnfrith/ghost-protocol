@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+// validate: the backlog schema checker's command line (usage and exit codes in validate.mjs).
+import { main } from "./validate.mjs";
+
+process.exitCode = main(process.argv.slice(2));

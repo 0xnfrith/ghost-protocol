@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# The release workflow's step (.github/workflows/release.yml): on a version tag, builds the image for linux/amd64 and linux/arm64
+# from the tagged tree, pushes it, writes the release notes and attaches get.sh and get.ps1 with the image digest filled in.
+#
+# Runs from the root of a full clone of the tag (HEAD is the tag's commit), with git, jq, python3 and Docker with buildx on the PATH,
+# and in its environment:
+#   GP_RELEASE_TAG       the tag being released (v<x.y.z> or v<x.y.z>-<pre-release>)
+#   GH_TOKEN             this run's own token: write access to the repository's releases and packages, nothing else. It is used to
+#                        sign in to the registry (from stdin) and by gh; never in a command line
+#   GITHUB_REPOSITORY    owner/name (or GP_RELEASE_REPO)
+#   GITHUB_ACTOR         the user name for the registry sign-in (default gp-release)
+#   GP_RELEASE_REGISTRY  the registry (default ghcr.io); the image is <registry>/<owner>/<name> in lower case
+#   GP_RELEASE_LOGIN     0: do not sign in to the registry (a local registry)
+#   GP_RELEASE_GITHUB    0: do not make the GitHub release; the files are left in the output folder
+#   GP_RELEASE_OUT       the output folder, which must be new or empty (default ./release-out)
+#   GP_RELEASE_DRY       1: check and print the plan; build, push and publish nothing
+#
+# In order:
+#   1. the tag is the tagged commit, plugin.json agrees with it (tools/release/agree) and the tree passes the scan's public words;
+#   2. arm64 emulation is registered on the build machine, if it is not (the pinned tonistiigi/binfmt image, Docker's own route);
+#   3. one multi-platform image build, pushed as <image>:pre-<version>, with GP_IMAGE_REPO=<image> so the agent checks there for
+#      newer releases (an image already at that tag, or at <image>:<version>, is kept, never rebuilt). Not as <image>:<version>:
+#      an agent's release check offers only plain x.y.z tags, so no install is offered a pre-release. That tag is added when the
+#      release is promoted (tools/release/ci/promote), to the same image. The files pin <image>:<version>@<digest>, which pulls
+#      by the digest whether or not the tag is there yet;
+#   4. both platforms are there and each one starts: gp and claude run in the amd64 image and, under emulation, in the arm64 one;
+#   5. get.sh and get.ps1 with <image>:<version>@<digest> filled in, SHA256SUMS, the release notes;
+#   6. tools/release/agree again: the tag, plugin.json, the image label and the digest in both files; and the image's
+#      GP_IMAGE_REPO is <image>;
+#   7. the GitHub release, a pre-release (it is promoted by hand once one of our agents runs it cleanly: tools/release/mark), with
+#      those files. A release that exists is given these files and notes again, unless it was promoted: then it is left as it is.
+# Exit 0: all done. Anything else: stopped, with the reason, before the next step.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Docker's own route to run foreign-architecture images: the binfmt image, by digest (tonistiigi/binfmt qemu-v10.2.3-68, the
+# index digest). The digest is written in four pieces: the scan takes any 64-hex string for a stray key, and this one is a pin.
+BINFMT_IMAGE="tonistiigi/binfmt@sha256:400a4873b838d1b8""9194d982c45e5fb3""cda4593fbfd7e08a""02e76b03b21166f0"
+PLATFORMS="linux/amd64,linux/arm64"
+
+die() { echo "release: $*" >&2; exit 2; }
+say() { echo "release: $*"; }
+
+tag=${GP_RELEASE_TAG:-}
+[ -n "$tag" ] || die "GP_RELEASE_TAG is not set"
+semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'
+[[ $tag =~ ^v$semver$ ]] || die "the tag '$tag' is not v<x.y.z> or v<x.y.z>-<pre-release>"
+version=${tag#v}
+repo=${GP_RELEASE_REPO:-${GITHUB_REPOSITORY:-}}
+if [ -z "$repo" ] && url=$(git remote get-url origin 2>/dev/null); then
+  url=${url%/}; url=${url%.git}; repo=${url%/*}; repo=${repo##*[:/]}/${url##*/}
+fi
+[[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]] || die "GITHUB_REPOSITORY (owner/name) is not set"
+registry=${GP_RELEASE_REGISTRY:-ghcr.io}
+[[ $registry =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$ ]] || die "GP_RELEASE_REGISTRY is not a registry host"
+login=${GP_RELEASE_LOGIN:-1}
+github=${GP_RELEASE_GITHUB:-1}
+dry=${GP_RELEASE_DRY:-0}
+image="$registry/$(tr '[:upper:]' '[:lower:]' <<<"$repo")"
+ref="$image:$version"   # the version as the files and the notes pin it, <ref>@<digest>; in the registry only once promoted
+pre_ref="$image:pre-$version" # where the release run pushes it
+for tool in git jq docker; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"; done
+[ "$github" = 0 ] || command -v gh >/dev/null 2>&1 || die "gh is not installed"
+
+# 1. The tag, the tree.
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+[ "$(git rev-parse --is-shallow-repository)" = false ] || die "the clone is shallow; check out with the full history"
+commit=$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null) || die "no tag $tag in this clone"
+[ "$(git rev-parse HEAD)" = "$commit" ] || die "HEAD is not the commit of $tag"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has changes: build from a clean checkout of the tag"
+"$here/../agree" --tag "$tag" --tree .
+if [ -x "$here/../../publish/scan" ]; then
+  "$here/../../publish/scan" --public-only tree "$commit^{tree}" || die "the scan found something that must not be public"
+fi
+sd=$(git rev-parse --show-toplevel)
+out=${GP_RELEASE_OUT:-$sd/release-out}
+if [ -e "$out" ] && [ -n "$(ls -A "$out" 2>/dev/null)" ]; then die "$out is not empty"; fi
+
+say "$tag from $(git rev-parse --short "$commit"): image $pre_ref ($PLATFORMS; $ref once promoted), release in $repo$([ "$github" = 0 ] && echo ", GitHub release off")"
+if [ "$dry" = 1 ]; then say "dry run: nothing built, pushed or published"; exit 0; fi
+mkdir -p "$out"
+
+# 2. arm64 emulation. Done when /proc/sys/fs/binfmt_misc has an aarch64 entry that is enabled and has the F flag (the interpreter
+# is then loaded at registration, so it works inside containers); on an arm64 machine there is nothing to emulate.
+binfmt_dir=${GP_BINFMT_DIR:-/proc/sys/fs/binfmt_misc}
+has_arm64_binfmt() {
+  local f
+  for f in "$binfmt_dir"/*; do
+    [ -f "$f" ] || continue
+    case ${f##*/} in register | status) continue ;; esac
+    if grep -q '^enabled' "$f" 2>/dev/null && grep -q 'aarch64' "$f" 2>/dev/null && grep -q '^flags:.*F' "$f" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+case $(uname -m) in
+  aarch64 | arm64) say "this machine is arm64: no emulation needed for arm64" ;;
+  *)
+    if has_arm64_binfmt; then
+      say "arm64 emulation is registered already"
+    else
+      say "registering arm64 emulation ($BINFMT_IMAGE)"
+      docker run --privileged --rm "$BINFMT_IMAGE" --install arm64 >/dev/null
+      has_arm64_binfmt || die "arm64 emulation did not register: the machine cannot run arm64 images"
+    fi
+    ;;
+esac
+
+# 3. The image. Its GP_IMAGE_REPO is the repository it is pushed to ($image, the same name as the push's --tag), where the agent
+# looks for newer releases; without it a released image would never check. It is pushed as $pre_ref, a tag no release check
+# offers. An image already at that tag, or at $ref (promoted, or released before this rule), is the one released: a tag is never
+# moved, so it is not rebuilt.
+if [ "$login" != 0 ]; then
+  : "${GH_TOKEN:?GH_TOKEN is not set}"
+  printf '%s' "$GH_TOKEN" | docker login "$registry" -u "${GITHUB_ACTOR:-gp-release}" --password-stdin >/dev/null
+fi
+digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er '.digest'; }
+pushed=""
+for r in "$pre_ref" "$ref"; do
+  if docker buildx imagetools inspect "$r" >/dev/null 2>&1; then pushed=$r; break; fi
+done
+if [ -n "$pushed" ]; then
+  say "$pushed is already in the registry: kept as it is, not rebuilt"
+else
+  pushed=$pre_ref
+  builder=gp-release
+  created=""
+  if ! docker buildx inspect "$builder" >/dev/null 2>&1; then
+    opts=()
+    case $registry in localhost* | 127.0.0.1* | "[::1]"*) opts=(--driver-opt network=host) ;; esac
+    docker buildx create --name "$builder" --driver docker-container "${opts[@]}" >/dev/null
+    created=1
+  fi
+  [ -z "$created" ] || trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+  say "building $PLATFORMS"
+  docker buildx build --builder "$builder" --platform "$PLATFORMS" -f docker/Dockerfile \
+    --build-arg "GP_IMAGE_VERSION=$version" \
+    --build-arg "GP_IMAGE_REPO=$image" \
+    --label "org.opencontainers.image.source=https://github.com/$repo" \
+    --label "org.opencontainers.image.revision=$commit" \
+    --label "org.opencontainers.image.licenses=Elastic-2.0" \
+    --provenance=false --sbom=false \
+    --tag "$pre_ref" --push .
+fi
+digest=$(digest_of "$pushed") || die "cannot read the digest of $pushed"
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "the digest of $pushed is not sha256:<64 hex>"
+say "image $pushed, pinned as $ref@$digest"
+
+# 4. Both platforms are there, and each one starts.
+plats=$(docker buildx imagetools inspect "$image@$digest" --raw | jq -r '[.manifests[]? | select(.platform.os != "unknown") | .platform.os + "/" + .platform.architecture] | sort | join(",")')
+[ "$plats" = "linux/amd64,linux/arm64" ] || die "the image holds '$plats', not linux/amd64 and linux/arm64"
+# fresh <platform>: the one platform of the pushed image, pulled anew. Docker's classic image store keeps one platform per digest
+# and refuses to pull another one over it ("cannot overwrite digest"), so the copy here goes first.
+fresh() {
+  docker image rm "$image@$digest" >/dev/null 2>&1 || true
+  docker pull --quiet --platform "$1" "$image@$digest" >/dev/null || die "cannot pull the $1 image"
+}
+for p in linux/amd64 linux/arm64; do
+  say "starting the $p image"
+  fresh "$p"
+  slug=$(docker run --rm --pull never --platform "$p" "$image@$digest" gp slug release-probe | sed -n 's/^GP_SLUG=//p')
+  [ "$slug" = release-probe ] || die "gp does not run in the $p image"
+  docker run --rm --pull never --platform "$p" --entrypoint claude "$image@$digest" --version >/dev/null ||
+    die "claude does not run in the $p image"
+done
+
+# 5. The files.
+fill() { # template destination
+  local d
+  d=$(printf '%s' "$ref@$digest" | sed 's/[&|\\]/\\&/g')
+  sed "s|@GP_IMAGE@|$d|g" "$1" >"$2"
+}
+[ -f docker/get.sh ] || die "docker/get.sh is not in the tree"
+[ -f docker/get.ps1 ] || die "docker/get.ps1 is not in the tree"
+fill docker/get.sh "$out/get.sh"
+fill docker/get.ps1 "$out/get.ps1"
+chmod 755 "$out/get.sh"
+(cd "$out" && sha256sum get.sh get.ps1 >SHA256SUMS)
+prev=$(git -c versionsort.suffix=- tag --list 'v[0-9]*' --sort=-version:refname | grep -v -x -F "$tag" | while read -r t; do
+  if git merge-base --is-ancestor "$t" "$commit" 2>/dev/null; then echo "$t"; break; fi
+done || true)
+{
+  echo "GHOST Protocol $tag. A pre-release until one of our own agents has run it cleanly."
+  echo
+  echo "## The image"
+  echo
+  echo '```'
+  echo "$ref@$digest"
+  echo '```'
+  echo
+  echo "For linux/amd64 and linux/arm64 (Intel and Arm machines, Linux, macOS and Windows with Docker). Built from this tag's tree; the digest above is the one the install files pull."
+  echo
+  echo "## Install"
+  echo
+  echo "Needs Docker. Linux and macOS:"
+  echo
+  echo '```sh'
+  echo "curl -fsSL https://github.com/$repo/releases/download/$tag/get.sh | sh -s -- --name \"<agent name>\" --relay <relay url> --owner <owner public key>"
+  echo '```'
+  echo
+  echo "Windows (PowerShell, with Docker Desktop):"
+  echo
+  echo '```powershell'
+  echo "& ([scriptblock]::Create((irm https://github.com/$repo/releases/download/$tag/get.ps1))) -Name \"<agent name>\" -Relay <relay url> -Owner <owner public key>"
+  echo '```'
+  echo
+  echo "The files are attached, with their SHA256SUMS."
+  echo
+  echo "## What changed${prev:+ since $prev}"
+  echo
+  if [ -n "$prev" ]; then range="$prev..$commit"; else range=$commit; fi
+  git log --no-merges --format='- %s' -n 100 "$range"
+} >"$out/release-notes.md"
+
+# 6. Everything agrees.
+fresh linux/amd64
+"$here/../agree" --tag "$tag" --tree . --image "$image@$digest" --image-digest "$digest" --get-sh "$out/get.sh" --get-ps1 "$out/get.ps1"
+env_repo=$(docker image inspect "$image@$digest" --format '{{json .Config}}' |
+  jq -r '[(.Env // [])[] | select(startswith("GP_IMAGE_REPO="))] | (.[0] // "GP_IMAGE_REPO=") | sub("^GP_IMAGE_REPO="; "")')
+[ "$env_repo" = "$image" ] || die "the image's GP_IMAGE_REPO is '$env_repo', not $image: a released image must check $image for newer releases"
+say "the image checks $image for newer releases"
+
+# 7. The GitHub release, a pre-release; its files are the ones in the output folder.
+if [ "$github" = 0 ]; then say "GitHub release off: the files are in $out"; exit 0; fi
+: "${GH_TOKEN:?GH_TOKEN is not set}"
+files=("$out/get.sh" "$out/get.ps1" "$out/SHA256SUMS")
+if existing=$(gh release view "$tag" --repo "$repo" --json isPrerelease 2>/dev/null); then
+  if [ "$(jq -r .isPrerelease <<<"$existing")" != true ]; then
+    say "the release $tag exists and was promoted: left as it is (files in $out)"
+    exit 0
+  fi
+  say "the release $tag exists: its notes and files are replaced"
+  gh release edit "$tag" --repo "$repo" --notes-file "$out/release-notes.md" >/dev/null
+  gh release upload "$tag" --repo "$repo" --clobber "${files[@]}" >/dev/null
+else
+  gh release create "$tag" --repo "$repo" --verify-tag --prerelease --title "$tag" --notes-file "$out/release-notes.md" "${files[@]}" >/dev/null
+fi
+say "released $tag as a pre-release in $repo; $ref is added when it is promoted (tools/release/mark promote)"

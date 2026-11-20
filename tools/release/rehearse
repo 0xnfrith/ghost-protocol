@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# rehearse: the staging proof's first half, run on this machine with no GitHub and no secret: export, scan, push to a local bare
+# repository, clone, tag, and the release step. What it does:
+#
+#   rehearse [--ref <ref>] [--build] [--keep]
+#
+#   1. publishes <ref> (default HEAD) of this clone into a new local bare repository with tools/publish/publish, which scans first;
+#   2. checks that what was published is exactly the allowlist's export of <ref> (the same tree, file for file);
+#   3. clones it, makes an annotated tag v<version> (the version in plugin.json) on the public commit, and checks that tag out;
+#   4. runs tools/release/ci/run there. By default as a dry run: the tag, plugin.json and the scan's public words are checked and
+#      the plan is printed. With --build it does the whole release against a local registry (registry:2 on 127.0.0.1, removed
+#      at the end): both architectures, the digest in get.sh and get.ps1, the notes, and no GitHub release. That takes a while
+#      (the arm64 half runs under emulation) and needs Docker.
+#
+# --keep leaves the scratch folder (and says where). Exit 0: every step passed. The real staging repo is the same steps, with the
+# workflows doing steps 1 and 4.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+die() { echo "rehearse: $*" >&2; exit 2; }
+say() { echo "rehearse: $*"; }
+
+ref=HEAD
+build=false
+keep=false
+while [ $# -gt 0 ]; do
+  case $1 in
+    --ref) [ $# -ge 2 ] || die "--ref needs a value"; ref=$2; shift 2 ;;
+    --build) build=true; shift ;;
+    --keep) keep=true; shift ;;
+    -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+for tool in git jq python3; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"; done
+cd "$root"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+head=$(git rev-parse --verify --quiet "$ref^{commit}") || die "no commit $ref"
+version=$(git show "$head:.claude-plugin/plugin.json" | jq -er '.version') || die "no version in plugin.json at $ref"
+tag=v$version
+# A shallow clone (CI's checkout) cannot be walked by the publish: it is rehearsed as one commit holding the tree, with no history.
+if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+  src_tree=$(git rev-parse "$head^{tree}")
+  rehearsal_email="rehearsal@users.""noreply.github.com"
+  head=$(GIT_AUTHOR_NAME="GP Rehearsal" GIT_AUTHOR_EMAIL=$rehearsal_email GIT_COMMITTER_NAME="GP Rehearsal" GIT_COMMITTER_EMAIL=$rehearsal_email \
+    git commit-tree "$src_tree" -m "Rehearsal of a tree")
+  say "this clone is shallow: rehearsing its tree as one commit, with no history"
+fi
+
+scratch=$(mktemp -d)
+registry_name=""
+cleanup() {
+  if [ -n "$registry_name" ]; then docker rm -f "$registry_name" >/dev/null 2>&1 || true; fi
+  if $keep; then say "kept $scratch"; else rm -rf "$scratch"; fi
+}
+trap cleanup EXIT
+
+# 1. Publish into a local bare repository.
+git init -q --bare -b main "$scratch/staging.git"
+say "publishing $(git rev-parse --short "$head") into a local bare repository"
+"$root/tools/publish/publish" --apply --ref "$head" "$scratch/staging.git" >"$scratch/publish.log" 2>&1 \
+  || { cat "$scratch/publish.log" >&2; die "the publish stopped (above)"; }
+tail -n 3 "$scratch/publish.log"
+
+# 2. The public tree is the export, exactly.
+want=$(GIT_DIR=$(git rev-parse --absolute-git-dir) "$root/tools/publish/export" --tree "$head")
+got=$(git --git-dir="$scratch/staging.git" rev-parse "main^{tree}")
+[ "$want" = "$got" ] || die "the published tree is not the allowlist's export of $ref"
+say "the published tree equals the export ($(cut -c1-12 <<<"$got"))"
+
+# 3. Clone, tag, check out.
+git clone -q "$scratch/staging.git" "$scratch/public"
+git -C "$scratch/public" -c user.name="GP Rehearsal" -c user.email="rehearsal@users.""noreply.github.com" tag -a "$tag" -m "Rehearsal of $tag" main
+git -C "$scratch/public" checkout -q "$tag" 2>/dev/null
+say "tagged $tag on the public commit"
+
+# 4. The release step.
+export GP_RELEASE_TAG=$tag GP_RELEASE_REPO=rehearsal/ghost-protocol GP_RELEASE_OUT=$scratch/release-out GP_RELEASE_GITHUB=0 GP_RELEASE_LOGIN=0
+if $build; then
+  command -v docker >/dev/null 2>&1 || die "docker is not installed"
+  port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  registry_name=gp-rehearse-registry-$$
+  docker run -d --name "$registry_name" -p "127.0.0.1:$port:5000" registry:2 >/dev/null
+  for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1 && break; sleep 1; done
+  export GP_RELEASE_REGISTRY=localhost:$port
+  say "building both architectures into the local registry on port $port"
+else
+  export GP_RELEASE_DRY=1
+fi
+(cd "$scratch/public" && ./tools/release/ci/run)
+if $build; then say "release files: $(ls "$scratch/release-out" | tr '\n' ' ')"; fi
+say "passed: export, scan and the release step$($build || echo ' (dry run)') for $tag"

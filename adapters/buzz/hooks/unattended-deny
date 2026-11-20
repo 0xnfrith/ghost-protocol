@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# unattended-deny: a Claude Code PermissionRequest hook for an instance in
+# unattended mode (the plugin option unattended; see install/service/start).
+#
+# Nobody watches an unattended instance's terminal, so a permission dialog
+# would wait there forever, and the turn would never end or report. Auto mode
+# still opens one in a few cases: its confirmation after three blocked actions
+# in a row, a read outside the working folders, and AskUserQuestion. This hook
+# answers every one of them with deny, and a message telling the agent to stop
+# trying and to say on Buzz that the step needs a person. The turn then goes
+# on, ends, and the reply guard sees the answer in the thread.
+#
+# It acts only when GP_UNATTENDED=1 is in the session's environment, which
+# install/service/start sets when the instance's unattended option is on.
+# Anywhere else (a session a person runs, an attended instance) it prints
+# nothing, and the dialog shows as usual. It reads its input only to drain it,
+# and always exits 0.
+#
+# For the status line (adapters/buzz/README.md, "Status line"), it also
+# leaves the fixed line "deny <time>" in the instance's state folder
+# (~/.local/state/ghost-protocol/<GP_INSTANCE_NAME>/status-wait), when that
+# folder exists and the hook was run by the instance's own claude (the one
+# install/service/start wrote to pane-pid: hooks/lib/own-claude.sh, the check
+# the session-id and turn-state hooks make). A `claude -p` the agent runs
+# gets the same deny, but leaves no wait: its dialog is not the agent's.
+# The channel then says the agent waits for a person. Nothing from the
+# request goes into it.
+#
+# Test: install/test/hook-unattended-deny.test.sh; the wait file:
+# adapters/buzz/test/status.test.mjs
+set -u
+[ "${GP_UNATTENDED:-}" = 1 ] || exit 0
+cat >/dev/null 2>&1 || true
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied automatically: this agent runs unattended and nobody can answer a permission prompt. Do not retry this action or work around it. Report in the Buzz thread that this step needs a person, quoting this message."}}}'
+name="${GP_INSTANCE_NAME:-}"
+case "$name" in '' | -* | *[!a-z0-9-]*) exit 0 ;; esac
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol/$name"
+[ -d "$dir" ] || exit 0
+# shellcheck source=SCRIPTDIR/../../../hooks/lib/own-claude.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../../../hooks/lib/own-claude.sh" 2>/dev/null || exit 0
+own_claude "$dir" || exit 0
+tmp="$(mktemp "$dir/.status-wait.XXXXXX" 2>/dev/null)" || exit 0
+if printf 'deny %s%s\n' "$(date +%s)" "$$" >"$tmp" 2>/dev/null && mv -f "$tmp" "$dir/status-wait" 2>/dev/null; then exit 0; fi
+rm -f "$tmp"
+exit 0

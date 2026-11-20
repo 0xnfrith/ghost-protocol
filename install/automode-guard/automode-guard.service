@@ -1,0 +1,113 @@
+# One run of the auto-mode guard for the Ghost Protocol instance @NAME@ (this
+# unit is named after the instance, <name>-automode-guard.service). The
+# installer (install/lib/service.sh, step 14, or install/automode-guard/setup)
+# makes it from install/automode-guard/automode-guard.service with the
+# manifest's [automode_guard] filled in, and installs it in /etc/systemd/system
+# with its timer. The guard (install/automode-guard/guard)
+# says what it reads, keeps and sends.
+#
+# Credentials and extra environment for the key command belong to the
+# instance, in a drop-in it owns,
+# /etc/systemd/system/<name>-automode-guard.service.d/instance.conf, for example:
+#   [Service]
+#   LoadCredentialEncrypted=api-token:/etc/credstore.encrypted/api-token
+#   Environment=EXAMPLE_SETTING=value
+# The guard hands each credential to the send alone, as an environment
+# variable (api-token becomes API_TOKEN), never to the check.
+#
+# The sandbox: it runs as @USER@, the instance home's owner (never root: the
+# installer refuses), with no capabilities and no way to gain any. Everything
+# is read-only except its state folder,
+# /var/lib/ghost-protocol/@NAME@-automode-guard (0700), and the two files it
+# writes to apply the owner's answer: the settings file and the ledger (when
+# the manifest names one; else the ledger is in the state folder). Each is
+# bound as one file, not its folder, and written in place. Home folders are an
+# empty read-only tmpfs: only the paths below are there. Read-only: the
+# instance repo's .git folder (the snapshot is read as committed on main,
+# with /usr/bin/git), node, and the manifest's read_paths for the key command.
+# The guard itself runs with PATH=/usr/bin:/bin; only the adapter's process
+# gets GP_GUARD_SEND_PATH. Network: IPv4, IPv6 and local sockets only, which
+# the adapter needs.
+#
+# Read it:  journalctl -u @NAME@-automode-guard (counts and outcomes, never a rule)
+# Run now:  sudo systemctl start <name>-automode-guard.service
+# Dry run:  @LIB@/guard --dry-run (as @USER@, with this unit's GP_GUARD_* settings)
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the auto-mode guard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=/
+Environment=HOME=@HOME@ USER=@USER@ LOGNAME=@USER@
+Environment=PATH=/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=GP_GUARD_NAME=@NAME@
+Environment=GP_GUARD_REPO=@REPO@
+Environment=GP_GUARD_SNAPSHOT=@SNAPSHOT@
+Environment=GP_GUARD_SETTINGS=@HOME@/.claude/settings.json
+Environment=GP_GUARD_LEDGER=@LEDGER@
+Environment=GP_GUARD_OWNER=@OWNER@
+Environment=GP_GUARD_NODE=@NODE@
+Environment=GP_GUARD_CHANNEL=@CHANNEL@
+Environment="GP_GUARD_MENTIONS=@MENTIONS@"
+Environment=BUZZ_RELAY_URL=@RELAY_URL@
+Environment="BUZZ_KEY_COMMAND=@KEY_COMMAND@"
+Environment=GP_GUARD_SEND_PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The manifest's buzz_task_open_emoji and its _url; empty: alerts get no state.
+Environment=BUZZ_TASK_OPEN_EMOJI=@TASK_EMOJI@
+Environment=BUZZ_TASK_OPEN_EMOJI_URL=@TASK_EMOJI_URL@
+ExecStart=@LIB@/guard
+StateDirectory=ghost-protocol/@NAME@-automode-guard
+StateDirectoryMode=0700
+UMask=0077
+# Two checks with a 5 s pause, one reply read of up to 90 s, a few
+# messages of up to 150 s each (an answer's, and one per kind of rule), and
+# each new alert's open state (with buzz_task_open_emoji) of up to 60 s.
+TimeoutStartSec=12min
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere except the state folder and the files bound with
+# BindPaths= below.
+ProtectSystem=strict
+# Home folders: an empty read-only tmpfs, with only these paths in it.
+# A path that is missing does not stop the start (the "-"): the guard then
+# finds what is missing and reports the check as broken.
+ProtectHome=tmpfs
+BindPaths=-@HOME@/.claude/settings.json
+@LEDGER_PATHS@
+BindReadOnlyPaths=-@REPO@/.git
+BindReadOnlyPaths=-@NODE@
+@READ_PATHS@
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+RemoveIPC=yes
+KeyringMode=private
+# The send's network only: IPv4, IPv6, local sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+Nice=10

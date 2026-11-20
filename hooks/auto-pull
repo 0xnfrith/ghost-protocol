@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# auto-pull: a Claude Code PostToolUse hook (matcher Bash). Right after a
+# `gh pr merge` the agent runs, it fast-forwards the instance's checkout of the
+# merged repo, so the merge lands locally without anyone saying "pull". The
+# plugin option auto_pull switches it off.
+#
+# This hook is the instant path for merges the agent presses. Merges it cannot
+# see (`gh pr merge --auto` landing after CI, a button on GitHub, other agents)
+# need a sweep: sync-mains --home <home> --root <root>, run by a timer.
+#
+# Which repo was merged: the `owner/name` of a `gh pr merge` in the Bash
+# command, on any host (github.com, the installer's integration host; https,
+# ssh:// or git@host: forms), read in this order:
+#   1. an explicit target after `gh pr merge` in the same command segment:
+#      -R / --repo <[host/]owner/repo or URL>, or a .../<owner>/<repo>/pull/<n>
+#      URL; else a GH_REPO=<repo> set before it in the command. owner/name must
+#      match exactly (tools-foo is not tools);
+#   2. otherwise the folder the merge ran in: the last `cd <dir>` before it in
+#      the command (a relative one from the hook's cwd, or the cwd itself when
+#      it is already that folder), else the hook's cwd; its remote.origin.url
+#      names the repo (worktrees share their repo's config, so a merge from a
+#      worktree counts).
+# Which checkout is pulled: every checkout among the instance's home and
+# <root>/repos/<owner>/<repo> whose own origin names that same owner/name. The
+# home and root come from the instance manifest of the session's project
+# (.ghost-protocol/instance.toml; hooks/lib/hook.sh); a session with none is
+# left alone. The match only decides WHETHER to pull; the pull itself comes
+# from the checkout's own origin, so matching on owner/name across hosts cannot
+# pull anyone else's code.
+#
+# What it does: hands those checkouts to sync-mains (next to this hook), which
+# fast-forwards each one only when it is a clean main checkout on its default
+# branch (never another branch, never a merge or rebase), and logs every
+# outcome to <plugin data>/hooks/auto-pull.log. When a checkout moved it prints
+# one PostToolUse additionalContext line naming it and the old and new commits,
+# so the agent knows a pull happened. When a fast-forward stopped PART-WAY
+# (tracked files changed, HEAD unmoved: a failed Git LFS download, say) the
+# line starts "auto-pull NEEDS A HAND", so the agent fixes that checkout by
+# hand before it is silently skipped as dirty. Otherwise it prints nothing. A
+# failed merge costs nothing: a fetch with nothing new is a no-op, so the hook
+# does not read the tool's exit status. `gh pr merge --auto` gets a harmless
+# no-op here.
+#
+# Never fails the tool call: every path exits 0 and nothing reaches stderr.
+# Any parse failure, a missing jq or git, no manifest, or a missing checkout is
+# a silent no-op. Reads only tool_name, tool_input.command and cwd; never
+# prints, stores or forwards the environment.
+#
+# Test: install/test/hook-auto-pull.test.sh
+set -u
+exec 2>/dev/null
+
+input=$(cat) || exit 0
+[ -n "$input" ] || exit 0
+# Fast path: this runs after every Bash call.
+case "$input" in
+  *gh*merge*) ;;
+  *) exit 0 ;;
+esac
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+hook_on auto_pull || exit 0
+command -v jq >/dev/null || exit 0
+command -v git >/dev/null || exit 0
+sync="$HOOKS_DIR/sync-mains"
+[ -x "$sync" ] || exit 0
+
+parsed=$(printf '%s' "$input" | jq -r '
+  select(.tool_name == "Bash")
+  | (.tool_input.command // "") as $c
+  | select($c | test("(^|[^A-Za-z0-9_.-])gh\\s+pr\\s+merge(\\s|$)"))
+  | ([$c | capture("gh\\s+pr\\s+merge(?<seg>[^;&|\\n]*)")] | first | .seg // "") as $seg
+  | ([$c | capture("^(?<pre>[\\s\\S]*?)gh\\s+pr\\s+merge")] | first | .pre // "") as $pre
+  | (
+      ([$seg | capture("(^|\\s)(-R\\s*|--repo[=\\s]\\s*)[\"'"'"']?(?<r>[^\\s\"'"'"';&|)]+)")] | first | .r)
+      // ([$seg | capture("(^|\\s)[\"'"'"']?(?<r>(https?://)?[A-Za-z0-9.-]+\\.[A-Za-z]+(:[0-9]+)?/[^/\\s]+/[^/\\s]+/pull/[0-9]+)")] | first | .r)
+      // ([$pre | scan("(?:^|[;&|\\s(])GH_REPO=[\"'"'"']?([^\\s\"'"'"';&|)]+)")] | last | .[0])
+      // ""
+    ) as $target
+  | ([$pre | scan("(?:^|[;&|\\s(])cd\\s+[\"'"'"']?([^;&|\\s\"'"'"']+)")] | last | .[0]) as $cd
+  | [$target, ($cd // ""), (.cwd // "")]
+  | join("\u001f")
+') || exit 0
+[ -n "$parsed" ] || exit 0
+# Unit-separator fields: a tab would collapse an empty first field in `read`.
+IFS=$'\x1f' read -r target cddir cwd <<<"$parsed"
+
+# owner/name from any repo spelling: owner/name, host/owner/name, a URL (https,
+# ssh://, git@host:), a PR URL. Lowercase, the last two path parts.
+slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's#[?\#].*$##; s#^[a-z][a-z0-9+.-]*://##; s#^[^@/]*@##; s#:#/#g; s#/pull/[0-9]+.*$##; s#/+$##; s#\.git$##; s#/+$##' \
+    | awk -F/ 'NF >= 2 && $(NF-1) != "" && $NF != "" { print $(NF-1) "/" $NF }'
+}
+
+if [ -n "$target" ]; then
+  want=$(slug "$target")
+else
+  dir="$cwd"
+  if [ -n "$cddir" ]; then
+    # The patterns are the literal text of the command (~, $HOME), not expansions.
+    # shellcheck disable=SC2088,SC2016
+    case "$cddir" in
+      "~") dir="$HOME" ;;
+      "~/"*) dir="$HOME/${cddir#\~/}" ;;
+      '$HOME' | '${HOME}') dir="$HOME" ;;
+      '$HOME/'*) dir="$HOME/${cddir#\$HOME/}" ;;
+      '${HOME}/'*) dir="$HOME/${cddir#\$\{HOME\}/}" ;;
+      /*) dir="$cddir" ;;
+      # Relative: from the hook's cwd, which may already be the folder after the cd.
+      *) if [ -d "$cwd/$cddir" ]; then dir="$cwd/$cddir"; else dir="$cwd"; fi ;;
+    esac
+  fi
+  want=""
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    want=$(slug "$(git -C "$dir" config --get remote.origin.url)")
+  fi
+fi
+[ -n "$want" ] || exit 0
+
+# The instance's checkouts: its home and <root>/repos/<owner>/<repo>, from the
+# manifest of the session's project (CLAUDE_PROJECT_DIR, else the hook's cwd).
+hook_instance "${CLAUDE_PROJECT_DIR:-$cwd}" || exit 0
+checkouts=()
+for c in "$HOOK_HOME" ${HOOK_ROOT:+"$HOOK_ROOT"/repos/*/*}; do
+  [ -e "$c/.git" ] || continue
+  [ "$(slug "$(git -C "$c" config --get remote.origin.url)")" = "$want" ] && checkouts+=("$c")
+done
+[ "${#checkouts[@]}" -gt 0 ] || exit 0
+
+out=$("$sync" --log "$(hook_state_dir)/auto-pull.log" -- "${checkouts[@]}") || exit 0
+[ -n "$out" ] || exit 0
+moved=$(printf '%s\n' "$out" | awk 'NF { printf "%s%s", sep, $0; sep = "; " }')
+case "$out" in
+  *PART-WAY*) msg="auto-pull NEEDS A HAND after gh pr merge: $moved" ;;
+  *) msg="auto-pull: $moved after gh pr merge." ;;
+esac
+jq -cn --arg m "$msg" \
+  '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $m}}'
+exit 0

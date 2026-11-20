@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# export: which files of a commit are public, and the public tree made from them.
+#
+#   export --list [<commit>]          the allowlisted files of the commit, one path per line
+#   export --tree [<commit>]          writes the allowlisted files as a tree object and prints its id
+#   export --dir <commit> <folder>    writes the allowlisted files into an empty folder
+#   export --filter <allowlist>       reads `git ls-tree -r` lines on stdin, prints the ones that are public
+#
+# <commit> defaults to HEAD. The allowlist is tools/publish/allowlist as it is in that commit; --allowlist <file> uses a file instead
+# (it replaces the one in the commit). The allowlist lists, one per line (# starts a comment):
+#   path/    a folder: every file under it
+#   path     one file
+#   !path/   or !path: leaves that out again (an exception to the lines above it, or below)
+# A path is relative to the root and holds no glob, no .., no backslash and no quote. The export is exactly the files of the commit
+# that the allowlist names and does not leave out, with their modes: nothing else, and never a path in NEVER below. A path in NEVER
+# is left out even when a folder above it is listed, and an allowlist that names one is refused (exit 2): that is a mistake, not a
+# choice.
+#
+# Runs on whatever repository git finds (GIT_DIR counts); a tree it writes goes into that repository.
+set -euo pipefail
+
+# Never public, whatever the allowlist says. tools/publish/internal/ holds the scan's full word list.
+NEVER=(evals/ docs/plans/ tools/publish/internal/ .git/)
+
+die() { echo "export: $*" >&2; exit 2; }
+
+allowlist_file=""
+mode=""
+args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --allowlist) [ $# -ge 2 ] || die "--allowlist needs a file"; allowlist_file=$2; shift 2 ;;
+    --list | --tree | --dir | --filter) mode=$1; shift ;;
+    -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ -n "$mode" ] || die "say what to do: --list, --tree, --dir or --filter"
+
+# Reads the allowlist file $1 and writes the rules to $2, one per line: +path or -path (the NEVER paths as - rules at the end).
+parse_allowlist() {
+  local file=$1 rules=$2 line sign n
+  : >"$rules"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [ -n "$line" ] || continue
+    sign=+
+    if [ "${line:0:1}" = '!' ]; then sign=-; line=${line:1}; fi
+    case $line in
+      '' | /* | ./* | *//* | *..* | *'*'* | *'?'* | *'['* | *[\\]* | *'"'* | *\'* | *[[:space:]]*)
+        die "$file: a bad entry: '$line'" ;;
+    esac
+    if [ "$sign" = + ]; then
+      for n in "${NEVER[@]}"; do
+        case $line in "$n"* | "${n%/}") die "$file: '$line' is never public" ;; esac
+      done
+    fi
+    printf '%s%s\n' "$sign" "$line" >>"$rules"
+  done <"$file"
+  for n in "${NEVER[@]}"; do printf -- '-%s\n' "$n" >>"$rules"; done
+  grep -q '^+' "$rules" || die "$file lists no path"
+}
+
+# Reads `git ls-tree -r` lines on stdin, writes the ones whose path is public.
+filter_lines() {
+  awk -F'\t' -v rules="$1" '
+    BEGIN {
+      while ((getline l < rules) > 0) {
+        if (substr(l, 1, 1) == "+") inc[++ni] = substr(l, 2); else exc[++ne] = substr(l, 2)
+      }
+    }
+    function hit(path, e) { return (substr(e, length(e)) == "/") ? (index(path, e) == 1) : (path == e) }
+    {
+      path = substr($0, index($0, "\t") + 1)
+      if (substr(path, 1, 1) == "\"") { print "export: a path git quotes (a special character in its name): " path > "/dev/stderr"; bad = 1; exit }
+      ok = 0
+      for (i = 1; i <= ni; i++) if (hit(path, inc[i])) { ok = 1; break }
+      if (ok) for (i = 1; i <= ne; i++) if (hit(path, exc[i])) { ok = 0; break }
+      if (ok) print
+    }
+    END { exit bad }'
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+if [ "$mode" = --filter ]; then
+  [ ${#args[@]} -eq 1 ] || die "--filter takes the allowlist file"
+  parse_allowlist "${args[0]}" "$tmp/rules"
+  filter_lines "$tmp/rules"
+  exit
+fi
+
+commit=${args[0]:-HEAD}
+if [ "$mode" = --dir ]; then
+  [ ${#args[@]} -eq 2 ] || die "--dir takes a commit and a folder"
+  folder=${args[1]}
+  if ! [ -d "$folder" ] || [ -n "$(ls -A "$folder")" ]; then die "$folder is not an empty folder"; fi
+elif [ ${#args[@]} -gt 1 ]; then
+  die "too many arguments"
+fi
+git rev-parse --verify --quiet "$commit^{commit}" >/dev/null || die "no commit $commit"
+if [ -z "$allowlist_file" ]; then
+  git cat-file -e "$commit:tools/publish/allowlist" 2>/dev/null || die "$commit has no tools/publish/allowlist"
+  git cat-file blob "$commit:tools/publish/allowlist" >"$tmp/allowlist"
+  allowlist_file=$tmp/allowlist
+fi
+parse_allowlist "$allowlist_file" "$tmp/rules"
+
+# The files of the commit that are public, as `git ls-tree` lines.
+git ls-tree -r --full-tree "$commit" | filter_lines "$tmp/rules" >"$tmp/entries"
+if grep -q '^160000 ' "$tmp/entries"; then die "a submodule is on the allowlist: not exported"; fi
+
+case $mode in
+  --list) cut -f2- "$tmp/entries" ;;
+  --tree)
+    # Each line is "<mode> <type> <sha>\t<path>"; an index entry is "<mode> <sha>\t<path>".
+    awk -F'\t' '{ split($1, m, " "); print m[1] " " m[3] "\t" $2 }' "$tmp/entries" >"$tmp/index-info"
+    GIT_INDEX_FILE=$tmp/index git update-index --index-info <"$tmp/index-info"
+    GIT_INDEX_FILE=$tmp/index git write-tree
+    ;;
+  --dir)
+    while IFS=$'\t' read -r meta path; do
+      read -r fmode _ sha <<<"$meta"
+      mkdir -p "$folder/$(dirname "$path")"
+      if [ "$fmode" = 120000 ]; then
+        ln -s "$(git cat-file blob "$sha")" "$folder/$path"
+      else
+        git cat-file blob "$sha" >"$folder/$path"
+        [ "$fmode" = 100755 ] && chmod +x "$folder/$path"
+      fi
+    done <"$tmp/entries"
+    ;;
+esac

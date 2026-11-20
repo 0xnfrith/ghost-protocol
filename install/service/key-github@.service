@@ -1,0 +1,80 @@
+# One GitHub review request (gp-key-<name>-github@.service) of the Ghost
+# Protocol instance @NAME@, started by its socket for each connection.
+# install/keyservice/setup makes it from install/service/key-github@.service
+# for GHOST Protocol commit @COMMIT@.
+#
+# It runs as @GH_USER@, the GitHub App key's own user: never the instance's
+# own user, and never @KEY_USER@, the key's user, whose buzz-mcp, channel and
+# copy step take what the agent and the relay send. A process of the same
+# user could read this one's memory (/proc/<pid>/mem) while it holds the key;
+# one of another user cannot. The GitHub App key arrives as a file descriptor
+# systemd opens as root (OpenFile=); that user cannot open the file itself. github-review.mjs serve
+# reads one request, checks it and the allowlist in @ETC@/github.conf, and
+# only then reads the key: a JWT, a token for that one repo with
+# pull_requests:write alone, the review pinned to the head commit, the token
+# revoked. It never answers with the key, a JWT or a token. Each request
+# leaves one ledger line in the journal:
+#   journalctl -u 'gp-key-@NAME@-github@*'
+#
+# Where it may connect: systemd filters by address, not by name, and
+# api.github.com's addresses change, so the one origin is fixed in the code
+# (https://api.github.com, no redirect followed, TLS checked against node's
+# own roots, every setting that would loosen that refused), and this unit
+# allows IPv4, IPv6 and local sockets only.
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the GitHub review action, as the GitHub App key's user
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=@GH_USER@
+Group=@GH_USER@
+ExecStart=@NODE@ --disable-sigusr1 @CODE@/adapters/buzz/src/github-review.mjs serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+OpenFile=@ETC@/github-app.pem:github-app-key:read-only
+EnvironmentFile=@ETC@/github.conf
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_COMPILE_CACHE LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF OPENSSL_MODULES OPENSSL_ENGINES NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE NODE_USE_ENV_PROXY NODE_DEBUG NODE_DEBUG_NATIVE
+WorkingDirectory=/
+UMask=0077
+LimitCORE=0
+# One request: it ends well before this.
+RuntimeMaxSec=2min
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere; home folders are not there at all, nor the folders the
+# session shares with the key's user.
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-@SRV@
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+KeyringMode=private
+# Other processes are hidden, and /proc shows only process folders.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# GitHub only, by the code: IPv4, IPv6, and local sockets for name lookups.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

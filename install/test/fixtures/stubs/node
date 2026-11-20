@@ -1,0 +1,126 @@
+#!/bin/sh
+# Test stand-in for node, for the auto-mode guard's and the key service's
+# install steps. It answers what they ask: its own path
+# (-e 'process.stdout.write(process.execPath)'), its major version (-p ...,
+# from $STUB_STATE/node.major, default 22) and --version. For the key service
+# it also plays the adapter's keyfile.mjs (--disable-sigusr1 <...>/keyfile.mjs
+# write|generate|pubkey <path>): write copies stdin into a new <path> (mode
+# 0400; a path that is there is refused, exit 1), generate writes a stand-in
+# key, and each prints the stand-in public key, 64 "a"s (keyfile.fail makes it
+# fail). It also plays launch.mjs probe <channel|buzz-mcp> (BUZZ_KEY_SOCKET
+# the folder): it answers, or does not while probe.<target>.fails is there
+# (then it says the connection was closed, exit 1). probe.<target>.why gives
+# another reason it did not answer (a timeout, an error answer), and
+# probe.<target>.not-channel makes it answer as a server that is not a
+# channel (exit 1). probe.<target>.adds holds a line for keyunit.running,
+# which systemctl list-units prints: a channel instance
+# (gp-key-<name>-channel@<nr>-<pid>-<uid>.service ...) that comes or stays
+# while it probes, counted in that socket's NConnections too; it records
+# "node probe <target>". It records "node <n>", and for keyfile.mjs
+# "node keyfile <command>".
+# It also plays the GitHub review code (github-review.mjs): keyfile
+# write|replace|fingerprint <path> as keyfile.mjs does (write refuses a path
+# that is there; replace needs one, and refuses the same content; each prints
+# "fingerprint SHA256:<43 characters>=", made from the file's sha256, and
+# replace "previous ..." too; ghkey.fail makes it fail; it records
+# "node ghkey <command>" and keeps the path in ghkey.path), and the session's
+# client, --socket <folder> fingerprint|app: it answers with the fingerprint
+# of the file in ghkey.path, or as app does ("app review-bot (id 31337), ...,
+# key <fingerprint>"), unless ghprobe.<action>.fails is there (then it says it
+# was refused, exit 1); ghprobe.fingerprint.wrong gives another fingerprint.
+# It records "node ghprobe <action>". It also plays rules check <path> (the
+# public-text rules file): "rules 1", or refused (exit 1) while ghrules.fail
+# is there or the file is not; it records "node ghrules <path>".
+# Anything else is an unexpected call.
+S="${STUB_STATE:?}"
+echo "node $#" >>"$S/calls"
+if [ "${1:-}" = --disable-sigusr1 ]; then shift; fi
+case "${1:-}" in
+    */keyfile.mjs)
+        echo "node keyfile ${2:-}" >>"$S/calls"
+        [ -f "$S/keyfile.fail" ] && { echo "keyfile: refused" >&2; exit 1; }
+        case "${2:-}" in
+            write|generate)
+                [ -e "$3" ] && { echo "keyfile: $3 already exists; a key file is never replaced" >&2; exit 1; }
+                if [ "$2" = write ]; then (umask 0377; cat >"$3"); else (umask 0377; echo "stand-in-generated-key" >"$3"); fi ;;
+            pubkey) [ -f "$3" ] || { echo "keyfile: could not open $3" >&2; exit 1; } ;;
+            *) exit 2 ;;
+        esac
+        printf '%064d\n' 0 | tr 0 a
+        exit 0 ;;
+    */github-review.mjs)
+        fp() { printf 'SHA256:%s=' "$(sha256sum <"$1" | cut -c1-43)"; }
+        case "${2:-}" in
+            keyfile)
+                echo "node ghkey ${3:-}" >>"$S/calls"
+                [ -f "$S/ghkey.fail" ] && { echo "github-review keyfile: refused" >&2; exit 1; }
+                printf '%s\n' "${4:-}" >"$S/ghkey.path"
+                case "${3:-}" in
+                    write)
+                        [ -e "$4" ] && { echo "github-review keyfile: $4 already exists" >&2; exit 1; }
+                        (umask 0377; cat >"$4") ;;
+                    replace)
+                        [ -f "$4" ] || { echo "github-review keyfile: $4 is not there: nothing to replace" >&2; exit 1; }
+                        old="$(fp "$4")"
+                        rm -f "$4.stub-new"; (umask 0377; cat >"$4.stub-new")
+                        [ "$(fp "$4.stub-new")" != "$old" ] || { rm -f "$4.stub-new"; echo "github-review keyfile: the new key is the key that is there already" >&2; exit 1; }
+                        mv -f "$4.stub-new" "$4" ;;
+                    fingerprint) [ -f "$4" ] || { echo "github-review keyfile: could not open $4" >&2; exit 1; } ;;
+                    *) exit 2 ;;
+                esac
+                echo "fingerprint $(fp "$4")"
+                [ -z "${old:-}" ] || echo "previous $old"
+                exit 0 ;;
+            rules)
+                echo "node ghrules ${4:-}" >>"$S/calls"
+                [ "${3:-}" = check ] || exit 2
+                [ -f "$S/ghrules.fail" ] && { echo "github-review rules: public-text rule example: the pattern does not compile" >&2; exit 1; }
+                [ -f "${4:-}" ] || { echo "github-review rules: the public-text rules file is not there" >&2; exit 1; }
+                echo "rules 1"
+                exit 0 ;;
+            --socket)
+                echo "node ghprobe ${4:-}" >>"$S/calls"
+                if [ -f "$S/ghprobe.${4:-}.fails" ]; then
+                    echo "gp-github-review: refused: the key service closed the connection before answering" >&2; exit 1
+                fi
+                k="$(cat "$S/ghkey.path" 2>/dev/null)"
+                f="$(fp "$k")"
+                [ -f "$S/ghprobe.fingerprint.wrong" ] && f="SHA256:$(printf '%043d' 0)="
+                case "${4:-}" in
+                    fingerprint) echo "fingerprint $f" ;;
+                    app) echo "app review-bot (id 31337), client id Iv23listandin, owner example-org, permissions pull_requests:write,metadata:read, key $f" ;;
+                    *) exit 2 ;;
+                esac
+                exit 0 ;;
+        esac
+        echo "node stub: unexpected github-review.mjs call" >&2; exit 64 ;;
+    */launch.mjs)
+        [ "${2:-}" = probe ] || { echo "node stub: unexpected launch.mjs call" >&2; exit 64; }
+        echo "node probe ${3:-}" >>"$S/calls"
+        sock="${BUZZ_KEY_SOCKET:?}/$3.sock"
+        # A connection that comes or stays while it probes: a running
+        # instance in keyunit.running, counted in NConnections too.
+        if [ -f "$S/probe.$3.adds" ]; then
+            l="$(cat "$S/probe.$3.adds")"
+            printf '%s\n' "$l" >>"$S/keyunit.running"
+            echo 1 >"$S/keyunit.${l%%@*}.socket.connections"
+        fi
+        if [ -f "$S/probe.$3.not-channel" ]; then
+            echo "probe: $sock answered (server stub-other), but not as a channel (no claude/channel capability)"
+            exit 1
+        fi
+        if [ -f "$S/probe.$3.why" ]; then
+            echo "probe: $sock did not answer: $(cat "$S/probe.$3.why")"
+            exit 1
+        fi
+        if [ -f "$S/probe.$3.fails" ]; then
+            echo "probe: $sock did not answer: the key service closed the connection before answering"
+            exit 1
+        fi
+        echo "probe: $sock answered (server stub-$3)"
+        exit 0 ;;
+    --version) echo "v$(cat "$S/node.major" 2>/dev/null || echo 22).12.0" ;;
+    -e) printf '%s' "$0" ;;
+    -p) if [ -f "$S/node.major" ]; then cat "$S/node.major"; else echo 22; fi ;;
+    *)  echo "node stub: unexpected call" >&2; exit 64 ;;
+esac

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Test stand-in for `gpg --show-keys --with-colons <file>`. It records only the
+# call name and the argument count, and never reads the file. For each line of
+# $STUB_STATE/gpg.fprs it prints one key: its pub and fpr lines, a uid, and a
+# subkey with a fingerprint of its own (which a caller must not count). No
+# file: it fails, as gpg does on a file that holds no key.
+S="${STUB_STATE:?}"
+echo "gpg $#" >>"$S/calls"
+[ -f "$S/gpg.fprs" ] || { echo "gpg stub: no key" >&2; exit 2; }
+while IFS= read -r f; do
+    printf 'pub:-:4096:1:0000000000000001:1713952998:::-:::scSC::::::23::0:\n'
+    printf 'fpr:::::::::%s:\n' "$f"
+    printf 'uid:-::::1713952998::0::Test key::::::::::0:\n'
+    printf 'sub:-:4096:1:0000000000000002:1713952998::::::e::::::23:\n'
+    printf 'fpr:::::::::0000000000000000000000000000000000000002:\n'
+done <"$S/gpg.fprs"

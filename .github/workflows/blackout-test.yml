@@ -1,0 +1,54 @@
+# The blackout tool's tests (tools/blackout/test/) with ImageMagick and
+# Tesseract installed, on Linux; macOS is paused (see the matrix).
+# BLACKOUT_TEST_REQUIRE=1 turns a skipped group into a failure, so the image
+# and OCR tests always run here.
+# install-test runs the same file, but its system PATH may hold neither tool.
+name: blackout-test
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when tools/blackout/
+  # changes (or anything under .github/). Its `all-tests` check is the one
+  # that is required. Run by hand from the Actions tab with workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # A name of its own: install-test's job is also called test.
+    name: blackout-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is paused: its runner minutes cost too much on a private repo. To
+        # turn it back on, restore macos-latest here. all-tests covers every
+        # leg of the matrix, so .github/required-checks does not change.
+        os: [ubuntu-latest] # paused: macos-latest
+    # Where the Linux leg runs: GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON
+    # (see install-test.yml). A macOS leg always runs on GitHub's runner. The way back is to delete the variable.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || matrix.os }}
+    # About 1 minute on GitHub's runners (2026-11-17); 40 leaves room for a slower self-hosted runner and its package download.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # From the Ubuntu archive, as root in the job's own machine (GitHub's runner) or its own single-use container (a self-hosted
+      # runner). sudo -n fails at once, instead of waiting for a password, where sudo needs one.
+      - name: install ImageMagick and Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y -qq --no-install-recommends imagemagick tesseract-ocr tesseract-ocr-eng fonts-dejavu-core
+      - name: install ImageMagick and Tesseract (macOS)
+        if: runner.os == 'macOS'
+        run: brew install imagemagick tesseract
+      - name: doctor
+        run: python3 tools/blackout/blackout.py doctor
+      - name: blackout tests
+        env:
+          BLACKOUT_TEST_REQUIRE: "1"
+        run: python3 -I -B tools/blackout/test/test_blackout.py

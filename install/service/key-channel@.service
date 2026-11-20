@@ -1,0 +1,78 @@
+# One Buzz channel (gp-key-<name>-channel@.service) of the Ghost Protocol
+# instance @NAME@, started by its socket for each connection.
+# install/keyservice/setup makes it from install/service/key-channel@.service
+# for GHOST Protocol commit @COMMIT@.
+#
+# It runs as @KEY_USER@, the key's user: never the instance's own user, so the
+# model's processes cannot read this process's memory or environment. The key
+# arrives as a file descriptor systemd opens as root (OpenFile=); that user
+# cannot open the file itself. launch.mjs serve reads it, closes it, and sets
+# it from inside this one process, so it is in no environment and no file the
+# key's user can read (adapters/buzz/README.md, "Key service").
+#
+# The code is the root-owned copy in @CODE@, run by a root-owned node. Its
+# settings are @ETC@/buzz.env (root-owned). The channel's cursor and log are
+# in @STATE@; its stderr is this unit's journal:
+#   journalctl -u 'gp-key-@NAME@-channel@*'
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the Buzz channel, as the key's user
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=@KEY_USER@
+Group=@KEY_USER@
+ExecStart=@NODE@ --disable-sigusr1 @CODE@/adapters/buzz/src/launch.mjs serve channel
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+OpenFile=@ETC@/buzz-key:buzz-key:read-only
+@TAG_CREDENTIAL@
+EnvironmentFile=@ETC@/buzz.env
+Environment=BUZZ_STATE_DIR=@STATE@
+Environment=BUZZ_CHANNEL_LOCK=on
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_COMPILE_CACHE LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF OPENSSL_MODULES OPENSSL_ENGINES
+WorkingDirectory=@STATE@
+StateDirectory=ghost-protocol-key/@NAME@
+StateDirectoryMode=0700
+UMask=0077
+LimitCORE=0
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere but its state folder; home folders are not there at all.
+ProtectSystem=strict
+ProtectHome=yes
+# Nor the shared folders (the outbox, buzz-mcp's files and media): the channel
+# reads nothing there, and what the session puts there must never pass for its
+# allowlist, even if its settings are later changed by hand to name one there.
+InaccessiblePaths=-@SRV@
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+KeyringMode=private
+# Other processes are hidden, and /proc shows only process folders.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# The relay only: IPv4, IPv6, local sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

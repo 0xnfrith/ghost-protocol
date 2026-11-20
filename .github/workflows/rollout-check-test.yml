@@ -1,0 +1,33 @@
+# The rollout check's tests (tools/rollout-check/test/), on Linux. They run the real hooks/session-id (and hooks/load-proof, once it
+# is in the tree) in a throwaway home, so they need jq and git, which the runner has; ROLLOUT_CHECK_TEST_REQUIRE=1 turns a skip for
+# a missing tool into a failure. No secrets, no network: ssh and the sha commands are stand-ins that run on the runner.
+name: rollout-check-test
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when
+  # tools/rollout-check/ or a hook it reads changes (or anything under
+  # .github/). Its `all-tests` check is the one that is required. Run by hand
+  # from the Actions tab with workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rollout-check-test:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml).
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: rollout-check tests
+        env:
+          ROLLOUT_CHECK_TEST_REQUIRE: "1"
+        run: node --test tools/rollout-check/test/*.test.mjs

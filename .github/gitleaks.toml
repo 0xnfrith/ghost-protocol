@@ -1,0 +1,6 @@
+# The secret scan's settings (gates.yml, secret-scan): gitleaks' own default
+# rules, with nothing allowed. A change to what the scan lets through merges on
+# the required checks and agent review like any other change, since CODEOWNERS
+# lists only itself.
+[extend]
+useDefault = true

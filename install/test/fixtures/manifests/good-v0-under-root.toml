@@ -1,0 +1,15 @@
+# A valid v0 manifest whose dir is ~/work/instance: read as v1 with root ~/work.
+schema = "ghost-protocol/instance/v0"
+name = "instance"
+dir = "~/work/instance"
+
+[github]
+login = "example-bot"
+host_config = "~/.gitconfig-host"
+repos = ["example/tools"]
+
+[claude]
+email = "agent@example.com"
+
+[setup]
+command = "setup.sh --profile {profile} --no-auth"

@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# move: turn an old single-folder instance into the root layout
+# (docs/layout.md): its home moves from <folder> to <root>/<name>.
+#
+# Usage:
+#   install/layout/move --from <folder> --root <root> [--name <name>]              dry run (the default)
+#   install/layout/move --from <folder> --root <root> [--name <name>] --apply      the move
+#   install/layout/move --from <folder> --root <root> [--name <name>] --rollback   undo it
+#   install/layout/move ... --rollback --dry-run                                   what the rollback would do
+#
+# <name> defaults to the name in <folder>'s manifest (.ghost-protocol/instance.toml),
+# else the folder's own name. A dry run makes every check and prints every
+# action, and changes nothing.
+#
+# Checks, before anything changes (it never stops anything itself):
+#   - no Claude Code process of this user runs (the native build or the npm
+#     package): Claude Code writes ~/.claude.json when it exits, which would
+#     undo the trust edit;
+#   - the instance's service, <name>.service, is not active (where systemd is);
+#   - jq is installed; <folder> is a git checkout, not a link; <root>/<name>
+#     does not exist yet; both are on one device, so each move is a rename.
+# Edited files that are links stay links: the file each one names is edited.
+#
+# What --apply does, each step skipped when it is already done, so a second run
+# finishes a half-done move:
+#   1. makes <root> and its folders: repos, worktrees, media, desk, scratch;
+#   2. moves <folder> to <root>/<name>, and leaves <folder> as a link to it, so
+#      old paths keep working;
+#   3. moves Claude Code's project folder for the old path (its transcripts and
+#      memory: ~/.claude/projects/<the path with every other character a dash>)
+#      to the new path's name, with a link back from the old name;
+#   4. edits Claude Code's own files with jq, each kept first as
+#      <file>.bak-move-<time>:
+#        ~/.claude.json                             the old path's project entry,
+#                                                   trust included, copied to the new path
+#        ~/.claude/plugins/installed_plugins.json   projectPath of plugins
+#                                                   installed for the old path
+#        ~/.claude/plugins/known_marketplaces.json  marketplaces read from it
+#        ~/.claude/settings.json                    extraKnownMarketplaces read from it
+#   5. repairs the repo's linked worktrees (git worktree repair);
+#   6. wires the worktree hook (install/layout/worktree-hook wire).
+# Each step is written to ~/.local/state/ghost-protocol/move-<name>.state as it
+# runs. --rollback undoes them from that file: an edited file nothing else
+# changed since is copied back from its .bak-move copy, one that changed gets
+# the reverse jq edit; then the folders move back and empty new folders go.
+#
+# Left as they are: other links in the home folder that point into <folder>
+# (they keep working through the <folder> link), and the project folders of
+# sessions that ran in worktrees.
+#
+# Exit codes: 0 ok (for a dry run: every check passed), 1 a check or a step
+# failed, 2 usage.
+set -uo pipefail
+
+SELF_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+GP_DIR="$(CDPATH='' cd -- "$SELF_DIR/../.." && pwd -P)"
+HOOK="$SELF_DIR/worktree-hook"
+# shellcheck source=../lib/common.sh
+. "$GP_DIR/install/lib/common.sh"
+# shellcheck source=../lib/instance.sh
+. "$GP_DIR/install/lib/instance.sh"
+# shellcheck source=../lib/layout.sh
+. "$GP_DIR/install/lib/layout.sh"
+export GIT_OPTIONAL_LOCKS=0
+
+usage_error() { echo "move: $*" >&2; echo "Try: install/layout/move --help" >&2; exit 2; }
+
+FROM_IN="" ROOT_IN="" NAME="" MODE=apply DRY=1 WANT_DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from)     [ $# -ge 2 ] || usage_error "--from needs a value"; FROM_IN="$2"; shift 2 ;;
+        --root)     [ $# -ge 2 ] || usage_error "--root needs a value"; ROOT_IN="$2"; shift 2 ;;
+        --name)     [ $# -ge 2 ] || usage_error "--name needs a value"; NAME="$2"; shift 2 ;;
+        --apply)    MODE=apply; DRY=0; shift ;;
+        --rollback) MODE=rollback; DRY=0; shift ;;
+        --dry-run)  WANT_DRY=1; shift ;;
+        -h|--help)  sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)          usage_error "unknown option: $1" ;;
+    esac
+done
+[ "$WANT_DRY" = "1" ] && DRY=1
+[ -n "$FROM_IN" ] || usage_error "--from <folder> is required"
+[ -n "$ROOT_IN" ] || usage_error "--root <root> is required"
+t="$(root_problem_text "$ROOT_IN")"
+[ -z "$t" ] || usage_error "--root $t"
+
+FROM="$(expand_home "$FROM_IN")"
+case "$FROM" in /*) ;; *) usage_error "--from must be an absolute path or start with ~/" ;; esac
+FROM="${FROM%/}"
+case "$FROM" in *"|"*|*"
+"*) usage_error "--from must not hold | or a line break" ;; esac
+# The old path as Claude Code saw it: its parent's real path, its own last
+# segment (which is a link once moved).
+FROM="$(phys "$(dirname "$FROM")")/$(basename "$FROM")"
+ROOT="$(phys "$(expand_home "$ROOT_IN")")"
+
+if [ -z "$NAME" ]; then
+    if [ -f "$FROM/$MANIFEST_REL" ] && manifest_load "$FROM/$MANIFEST_REL"; then NAME="$M_NAME"
+    else NAME="$(basename "$FROM")"; fi
+fi
+re_name='^[a-z0-9][a-z0-9-]*$'
+[[ $NAME =~ $re_name ]] || usage_error "the name '$NAME' must be lower-case letters, digits and dashes (pass --name)"
+case " $LAYOUT_DIRS " in *" $NAME "*) usage_error "the name must not be one of the layout's folders ($LAYOUT_DIRS)" ;; esac
+NEW="$ROOT/$NAME"
+case "$ROOT/" in "$FROM"/*) usage_error "the root $ROOT is inside $FROM" ;; esac
+[ "$NEW" != "$FROM" ] || usage_error "$FROM is already <root>/<name>"
+
+key() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }   # Claude Code's project folder name
+PROJECTS="$HOME/.claude/projects"
+P_OLD="$PROJECTS/$(key "$FROM")"
+P_NEW="$PROJECTS/$(key "$NEW")"
+CJ="$HOME/.claude.json"
+IP="$HOME/.claude/plugins/installed_plugins.json"
+KM="$HOME/.claude/plugins/known_marketplaces.json"
+ST="$HOME/.claude/settings.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol"
+STATE="$STATE_DIR/move-$NAME.state"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+FAILS=0
+ok()    { printf '  ok    %s\n' "$*"; }
+note()  { printf '  note  %s\n' "$*"; }
+bad()   { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+would() { if [ "$DRY" = "1" ]; then printf '  would %s\n' "$*"; else printf '  doing %s\n' "$*"; fi; }
+rec()   { [ "$DRY" = "1" ] && return 0; mkdir -p "$STATE_DIR" || return 1; local IFS='|'; printf '%s\n' "$*" >>"$STATE"; }
+in_state() { [ -f "$STATE" ] && grep -q "^$1|" "$STATE"; }
+
+# old: not moved; moved: <root>/<name> is the repo and <folder> links to it.
+where_now() {
+    if [ -d "$FROM" ] && [ ! -L "$FROM" ] && [ ! -e "$NEW" ] && [ ! -L "$NEW" ]; then echo old
+    elif [ -d "$NEW" ] && [ ! -L "$NEW" ] && [ -L "$FROM" ] && [ "$(phys "$FROM")" = "$NEW" ]; then echo moved
+    elif [ -d "$NEW" ] && [ ! -L "$NEW" ] && [ ! -e "$FROM" ] && [ ! -L "$FROM" ]; then echo moved-unlinked
+    else echo odd; fi
+}
+
+# The device a path is on (of the nearest folder that exists): one device
+# means mv is a rename.
+fs_of() {
+    local p="$1"
+    while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+    if stat -c %d "$p" >/dev/null 2>&1; then stat -c %d "$p"; else stat -f %d "$p"; fi
+}
+
+# 0 when a Claude Code process of this user runs: the native build (named
+# claude, or run through a claude link), or the npm package under node. The
+# pattern is anchored on the command word, and this script and its caller are
+# never counted, so a path ending in /claude among the arguments is no match.
+claude_running() {
+    local pids p
+    pids="$( { pgrep -u "$(id -u)" -x claude
+               pgrep -u "$(id -u)" -f '^([^ ]*/)?claude( |$)|^[^ ]*/claude/versions/|@anthropic-ai/claude-code/cli'
+             } 2>/dev/null )"
+    for p in $pids; do
+        if [ "$p" != "$$" ] && [ "$p" != "$PPID" ]; then return 0; fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- jq edits
+
+# The jq filters name jq's own $variables inside single quotes, on purpose.
+# shellcheck disable=SC2016
+JQ_DEFS='def mvpath($o; $n): if type == "string" and (. == $o or startswith($o + "/")) then $n + .[($o | length):] else . end;'
+# shellcheck disable=SC2016
+F_CJ='if (.projects | type) == "object" and (.projects[$old] != null) and (.projects[$new] == null)
+      then .projects[$new] = .projects[$old] else . end'
+# shellcheck disable=SC2016
+F_CJ_UNDO='if (.projects | type) == "object" then del(.projects[$new]) else . end'
+# shellcheck disable=SC2016
+F_IP="$JQ_DEFS"'
+      if (.plugins | type) == "object"
+      then .plugins |= map_values(if type == "array"
+          then map(if type == "object" and has("projectPath") then .projectPath |= mvpath($old; $new) else . end)
+          else . end)
+      else . end'
+# shellcheck disable=SC2016
+F_KM="$JQ_DEFS"'
+      if type == "object"
+      then map_values(if type == "object"
+          then (if (.source | type) == "object" and (.source | has("path")) then .source.path |= mvpath($old; $new) else . end)
+             | (if has("installLocation") then .installLocation |= mvpath($old; $new) else . end)
+          else . end)
+      else . end'
+# shellcheck disable=SC2016
+F_ST="$JQ_DEFS"'
+      if (.extraKnownMarketplaces | type) == "object"
+      then .extraKnownMarketplaces |= map_values(
+          if type == "object" and (.source | type) == "object" and (.source | has("path"))
+          then .source.path |= mvpath($old; $new) else . end)
+      else . end'
+
+# edit_json label file filter [jq args]: rewrite the file with the filter. A
+# link is followed: the link stays and the file it names changes. The new text
+# goes through a temp copy of that file (so its mode is kept), and a .bak-move
+# copy is kept first; nothing happens when the result is the same.
+edit_json() {
+    local label="$1" f="$2" filter="$3" orig="$2" out tmp bak
+    shift 3
+    if [ ! -f "$f" ]; then ok "$label: no $f, nothing to change"; return 0; fi
+    f="$(real_file "$f")" || { bad "$label: could not follow the links of $orig"; return 1; }
+    out="$(jq "$@" "$filter" "$f")" || { bad "$label: jq could not edit $f"; return 1; }
+    if printf '%s\n' "$out" | jq -e --slurpfile a "$f" '. == $a[0]' >/dev/null 2>&1; then
+        ok "$label: nothing to change in $f"; return 0
+    fi
+    if [ "$DRY" = "1" ]; then would "$label: edit $f"; return 0; fi
+    # The backup sits beside the path as named (a link's own folder, not a
+    # dotfiles repo it points into), and the record names that path too:
+    # the rollback reads and writes through the link.
+    bak="$orig.bak-move-$STAMP"
+    tmp="$(mktemp "$(dirname "$f")/.move.XXXXXX")" || { bad "$label: no temp file beside $f"; return 1; }
+    if ! { cp -p "$f" "$tmp" && printf '%s\n' "$out" >"$tmp" && cp -p "$f" "$bak"; }; then
+        rm -f "$tmp"; bad "$label: could not prepare the edit of $f"; return 1
+    fi
+    rec editing "$orig" "$bak" "$label"
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; bad "$label: could not replace $f"; return 1; }
+    rec edited "$orig" "$bak" "$(sha256_of "$f")" "$label"
+    ok "$label: edited $f (the old copy is $bak)"
+}
+
+# The reverse of one edit: the .bak copy when nothing changed the file since,
+# else the reverse jq edit.
+undo_edit() {   # file bak sha-after(- = unknown) label
+    local f="$1" bak="$2" sha="$3" label="$4"
+    if [ "$sha" != "-" ] && [ -f "$bak" ] && [ "$(sha256_of "$f")" = "$sha" ]; then
+        if [ "$DRY" = "1" ]; then would "$label: copy $bak back over $f"; return 0; fi
+        cp -p "$bak" "$f" && ok "$label: put back from $bak"
+        return
+    fi
+    case "$label" in
+        claude.json)
+            if in_state cj-added; then edit_json "$label" "$f" "$F_CJ_UNDO" --arg new "$NEW"
+            else ok "$label: nothing to undo (the old entry was kept)"; fi ;;
+        installed_plugins) edit_json "$label" "$f" "$F_IP" --arg old "$NEW" --arg new "$FROM" ;;
+        known_marketplaces) edit_json "$label" "$f" "$F_KM" --arg old "$NEW" --arg new "$FROM" ;;
+        settings) edit_json "$label" "$f" "$F_ST" --arg old "$NEW" --arg new "$FROM" ;;
+        *) bad "no reverse edit for $label" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- worktrees
+
+# Point the repo's linked worktrees at its new place: a worktree that was
+# inside <from> is now inside <to>, and a .git file naming <from>/.git/ is
+# rewritten (it still worked through the link, so git would leave it).
+# A dry run reads each worktree where it is now.
+fix_worktrees() {   # repo from to
+    local repo="$1" from="$2" to="$3" orig p src c paths="" n=0
+    while IFS= read -r orig; do
+        [ -n "$orig" ] || continue
+        p="$orig"
+        case "$p" in "$from"/*) p="$to/${p#"$from"/}" ;; esac
+        src="$p"
+        if [ "$DRY" = "1" ] && [ ! -d "$p" ]; then src="$orig"; fi
+        [ -d "$src" ] || continue
+        if [ -f "$src/.git" ]; then
+            c="$(cat "$src/.git")"
+            case "$c" in
+                "gitdir: $from/.git/"*)
+                    if [ "$DRY" = "1" ]; then would "rewrite $p/.git to name $to/.git"
+                    else printf 'gitdir: %s\n' "$to/.git/${c#"gitdir: $from/.git/"}" >"$p/.git"; fi ;;
+            esac
+        fi
+        paths="$paths$p
+"
+        n=$((n + 1))
+    done <<EOF
+$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | sed 1d)
+EOF
+    if [ "$n" -eq 0 ]; then ok "worktrees: none to repair"; return 0; fi
+    if [ "$DRY" = "1" ]; then would "git worktree repair for $n worktree(s)"; return 0; fi
+    # shellcheck disable=SC2046  # one path per line, none with a line break
+    if (set -f; IFS='
+'; git -C "$repo" worktree repair $(printf '%s' "$paths")) >/dev/null 2>&1; then
+        ok "worktrees: repaired $n"
+    else
+        note "git worktree repair reported a problem; the link at $FROM keeps them working; run: git -C $repo worktree repair"
+    fi
+}
+
+# ---------------------------------------------------------------- checks
+
+checks() {
+    local w
+    printf '\n== checks\n'
+    if command -v jq >/dev/null 2>&1; then ok "jq is installed"; else bad "jq is needed, to edit Claude Code's JSON files"; fi
+    if command -v pgrep >/dev/null 2>&1; then
+        if claude_running; then
+            bad "Claude Code is running; quit every Claude Code session first (it writes ~/.claude.json on exit)"
+        else ok "no Claude Code process runs"; fi
+    else
+        note "no pgrep here: make sure no Claude Code session runs"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$NAME.service" 2>/dev/null; then
+        bad "$NAME.service is active; stop it first (sudo systemctl stop $NAME)"
+    fi
+    w="$(where_now)"
+    if [ "$MODE" = "rollback" ]; then
+        if [ -f "$STATE" ]; then ok "state file $STATE"
+        else bad "no state file $STATE: nothing to roll back"; fi
+        return
+    fi
+    case "$w" in
+        old)
+            if [ -d "$FROM/.git" ]; then ok "$FROM is a git checkout"
+            else bad "$FROM is not a main git checkout (no .git folder)"; fi
+            if [ "$(fs_of "$FROM")" = "$(fs_of "$ROOT")" ]; then ok "$FROM and $ROOT are on one filesystem"
+            else bad "$FROM and $ROOT are on different filesystems; this script only renames"; fi
+            if [ -d "$P_OLD" ] && [ ! -L "$P_OLD" ] && { [ -e "$P_NEW" ] || [ -L "$P_NEW" ]; }; then
+                bad "both $P_OLD and $P_NEW exist; merge them by hand first"
+            fi ;;
+        moved|moved-unlinked) note "the repo is already at $NEW; any step left is finished" ;;
+        *) bad "$FROM and $NEW are in neither the old nor the moved layout; look at both by hand" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- apply
+
+do_apply() {
+    local d existed out rc had_new
+    printf '\n== 1/6 the root and its folders\n'
+    layout_make_dirs "$ROOT" "$DRY" || { bad "a folder's place under $ROOT holds something else"; return 1; }
+    while IFS= read -r d; do [ -n "$d" ] && rec made-dir "$d"; done <<EOF
+$LAYOUT_MADE
+EOF
+    [ -n "$LAYOUT_MADE" ] || ok "every folder is there"
+
+    printf '\n== 2/6 the repo\n'
+    case "$(where_now)" in
+        old)
+            would "mv $FROM $NEW, then link $FROM -> $NEW"
+            if [ "$DRY" != "1" ]; then
+                rec moving-repo "$FROM" "$NEW"
+                mv "$FROM" "$NEW" || { bad "mv $FROM $NEW"; return 1; }
+                rec moved-repo "$FROM" "$NEW"
+                ln -s "$NEW" "$FROM" || { bad "ln -s $NEW $FROM"; return 1; }
+                rec linked-repo "$FROM"
+            fi ;;
+        moved-unlinked)
+            would "link $FROM -> $NEW"
+            if [ "$DRY" != "1" ]; then ln -s "$NEW" "$FROM" || { bad "ln -s $NEW $FROM"; return 1; }; rec linked-repo "$FROM"; fi ;;
+        moved) ok "the repo is at $NEW; $FROM links to it" ;;
+        *) bad "unexpected layout"; return 1 ;;
+    esac
+
+    printf '\n== 3/6 Claude Code project folder (transcripts, memory)\n'
+    # The names start with a dash: "--" keeps ln from reading one as an option.
+    if [ -d "$P_OLD" ] && [ ! -L "$P_OLD" ] && { [ -e "$P_NEW" ] || [ -L "$P_NEW" ]; }; then
+        bad "both $P_OLD and $P_NEW exist; merge them by hand first"
+        return 1
+    elif [ -d "$P_OLD" ] && [ ! -L "$P_OLD" ]; then
+        would "mv $P_OLD $P_NEW, then link ${P_OLD##*/} -> ${P_NEW##*/}"
+        if [ "$DRY" != "1" ]; then
+            rec moving-project "$P_OLD" "$P_NEW"
+            mv -- "$P_OLD" "$P_NEW" || { bad "mv $P_OLD $P_NEW"; return 1; }
+            rec moved-project "$P_OLD" "$P_NEW"
+            ln -s -- "${P_NEW##*/}" "$P_OLD" || { bad "link $P_OLD"; return 1; }
+            rec linked-project "$P_OLD"
+        fi
+    elif [ -L "$P_OLD" ]; then
+        ok "already moved: ${P_OLD##*/} links to ${P_NEW##*/}"
+    elif [ -d "$P_NEW" ] && in_state moved-project; then
+        would "link ${P_OLD##*/} -> ${P_NEW##*/}"
+        if [ "$DRY" != "1" ]; then
+            ln -s -- "${P_NEW##*/}" "$P_OLD" || { bad "link $P_OLD"; return 1; }
+            rec linked-project "$P_OLD"
+        fi
+    else
+        note "no project folder for $FROM (${P_OLD##*/}); nothing to carry"
+    fi
+
+    printf '\n== 4/6 Claude Code files\n'
+    had_new=1
+    if [ -f "$CJ" ] && ! jq -e --arg new "$NEW" '.projects[$new] != null' "$CJ" >/dev/null 2>&1; then had_new=0; fi
+    edit_json claude.json "$CJ" "$F_CJ" --arg old "$FROM" --arg new "$NEW" || return 1
+    if [ "$DRY" != "1" ] && [ "$had_new" = "0" ] \
+        && jq -e --arg new "$NEW" '.projects[$new] != null' "$CJ" >/dev/null 2>&1; then
+        rec cj-added "$NEW"
+    fi
+    edit_json installed_plugins "$IP" "$F_IP" --arg old "$FROM" --arg new "$NEW" || return 1
+    edit_json known_marketplaces "$KM" "$F_KM" --arg old "$FROM" --arg new "$NEW" || return 1
+    edit_json settings "$ST" "$F_ST" --arg old "$FROM" --arg new "$NEW" || return 1
+
+    printf '\n== 5/6 worktrees\n'
+    if [ "$DRY" = "1" ] && [ "$(where_now)" = "old" ]; then
+        fix_worktrees "$FROM" "$FROM" "$NEW"
+    else
+        fix_worktrees "$NEW" "$FROM" "$NEW"
+    fi
+
+    printf '\n== 6/6 the worktree hook\n'
+    existed=0; [ -e "$ST" ] && existed=1
+    if [ "$DRY" = "1" ]; then out="$("$HOOK" wire --root "$ROOT" --dry-run 2>&1)"
+    else out="$("$HOOK" wire --root "$ROOT" 2>&1)"; fi
+    rc=$?
+    printf '%s\n' "$out" | sed 's/^/  /'
+    case "$rc:$out" in
+        "0:wired"*) rec wired "$existed" ;;
+        "0:"*) ;;
+        *) note "the worktree hook is not wired; new worktrees go to Claude Code's default place" ;;
+    esac
+    rec complete
+}
+
+# ---------------------------------------------------------------- rollback
+
+do_rollback() {
+    local kind a b c d records
+    records="$(awk '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }' "$STATE")"
+
+    printf '\n== rollback: the worktree hook\n'
+    if in_state wired; then
+        if [ "$DRY" = "1" ]; then would "unwire the worktree hook from $ST"
+        else
+            "$HOOK" unwire 2>&1 | sed 's/^/  /'
+            if grep -q '^wired|0$' "$STATE" && [ -f "$ST" ] && jq -e '. == {}' "$ST" >/dev/null 2>&1; then
+                rm -f "$ST" && ok "removed $ST (it did not exist before the move)"
+            fi
+        fi
+    else ok "not wired by the move"; fi
+
+    printf '\n== rollback: Claude Code files\n'
+    local undone="|"
+    while IFS='|' read -r kind a b c d; do
+        case "$kind" in
+            edited)
+                case "$undone" in *"|$a|"*) continue ;; esac
+                undo_edit "$a" "$b" "$c" "$d"; undone="$undone$a|" ;;
+            editing)   # the intent with no "edited" after it: the run stopped mid-edit
+                case "$undone" in *"|$a|"*) continue ;; esac
+                undo_edit "$a" "$b" - "$c"; undone="$undone$a|" ;;
+        esac
+    done <<EOF
+$records
+EOF
+
+    printf '\n== rollback: the project folder\n'
+    if [ -L "$P_OLD" ] && [ -d "$P_NEW" ] && [ ! -L "$P_NEW" ] && in_state moved-project; then
+        would "mv $P_NEW $P_OLD (the link goes)"
+        if [ "$DRY" != "1" ] && ! { rm -f -- "$P_OLD" && mv -- "$P_NEW" "$P_OLD"; }; then bad "moving $P_NEW back"; fi
+    else ok "nothing to move back"; fi
+
+    printf '\n== rollback: the repo\n'
+    if [ "$(where_now)" = "moved" ] && in_state moved-repo; then
+        would "mv $NEW $FROM (the link goes)"
+        if [ "$DRY" != "1" ]; then
+            if rm -f "$FROM" && mv "$NEW" "$FROM"; then
+                fix_worktrees "$FROM" "$NEW" "$FROM"
+            else bad "moving $NEW back"; fi
+        fi
+    else ok "nothing to move back"; fi
+
+    printf '\n== rollback: new empty folders\n'
+    while IFS='|' read -r kind a b c d; do
+        [ "$kind" = "made-dir" ] || continue
+        if [ "$DRY" = "1" ]; then would "remove $a if it is empty"
+        elif rmdir "$a" 2>/dev/null; then ok "removed $a"
+        else note "kept $a (not empty)"; fi
+    done <<EOF
+$records
+EOF
+
+    if [ "$DRY" != "1" ] && [ "$FAILS" -eq 0 ]; then
+        mv "$STATE" "$STATE.rolled-back-$STAMP" && ok "the state file is now $STATE.rolled-back-$STAMP"
+    fi
+}
+
+# ---------------------------------------------------------------- main
+
+printf 'move: %s -> %s (instance %s)%s\n' "$FROM" "$NEW" "$NAME" \
+    "$([ "$DRY" = "1" ] && echo ', DRY RUN: nothing is changed')"
+[ "$MODE" = "rollback" ] && echo "mode: rollback"
+checks
+if [ "$FAILS" -gt 0 ]; then
+    printf '\n%s check(s) failed; nothing was changed.\n' "$FAILS"
+    exit 1
+fi
+if [ "$MODE" = "apply" ]; then
+    if [ "$DRY" != "1" ] && [ "$(where_now)" = "old" ]; then rec run apply "$STAMP"; fi
+    do_apply || FAILS=$((FAILS + 1))
+else
+    rec run rollback "$STAMP"
+    do_rollback
+fi
+echo
+if [ "$FAILS" -gt 0 ]; then
+    echo "move: $FAILS step(s) failed. The state file is $STATE; --rollback undoes what was done."
+    exit 1
+fi
+if [ "$DRY" = "1" ]; then
+    echo "Dry run: every check passed. Run it again with --apply (or --rollback) to do it."
+elif [ "$MODE" = "apply" ]; then
+    echo "Moved: the instance's home is $NEW ($FROM links to it)."
+    echo "Next:"
+    echo "  1. In the instance's manifest, write schema = \"$SCHEMA_V1\" and root = \"$ROOT_IN\", and drop dir."
+    echo "  2. Start the instance from $NEW. Its service unit: install/service/start --root $ROOT_IN --name $NAME --print-unit"
+    echo "  Undo: install/layout/move --from $FROM_IN --root $ROOT_IN --name $NAME --rollback"
+else
+    echo "Rolled back: the instance's home is $FROM again."
+fi
+exit 0

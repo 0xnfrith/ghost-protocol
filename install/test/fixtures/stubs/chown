@@ -1,0 +1,9 @@
+#!/bin/sh
+# Test stand-in for chown: the tests never run as root, so it changes nothing.
+# It records "chown <owner> <path>" for each path ("chown -R <owner> <path>"
+# with -R), so a test can see who each folder was given to.
+S="${STUB_STATE:?}"
+r=""
+[ "${1:-}" = -R ] && { r="-R "; shift; }
+owner="$1"; shift
+for p in "$@"; do echo "chown $r$owner $p" >>"$S/calls"; done

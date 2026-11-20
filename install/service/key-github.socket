@@ -1,0 +1,28 @@
+# The GitHub review socket (gp-key-<name>-github.socket) of the Ghost Protocol
+# instance @NAME@: its GitHub App's one fixed review action, served by its key
+# service. install/keyservice/setup makes it from
+# install/service/key-github.socket and installs it in /etc/systemd/system,
+# only for an instance with a GitHub App key (--github-app-key-from-stdin).
+#
+# Each connection starts one gp-key-@NAME@-github@.service as its own user,
+# with the connection as its stdin and stdout: one request, one answer. The
+# session's side is tools/github-review/gp-github-review: it holds no key.
+#
+# Only root and the group @AGENT_GROUP@ (the instance's own user's group, which
+# holds no other user) can connect. Up to 4 at once.
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the key service's GitHub review socket
+
+[Socket]
+ListenStream=@RUN@/github.sock
+Accept=yes
+MaxConnections=4
+SocketUser=root
+SocketGroup=@AGENT_GROUP@
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

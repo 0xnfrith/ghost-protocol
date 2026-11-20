@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# agree: one check that everything that names a release's version names the same one. It fails a release where one differs.
+#
+#   agree --tag <tag> [--tree <dir>] [--image-version <v>] [--image-digest <sha256:...>] [--image <reference>]
+#         [--get-sh <file>] [--get-ps1 <file>]
+#
+# The places, each compared with the tag (v<version>):
+#   plugin.json   <tree>/.claude-plugin/plugin.json, the "version" (<tree> is a checkout of the tag, default .);
+#   the label     the image's org.opencontainers.image.version, and its GP_IMAGE_VERSION: the version without the v. Given as
+#                 --image-version, or read from --image (a reference to an image that is on this machine) with docker;
+#   the pin       the installers, get.sh and get.ps1 as the release fills them in: the image they pull must be
+#                 <repository>:<version>@<digest>, with that version, and with the digest of --image-digest when that is given
+#                 (the digest of the pushed image); a file that still holds its @...@ placeholder is not filled in.
+# What is not given is not checked, and is said so; give at least --tag. The tag is v<x.y.z> or v<x.y.z>-<pre-release>.
+# Exit 0: all that was given agrees. Exit 1: one differs (each is named). Exit 2: usage, or something could not be read.
+# Needs jq; docker only for --image.
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//' >&2; }
+die() { echo "agree: $*" >&2; exit 2; }
+
+tag="" tree=. image_version="" image_digest="" image="" get_sh="" get_ps1=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --tag | --tree | --image-version | --image-digest | --image | --get-sh | --get-ps1)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      case $1 in
+        --tag) tag=$2 ;; --tree) tree=$2 ;; --image-version) image_version=$2 ;; --image-digest) image_digest=$2 ;;
+        --image) image=$2 ;; --get-sh) get_sh=$2 ;; --get-ps1) get_ps1=$2 ;;
+      esac
+      shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+[ -n "$tag" ] || { usage; die "--tag is required"; }
+command -v jq >/dev/null 2>&1 || die "jq is not installed"
+semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'
+[[ $tag =~ ^v($semver)$ ]] || die "the tag '$tag' is not v<x.y.z> or v<x.y.z>-<pre-release>"
+version=${tag#v}
+[[ -z $image_digest || $image_digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "--image-digest is not sha256:<64 hex>"
+
+bad=0
+ok() { echo "  ok       $1"; }
+differ() { echo "  DIFFERS  $1"; bad=$((bad + 1)); }
+skip() { echo "  skipped  $1 (not given)"; }
+cmp_to_version() { # label got: the version at that place against the tag's
+  if [ "$2" = "$version" ]; then ok "$1 is $version"; else differ "$1 is '$2', the tag says $version"; fi
+}
+
+echo "agree: $tag"
+# plugin.json
+pj=$tree/.claude-plugin/plugin.json
+[ -f "$pj" ] || die "no $pj"
+pv=$(jq -er '.version | strings' "$pj" 2>/dev/null) || die "$pj has no version"
+cmp_to_version "plugin.json version" "$pv"
+
+# the image's label (and its environment)
+if [ -n "$image" ]; then
+  command -v docker >/dev/null 2>&1 || die "docker is not installed (needed for --image)"
+  info=$(docker image inspect --format '{{json .Config}}' "$image" 2>/dev/null) || die "cannot inspect the image $image (is it on this machine?)"
+  image_version=$(jq -r '.Labels["org.opencontainers.image.version"] // ""' <<<"$info")
+  env_version=$(jq -r '[(.Env // [])[] | select(startswith("GP_IMAGE_VERSION="))] | (.[0] // "GP_IMAGE_VERSION=") | sub("^GP_IMAGE_VERSION="; "")' <<<"$info")
+  cmp_to_version "image environment GP_IMAGE_VERSION" "$env_version"
+fi
+if [ -n "$image_version" ]; then cmp_to_version "image label org.opencontainers.image.version" "$image_version"; else skip "the image label"; fi
+
+# the installers' pin
+check_installer() { # label file
+  local label=$1 f=$2 line ref rv
+  [ -f "$f" ] || die "no $f"
+  line=$(grep -E '^(IMAGE=|\$Image = )' "$f" | head -n 1) || true
+  [ -n "$line" ] || { differ "$label: no image line"; return; }
+  if grep -q '@GP_IMAGE@' <<<"$line"; then differ "$label: the image is not filled in (it still holds its placeholder)"; return; fi
+  ref=$(grep -oE "[A-Za-z0-9._/:-]+:$semver@sha256:[0-9a-f]{64}" <<<"$line" | head -n 1) || true
+  if [ -z "$ref" ]; then differ "$label: no <image>:<version>@<digest> in its image line"; return; fi
+  # the version is what follows the last colon before the @ (a registry port puts a colon earlier)
+  rv=${ref%@*}
+  rv=${rv##*:}
+  cmp_to_version "$label pins the image version" "$rv"
+  if [ -n "$image_digest" ]; then
+    if [ "${ref#*@}" = "$image_digest" ]; then ok "$label pins the pushed image's digest"; else differ "$label pins a digest that is not the pushed image's"; fi
+  fi
+}
+if [ -n "$get_sh" ]; then check_installer "get.sh" "$get_sh"; else skip "get.sh"; fi
+if [ -n "$get_ps1" ]; then check_installer "get.ps1" "$get_ps1"; else skip "get.ps1"; fi
+
+if [ "$bad" -ne 0 ]; then echo "agree: $bad place(s) differ: this is not a release"; exit 1; fi
+echo "agree: all that was given agree"

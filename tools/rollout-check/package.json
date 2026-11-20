@@ -1,0 +1,13 @@
+{
+  "name": "rollout-check",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Compares each agent's class file and team AGENTS.md with main, reads its load proof, and names who is behind. Report only.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

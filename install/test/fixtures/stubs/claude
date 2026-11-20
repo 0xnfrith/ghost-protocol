@@ -1,0 +1,138 @@
+#!/bin/sh
+# Test stand-in for claude. It records only the call name and the argument
+# count. Its behaviour comes from files in $STUB_STATE: claude.version (the
+# --version line), claude.authed (signed in), claude.email (the account).
+# The plugin commands answer with the shape of Claude Code's own --json:
+#   claude.plugins        one "<id> enabled|disabled [scope]" per line (scope
+#                         user when left out); the same id may repeat
+#   claude.marketplaces   one "<name> [<path>]" per line: with a path, a
+#                         directory marketplace at that path, else a GitHub one
+# and change when these files exist:
+#   claude.json-compact        the JSON on one line
+#   claude.json-reordered      enabled and scope before id, then a nested
+#                              object holding an id, scope and enabled of its
+#                              own (which must not be read as the entry's)
+#   claude.list-garbage, claude.mlist-garbage
+#                              plugin list / marketplace list print an error
+#                              line, not JSON, and exit 1
+#   claude.list-json-fails, claude.mlist-json-fails
+#                              they print the JSON, then exit 1
+#   claude.cwd-disables        called from anywhere but /, user-scope plugins
+#                              read as disabled (a project's settings)
+#   claude.marketplace-add-fails, claude.marketplace-update-fails,
+#   claude.plugin-update-fails
+#   claude.plugin-install-fails  empty: every install fails; else only the
+#                              plugin ids it lists, one per line
+#   claude.plugin-install-noop the install says yes but lists nothing
+# An install records the scope it was given with --scope, or "unset", so a
+# test can tell the scope was passed. A marketplace can be added from
+# anthropics/claude-plugins-official, or from a folder that holds
+# .claude-plugin/marketplace.json (as "ghost-protocol <folder>"; like Claude
+# Code, adding it again from another folder repoints it). Anything else fails.
+S="${STUB_STATE:?}"
+name="claude"
+case "${1:-}" in
+    --version) name="claude --version" ;;
+    auth) name="claude auth ${2:-}" ;;
+    plugin)
+        name="claude plugin ${2:-}"
+        [ "${2:-}" = "marketplace" ] && name="$name ${3:-}" ;;
+esac
+echo "$name $#" >>"$S/calls"
+
+shape() { if [ -f "$S/claude.json-compact" ]; then tr -d '\n '; echo; else cat; fi; }
+
+# shellcheck disable=SC2016  # ${CLAUDE_PLUGIN_ROOT} is text in the JSON, as in Claude Code's own
+plugin_entries() {
+    n=0
+    [ -f "$S/claude.plugins" ] || return 0
+    while read -r id st sc; do
+        [ -n "$id" ] || continue
+        sc="${sc:-user}"
+        en=false; [ "$st" = "enabled" ] && en=true
+        if [ -f "$S/claude.cwd-disables" ] && [ "$sc" = "user" ] && [ "$(pwd)" != "/" ]; then en=false; fi
+        [ "$n" -gt 0 ] && printf ','
+        n=$((n + 1))
+        if [ -f "$S/claude.json-reordered" ]; then
+            printf '\n  {\n    "enabled": %s,\n    "scope": "%s",\n    "id": "%s",\n    "mcpServers": {"x": {"id": "%s", "scope": "user", "enabled": true, "args": ["${CLAUDE_PLUGIN_ROOT}/a,{b}"]}}\n  }' "$en" "$sc" "$id" "$id"
+        else
+            printf '\n  {\n    "id": "%s",\n    "version": "1.0.0",\n    "scope": "%s",\n    "enabled": %s,\n    "mcpServers": {"x": {"args": ["${CLAUDE_PLUGIN_ROOT}/a"]}},\n    "projectEnabled": false\n  }' "$id" "$sc" "$en"
+        fi
+    done <"$S/claude.plugins"
+}
+
+marketplace_entries() {
+    n=0
+    [ -f "$S/claude.marketplaces" ] || return 0
+    while read -r m p; do
+        [ -n "$m" ] || continue
+        [ "$n" -gt 0 ] && printf ','
+        n=$((n + 1))
+        if [ -n "$p" ]; then
+            printf '\n  {\n    "name": "%s",\n    "source": "directory",\n    "path": "%s",\n    "installLocation": "%s"\n  }' "$m" "$p" "$p"
+        else
+            printf '\n  {\n    "name": "%s",\n    "source": "github"\n  }' "$m"
+        fi
+    done <"$S/claude.marketplaces"
+}
+
+case "${1:-} ${2:-}" in
+    "--version "*)
+        cat "$S/claude.version" ;;
+    "auth status")
+        if [ -f "$S/claude.authed" ]; then
+            printf '{\n  "loggedIn": true,\n  "authMethod": "claude.ai",\n  "email": "%s",\n  "orgName": "Example"\n}\n' "$(cat "$S/claude.email")"
+        else
+            printf '{\n  "loggedIn": false,\n  "authMethod": "none"\n}\n'
+            exit 1
+        fi ;;
+    "auth login")
+        touch "$S/claude.authed" ;;
+    "auth logout")
+        rm -f "$S/claude.authed" ;;
+    "plugin list")
+        [ -f "$S/claude.list-garbage" ] && { echo "Error: the plugin list could not be read"; exit 1; }
+        { printf '['; plugin_entries; printf '\n]\n'; } | shape
+        [ -f "$S/claude.list-json-fails" ] && exit 1 ;;
+    "plugin marketplace")
+        case "${3:-}" in
+            list)
+                [ -f "$S/claude.mlist-garbage" ] && { echo "Error: the marketplaces could not be read"; exit 1; }
+                { printf '['; marketplace_entries; printf '\n]\n'; } | shape
+                [ -f "$S/claude.mlist-json-fails" ] && exit 1 ;;
+            add)
+                if [ -f "$S/claude.marketplace-add-fails" ]; then echo "could not add the marketplace" >&2; exit 1; fi
+                if [ "${4:-}" = "anthropics/claude-plugins-official" ]; then
+                    echo "claude-plugins-official" >>"$S/claude.marketplaces"
+                elif [ -f "${4:-}/.claude-plugin/marketplace.json" ]; then
+                    { grep -v '^ghost-protocol\( \|$\)' "$S/claude.marketplaces" 2>/dev/null || true; echo "ghost-protocol $4"; } >"$S/claude.marketplaces.new"
+                    mv "$S/claude.marketplaces.new" "$S/claude.marketplaces"
+                else
+                    echo "claude stub: not a marketplace this stub knows" >&2; exit 1
+                fi ;;
+            update)
+                if [ -f "$S/claude.marketplace-update-fails" ]; then echo "could not update the marketplace" >&2; exit 1; fi ;;
+            *)
+                echo "claude stub: unexpected call" >&2
+                exit 64 ;;
+        esac ;;
+    "plugin install")
+        id="${3:-}"
+        if [ -f "$S/claude.plugin-install-fails" ]; then
+            if [ ! -s "$S/claude.plugin-install-fails" ] || grep -qxF "$id" "$S/claude.plugin-install-fails"; then
+                echo "could not install the plugin" >&2; exit 1
+            fi
+        fi
+        scope="unset"; prev=""
+        for a in "$@"; do
+            [ "$prev" = "--scope" ] && scope="$a"
+            prev="$a"
+        done
+        if [ ! -f "$S/claude.plugin-install-noop" ]; then echo "$id enabled $scope" >>"$S/claude.plugins"; fi ;;
+    "plugin update")
+        if [ -f "$S/claude.plugin-update-fails" ]; then echo "could not update the plugin" >&2; exit 1; fi ;;
+    *)
+        echo "claude stub: unexpected call" >&2
+        exit 64 ;;
+esac
+exit 0

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Test stand-in for useradd, for the key service's user. It records the call
+# ("useradd <n>", then "useradd flag <flag>" for each option, never a value
+# but the shell and the home), and adds the user and its own group to
+# $STUB_STATE/passwd and group, with the next free uid from 901 and the
+# comment in the passwd line's comment field, as useradd does.
+# useradd.fail in $STUB_STATE makes it fail.
+S="${STUB_STATE:?}"
+echo "useradd $#" >>"$S/calls"
+[ -f "$S/useradd.fail" ] && { echo "useradd stub: fails" >&2; exit 1; }
+home=/home/x shell=/bin/sh name="" comment=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --home-dir) home="$2"; echo "useradd flag --home-dir $2" >>"$S/calls"; shift 2 ;;
+        --shell) shell="$2"; echo "useradd flag --shell $2" >>"$S/calls"; shift 2 ;;
+        --comment) comment="$2"; echo "useradd flag --comment" >>"$S/calls"; shift 2 ;;
+        --*) echo "useradd flag $1" >>"$S/calls"; shift ;;
+        *) name="$1"; shift ;;
+    esac
+done
+[ -n "$name" ] || exit 2
+uid=901
+while awk -F: -v u="$uid" '$3 == u { f = 1 } END { exit f ? 0 : 1 }' "$S/passwd" "$S/group" 2>/dev/null; do uid=$((uid + 1)); done
+printf '%s:x:%s:%s:%s:%s:%s\n' "$name" "$uid" "$uid" "$comment" "$home" "$shell" >>"$S/passwd"
+printf '%s:x:%s:\n' "$name" "$uid" >>"$S/group"

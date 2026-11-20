@@ -1,0 +1,53 @@
+# @NAME@.service: the Ghost Protocol instance @NAME@, made by
+#   install/service/start --root @ROOT@ --name @NAME@ --print-unit
+#
+# Install it as root: put this file at /etc/systemd/system/@NAME@.service, then
+# systemctl daemon-reload. Nothing in Ghost Protocol enables or starts it: two
+# running copies of one instance would both answer the same messages, so only
+# the operator turns it on (systemctl enable --now @NAME@), after any other copy
+# is stopped.
+#
+# Credentials and extra environment belong to the instance, in a drop-in it
+# owns, /etc/systemd/system/@NAME@.service.d/instance.conf, for example:
+#   [Service]
+#   LoadCredentialEncrypted=api-token:/etc/credstore.encrypted/api-token
+#   Environment=EXAMPLE_SETTING=value
+# start exports each credential as an environment variable (api-token becomes
+# API_TOKEN). A credential file that is missing stops the start (status
+# 243/CREDENTIALS).
+#
+# start runs in the foreground. When Claude Code's own window ends while other
+# windows keep its tmux session alive, start runs it again in a new window;
+# when the whole session ends (or Claude Code ends quickly three times in a
+# row), start returns, so Restart=always brings the instance back; enabled, it
+# also comes back after a reboot. The restart delay grows from 15 seconds to 10 minutes
+# (RestartSteps and RestartMaxDelaySec need systemd 254 or later; an older
+# systemd ignores them and waits 15 seconds each time).
+#
+# Watch it: systemctl status @NAME@; journalctl -u @NAME@ -f
+# Attach:   tmux -L @NAME@ attach -t @NAME@   (detach: C-b d)
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: Claude Code in tmux, in @ROOT@/@NAME@
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@HOME@
+Environment=HOME=@HOME@ USER=@USER@ LOGNAME=@USER@
+Environment=PATH=@HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LANG=C.UTF-8 TERM=xterm-256color
+Environment=DISABLE_AUTOUPDATER=1
+ExecStart=@START@ --root @ROOT@ --name @NAME@
+Restart=always
+RestartSec=15
+RestartSteps=6
+RestartMaxDelaySec=600
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# time-stamp: a Claude Code UserPromptSubmit hook. Before each prompt it adds
+# one line with the current time, so the agent knows the time of day; Claude
+# Code itself gives the date once per session and never the time.
+#
+#   Current time: Tue 2026-11-03 14:05 CET (UTC+0100)
+#
+# The plugin option time_zone names the operator's time zone (an IANA name such
+# as Europe/Berlin); empty means the session's own (its TZ, else the machine's).
+# A name that is not a time zone on this machine is not used: the line then
+# gives the session's time and says so. The plugin option time_stamp switches
+# the hook off.
+#
+# To make Claude Code's own date agree with the stamp, start the session with
+# TZ set to the same zone; this hook can only set its own.
+#
+# Reads nothing from its input. Always exits 0.
+set -u
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+hook_on time_stamp || exit 0
+
+# A time zone this machine knows: a name made of letters, digits and _ + -,
+# in /-separated parts, that is a file in a zoneinfo folder.
+zone_file_exists() {
+    local d
+    case "$1" in
+        "" | /* | */ | *//* | .* | */.*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$' || return 1
+    for d in "${TZDIR:-}" /usr/share/zoneinfo /usr/lib/zoneinfo /usr/share/lib/zoneinfo /var/db/timezone/zoneinfo; do
+        [ -n "$d" ] && [ -f "$d/$1" ] && return 0
+    done
+    return 1
+}
+
+zone="$(hook_option time_zone)"
+note=""
+if [ -n "$zone" ]; then
+    if zone_file_exists "$zone"; then
+        TZ="$zone"
+        export TZ
+    else
+        note=" (the time zone setting \"$zone\" is not a time zone on this machine, so this is the session's time)"
+    fi
+fi
+printf 'Current time: %s%s\n' "$(date '+%a %Y-%m-%d %H:%M %Z (UTC%z)')" "$note"
+exit 0

@@ -1,0 +1,24 @@
+# The paths of the internal repository that are copied into the public one, and nothing else. Read by tools/publish/export from the
+# commit being published. A path ending in / is a folder; any other is one file; a line starting with ! leaves a path out again.
+# Never public, whatever is written here, and refused if named: the evals, the plans under docs/, and the scan's internal folder.
+.claude-plugin/
+.github/
+.gitignore
+.mcp.json
+LICENSE
+NOTICE
+README.md
+VOCABULARY.md
+adapters/
+agents/
+backlog/
+docker/
+docs/
+# The internal repository's own operating scripts: not part of the product.
+!docs/ops/
+hooks/
+install/
+persona/
+statusline/
+tools/
+.dockerignore

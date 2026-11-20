@@ -1,0 +1,20 @@
+# The auto-mode guard's timer for the Ghost Protocol instance @NAME@ (its unit
+# is named after the instance, <name>-automode-guard.timer): it runs the
+# guard's service every 15 minutes, on the quarter hour. Made by the installer
+# from install/automode-guard/automode-guard.timer.
+#
+# A calendar timer fires on the clock whatever the last run's result was: a
+# run that finds the check broken exits 1, and that must not move the next
+# one. The service is one short oneshot, so runs never overlap.
+#
+# Check: systemctl list-timers <name>-automode-guard.timer
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the auto-mode guard every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

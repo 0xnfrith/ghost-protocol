@@ -1,0 +1,14 @@
+#!/bin/sh
+# Test stand-in for ImageMagick 7's magick. It records only the call name and
+# the argument count. Its behaviour comes from $STUB_STATE/magick.version (the
+# version it reports).
+S="${STUB_STATE:?}"
+echo "magick ${1:-} $#" >>"$S/calls"
+case "${1:-}" in
+    -version)
+        printf 'Version: ImageMagick %s Q16-HDRI x86_64 https://imagemagick.org\n' "$(cat "$S/magick.version")" ;;
+    *)
+        echo "magick stub: unexpected call" >&2
+        exit 64 ;;
+esac
+exit 0

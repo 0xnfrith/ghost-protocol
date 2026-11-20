@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "typeOrder": ["app", "infra", "plugin", "vendor", "ops-desk", "personal-ops", "agent-ops", "desk-ops", "research", "decision", "chore"],
+  "types": {
+    "vendor": {
+      "family": "work",
+      "statuses": ["idea", "draft", "scoped", "active", "blocked", "delivered", "completed", "deferred", "cancelled", "moved"],
+      "sections": ["DESCRIPTION", "REQUIREMENTS", "DOD", "CLIENT_CONTEXT", "DELIVERABLES", "ARCHITECTURE", "REFERENCES", "ACTIVITY_LOG"]
+    },
+    "ops-desk": {
+      "family": "work",
+      "statuses": ["idea", "draft", "active", "blocked", "completed", "deferred", "cancelled", "moved"],
+      "sections": ["DESCRIPTION", "REQUIREMENTS", "CONTACTS", "DELIVERABLES", "REFERENCES", "ACTIVITY_LOG"]
+    },
+    "agent-ops": {
+      "family": "work",
+      "statuses": ["idea", "draft", "scoped", "active", "blocked", "completed", "deferred", "cancelled"],
+      "sections": ["DESCRIPTION", "REFERENCES", "ACTIVITY_LOG"]
+    },
+    "desk-ops": {
+      "family": "work",
+      "statuses": ["idea", "draft", "scoped", "active", "blocked", "completed", "deferred", "cancelled", "open", "decided"],
+      "sections": ["REFERENCES", "ACTIVITY_LOG"],
+      "sectionsAnyOf": [["DESCRIPTION", "CONTEXT"]],
+      "decisionStatuses": ["open", "decided"],
+      "extraMoves": { "open": ["active"] }
+    }
+  },
+  "extend": {
+    "app": { "statuses": ["moved"] },
+    "infra": { "statuses": ["moved"] },
+    "plugin": { "statuses": ["moved"] },
+    "research": { "statuses": ["moved"] },
+    "decision": { "statuses": ["moved"] }
+  },
+  "knownKeys": ["vendor", "vendor_ref", "vendor_emails", "meeting_codes", "engagement_mode"],
+  "requireWhen": [{ "type": "vendor", "field": "vendor", "exceptStatuses": ["idea", "draft"] }],
+  "handoff": { "status": "moved", "field": "tracker_ref", "pattern": "^[A-Za-z][A-Za-z0-9]*-\\d+$" }
+}

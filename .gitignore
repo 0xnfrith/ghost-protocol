@@ -1,0 +1,4 @@
+node_modules/
+.install-lock/
+*.tmp
+__pycache__/

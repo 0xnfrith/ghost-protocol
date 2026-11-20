@@ -1,0 +1,48 @@
+#!/bin/sh
+# Test stand-in for sudo. It records the call ("sudo <n>", "sudo -n <n>" or
+# "sudo -v <n>", n the argument count) and, by default, refuses: the tests
+# never run anything as root. Files in $STUB_STATE change that:
+#   sudo.allow            run the command as the test's own user instead, never
+#                         as root, and only from the sandbox's PATH (its stubs
+#                         and system tools); this is how a test follows a root
+#                         step through to its stubs and to its own GP_ETC folder
+#   sudo.needs-password   sudo -n fails as sudo does when it wants a password
+#   sudo.v-fails          sudo -v (the password prompt) fails
+#   sudo.list.<user>      what sudo -l -U <user> prints (the key service's check
+#                         of what that user may run); without it, that the user
+#                         may run nothing. Outside the C locale (LC_ALL), it is
+#                         translated, as sudo's own messages are
+#   sudo.none             sudo -l answers as env does on a machine with no
+#                         sudo at all: nothing on stdout, status 127
+S="${STUB_STATE:?}"
+# sudo -l -U <user>: list a user's sudo rights (run as root by the caller).
+if [ "${1:-}" = -l ] && [ "${2:-}" = -U ]; then
+    echo "sudo -l -U $3" >>"$S/calls"
+    if [ -f "$S/sudo.none" ]; then echo "env: 'sudo': No such file or directory" >&2; exit 127; fi
+    case "${LC_ALL:-C}" in
+        C|POSIX) if [ -f "$S/sudo.list.$3" ]; then cat "$S/sudo.list.$3"; else echo "User $3 is not allowed to run sudo on stub."; fi ;;
+        *) if [ -f "$S/sudo.list.$3" ]; then sed 's/may run the following commands/darf die folgenden Befehle ausfuehren/' "$S/sudo.list.$3"
+           else echo "Der Benutzer $3 darf sudo auf stub nicht verwenden."; fi ;;
+    esac
+    exit 0
+fi
+case "${1:-}" in
+    -v)
+        echo "sudo -v $#" >>"$S/calls"
+        [ -f "$S/sudo.v-fails" ] && { echo "sudo stub: -v fails" >&2; exit 1; }
+        exit 0 ;;
+    -n)
+        echo "sudo -n $#" >>"$S/calls"
+        shift
+        if [ -f "$S/sudo.needs-password" ]; then
+            echo "sudo: a password is required" >&2
+            exit 1
+        fi ;;
+    *)
+        echo "sudo $#" >>"$S/calls" ;;
+esac
+if [ -f "$S/sudo.allow" ]; then
+    exec "$@"
+fi
+echo "sudo stub: refusing" >&2
+exit 1

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# root-limit: a Claude Code PreToolUse hook on the Buzz MCP send tool. A
+# top-level post (a send with no reply: a channel's or a DM's own timeline,
+# not a thread) may be at most 5 non-empty lines and 400 characters, so that
+# a channel or a DM shows many threads on one screen and the reader scrolls
+# the roots to pick the thread to open. Anything longer is refused, with the
+# numbers and what to do instead: a short root, then the rest in a reply to
+# it. Replies are never limited. The plugin wires it (hooks/hooks.json); the
+# plugin option root_limit switches it off.
+#
+# THE SETTINGS (plugin options, as CLAUDE_PLUGIN_OPTION_<KEY>; unset is the
+# default):
+#   root_limit           on (the default) or off
+#   root_limit_lines     the most non-empty lines a root may have, default 5
+#   root_limit_chars     the most characters (code points) a root may have, default 400
+#   root_limit_exempt    channel ids whose roots are not limited (a comma list)
+#   root_limit_channels  per-channel limits: <channel id>=<lines>:<chars>, comma-separated
+#
+# THE OPERATOR'S ONE-TIME PASS: a file only root can write,
+# /etc/ghost-protocol/root-limit-pass.json, lets one longer root through (or
+# a few). It counts only when it and every folder above it are owned by root
+# and writable by no group or others, and it is no link. Its path is fixed in
+# the code, never read from the environment or a setting. See
+# root-limit.py and the Buzz adapter's README ("Root limit").
+#
+# WHAT IT READS: the hook input (tool_name, tool_input: channel, reply, text,
+# path, audience), the plugin options and the pass file. Nothing else: no
+# relay, no transcript, no model. The text is measured, never changed: the
+# hook only allows or refuses the call.
+#
+# Log: one line per decision, ids and numbers only, never message text, at
+# <plugin data>/hooks/root-limit.log (without the plugin:
+# ~/.local/state/ghost-protocol/hooks/root-limit.log). Logic: root-limit.py
+# next to this file, Python 3.9 or later. Tests: test/root-limit.test.mjs.
+#
+# This wrapper always exits 0. For a PreToolUse hook, exit code 2 means
+# "block the call", so an exit 2 from here (python3 given a missing file exits
+# 2) would block every Buzz send of every session. The refusal travels only as
+# JSON on stdout. Any error lets the send through (fail open), as the reply
+# guard does.
+set -u
+case "$(printf '%s' "${CLAUDE_PLUGIN_OPTION_ROOT_LIMIT:-on}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+  off | false | no | 0) exit 0 ;;
+esac
+py="$(dirname "$0")/root-limit.py"
+[ -r "$py" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "$py" "$@"
+exit 0

@@ -1,0 +1,193 @@
+# Every test workflow, called from one place, and one check over all of them: `all-tests`, the one check in .github/required-checks.
+#
+# GitHub blocks a merge only on a required check, and a required check that never reports leaves the pull request waiting. So this
+# workflow runs on every pull request to main, every push to main and every merge group, and the test workflows have no events of
+# their own: they are called from here (`workflow_call`), each one once, and only when the change touches what they test.
+# The `changes` job decides which, with .github/tests-to-run.sh, which holds the list (one row per test workflow, and the paths that
+# no test reads on purpose). The gates (the secret scan and the tree scan) run on every run; a change that touches nothing else
+# (the docs, say) calls only them. Two test workflows find their tests by name, so a new test or eval needs no change here:
+# tool-tests runs every tools/<name>/test and docker/test, and evals runs evals/ci/run (and passes with a notice where there is none). A change to any file under .github/ calls every one, and so does running this workflow by hand.
+# `all-tests` waits for all of them and fails unless the list was made and each test workflow did what the list said: passed when
+# it was called, was skipped when it was not.
+#
+# To add a test workflow, give it `on: workflow_call` and put its name in five places: its row in .github/tests-to-run.sh, the list
+# of rows (ROWS) in .github/tests-to-run.test.mjs, the `outputs` of the `changes` job, a job below that calls the workflow, and the
+# `needs` of `all-tests`. If one of these is missing, `changes`, `all-tests` or install-test's check of the workflows fails and says so.
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+    # Only pull requests into main. That holds only for this copy of the file: a pull request into another branch runs that
+    # branch's copy of tests.yml, which can say anything, and its `all-tests` lands on the same head commit. If that pull request is
+    # then retargeted to main, the result from the other copy is still there. `edited` is in the types so that a retarget starts a
+    # real run of this copy, but a stale result can count until that run replaces it: the branch ruleset step has to close the rest.
+    # An edit of the title or description also starts a run, which waits for the one in progress instead of cancelling it.
+    # A retarget arrives as an edit too, but with a base change, and that run does cancel the one in progress.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A pull request's newer push, or a change of its base (a retarget), cancels the run in progress: a run against the old base must
+  # not finish after the retarget and stand as the result. A title or description edit does not cancel: its run queues behind the
+  # run in progress, so an edit never turns a running `all-tests` into a cancelled one. The group has no base in it on purpose, or a
+  # retarget's run could never reach the old base's run. Any other run (a push to main, a merge group, a run by hand) is grouped by
+  # its own commit, so it never waits for, or is replaced by, the run of another commit.
+  group: tests-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null) }}
+
+jobs:
+  changes:
+    name: Which tests apply
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml).
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      rows: ${{ steps.match.outputs.rows }}
+      install-test: ${{ steps.match.outputs.install-test }}
+      blackout-test: ${{ steps.match.outputs.blackout-test }}
+      adapter-tests: ${{ steps.match.outputs.adapter-tests }}
+      rollout-check-test: ${{ steps.match.outputs.rollout-check-test }}
+      backlog-test: ${{ steps.match.outputs.backlog-test }}
+      tool-tests: ${{ steps.match.outputs.tool-tests }}
+      evals: ${{ steps.match.outputs.evals }}
+      gates: ${{ steps.match.outputs.gates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the whole history, so the base of the change is there to diff against
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: The test of the script that picks the tests
+        run: node --test .github/tests-to-run.test.mjs
+      - name: The changed files, and the tests they call
+        id: match
+        env:
+          EVENT: ${{ github.event_name }}
+          # A pull request: its base and head. A merge group: its base and its commit. A push: the commit before it and the one pushed.
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: .github/tests-to-run.sh
+
+  install-test:
+    name: install-test
+    needs: changes
+    if: ${{ needs.changes.outputs.install-test == 'true' }}
+    uses: ./.github/workflows/install-test.yml
+
+  blackout-test:
+    name: blackout-test
+    needs: changes
+    if: ${{ needs.changes.outputs.blackout-test == 'true' }}
+    uses: ./.github/workflows/blackout-test.yml
+
+  adapter-tests:
+    name: adapter-tests
+    needs: changes
+    if: ${{ needs.changes.outputs.adapter-tests == 'true' }}
+    uses: ./.github/workflows/adapter-tests.yml
+
+  rollout-check-test:
+    name: rollout-check-test
+    needs: changes
+    if: ${{ needs.changes.outputs.rollout-check-test == 'true' }}
+    uses: ./.github/workflows/rollout-check-test.yml
+
+  backlog-test:
+    name: backlog-test
+    needs: changes
+    if: ${{ needs.changes.outputs.backlog-test == 'true' }}
+    uses: ./.github/workflows/backlog-test.yml
+
+  tool-tests:
+    name: tool-tests
+    needs: changes
+    if: ${{ needs.changes.outputs.tool-tests == 'true' }}
+    uses: ./.github/workflows/tool-tests.yml
+
+  evals:
+    # The only job given secrets, and only the ones the evals read (evals.yml lists them). Where they are not set (a public copy, a
+    # pull request from a fork) the eval cannot run; evals.yml says what happens then.
+    name: evals
+    needs: changes
+    if: ${{ needs.changes.outputs.evals == 'true' }}
+    # actions: read lets evals/ci/run tell whether the GitHub run that made another CI eval's VM has finished.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/evals.yml
+    secrets:
+      GP_EVAL_EXE_TOKEN: ${{ secrets.GP_EVAL_EXE_TOKEN }}
+      GP_EVAL_OPERATOR_KEY: ${{ secrets.GP_EVAL_OPERATOR_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GP_EVAL_RELAY_URL: ${{ secrets.GP_EVAL_RELAY_URL }}
+      GP_EVAL_CHANNEL_ID: ${{ secrets.GP_EVAL_CHANNEL_ID }}
+
+  gates:
+    name: gates
+    needs: changes
+    if: ${{ needs.changes.outputs.gates == 'true' }}
+    uses: ./.github/workflows/gates.yml
+
+  all-tests:
+    # The check to require. It runs whatever happened above (`always()`), and it has no `if` that could skip it, because a required
+    # check that is skipped counts as passed. It fails unless:
+    #   - `changes` passed;
+    #   - the rows of .github/tests-to-run.sh, the outputs of `changes` and the jobs this one needs are the same names, so no row is
+    #     left without a job and no job without a row;
+    #   - each test workflow did what its row said: passed when it was called ("true"), was skipped when it was not ("false").
+    name: all-tests
+    needs: [changes, install-test, blackout-test, adapter-tests, rollout-check-test, backlog-test, tool-tests, evals, gates]
+    if: ${{ always() }}
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }} # as `changes`
+    timeout-minutes: 5
+    steps:
+      - name: Every test that applies passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # One line per name: the name, what `changes` said, and how the job ended.
+          table=$(jq -r '
+            . as $n
+            | (($n.changes.outputs.rows // "") | split(" ") | map(select(. != ""))) as $rows
+            | ($rows + ($n | keys | map(select(. != "changes"))) + ($n.changes.outputs // {} | keys | map(select(. != "rows"))) | unique)[]
+            | [., ($n.changes.outputs[.] // "(no output)"), ($n[.].result // "(no job)")] | @tsv' <<<"$NEEDS")
+          {
+            echo "### all-tests"
+            echo
+            echo "Which tests apply: $(jq -r .changes.result <<<"$NEEDS")"
+            echo
+            echo "| Tests | Called | Result |"
+            echo "| --- | --- | --- |"
+            awk -F'\t' '{ printf "| %s | %s | %s |\n", $1, $2, $3 }' <<<"$table"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Which tests apply: $(jq -r .changes.result <<<"$NEEDS")"
+          awk -F'\t' '{ printf "%s: called %s, %s\n", $1, $2, $3 }' <<<"$table"
+          problems=$(jq -r '
+            . as $n
+            | (($n.changes.outputs.rows // "") | split(" ") | map(select(. != "")) | sort) as $rows
+            | ($n | keys | map(select(. != "changes")) | sort) as $jobs
+            | ($n.changes.outputs // {} | keys | map(select(. != "rows")) | sort) as $outputs
+            | if $n.changes.result != "success" then "Working out which tests apply failed: see the `changes` job\u0027s log."
+              else
+                (if $rows != $jobs then "the rows of .github/tests-to-run.sh (\($rows | join(", "))) are not the jobs all-tests needs (\($jobs | join(", ")))" else empty end),
+                (if $outputs != $jobs then "the outputs of the changes job (\($outputs | join(", "))) are not the jobs all-tests needs (\($jobs | join(", ")))" else empty end),
+                ($jobs[] as $j | ($n.changes.outputs[$j] // "") as $called | $n[$j].result as $result
+                  | if $called == "true" and $result == "success" then empty
+                    elif $called == "false" and $result == "skipped" then empty
+                    else "\($j): called \(if $called == "" then "(no output)" else $called end), \($result)" end)
+              end' <<<"$NEEDS")
+          if [ -n "$problems" ]; then
+            while IFS= read -r line; do echo "::error::$line"; done <<<"$problems"
+            exit 1
+          fi
+          echo "Every test that applies passed."

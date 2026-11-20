@@ -1,0 +1,22 @@
+#!/bin/sh
+# Test stand-in for runuser -u <user> -- <command...>, for the key service's
+# probes, which ask as another user what that user can do. It records
+# "runuser <user> <command...>" (the probes hold paths, never a secret) and
+# answers from $STUB_STATE:
+#   runuser.<user>.sudo-n   sudo -n true succeeds for that user
+#   runuser.<user>.can      lines "r <path>" or "w <path>": test -r or test -w
+#                           of that path succeeds for that user
+# A command through env -i (the key service's probe) is run, as this user:
+# the node stub plays the probe.
+# Anything else is refused: by default a user can do none of these.
+S="${STUB_STATE:?}"
+[ "${1:-}" = -u ] || { echo "runuser stub: expected -u <user>" >&2; exit 64; }
+u="$2"; shift 2
+[ "${1:-}" = -- ] && shift
+echo "runuser $u $*" >>"$S/calls"
+case "${1:-} ${2:-}" in
+    "sudo -n") [ -f "$S/runuser.$u.sudo-n" ] ;;
+    "test -r"|"test -w") grep -qxF "${2#-} $3" "$S/runuser.$u.can" 2>/dev/null ;;
+    "env -i") exec "$@" ;;
+    *) echo "runuser stub: unexpected command" >&2; exit 64 ;;
+esac

@@ -1,0 +1,75 @@
+#!/bin/sh
+# Test stand-in for gh. It records only the call name and the argument count,
+# never arguments, values or the environment. Its behaviour comes from files
+# in $STUB_STATE: gh.authed (signed in), gh.login (the login it reports),
+# gh.login-fails (the sign-in fails), gh.user-error (`api user` on github.com
+# fails with an error body), gh.int-denied (owner/repo lines the integration
+# host does not answer for).
+#
+# The host it plays is --hostname when given, else GH_HOST, else github.com,
+# as with the real gh. As the exe.dev integration host (github.int.exe.xyz) it
+# answers like that proxy: only /repos/OWNER/REPO/... paths, so `api user`
+# gets 403 and `api repos/<owner>/<repo>` answers with no sign-in.
+S="${STUB_STATE:?}"
+INT_HOST="github.int.exe.xyz"
+name="gh"
+case "${1:-}" in
+    --version) name="gh --version" ;;
+    auth) name="gh $1 ${2:-}" ;;
+    api)
+        case "${2:-}" in
+            repos/*) name="gh api repos" ;;
+            *) name="gh $1 ${2:-}" ;;
+        esac ;;
+esac
+echo "$name $#" >>"$S/calls"
+
+host="${GH_HOST:-github.com}"
+prev=""
+for a in "$@"; do
+    [ "$prev" = "--hostname" ] && host="$a"
+    prev="$a"
+done
+
+case "${1:-} ${2:-}" in
+    "--version "*)
+        echo "gh version 0.0.0-stub" ;;
+    "auth status")
+        [ -f "$S/gh.authed" ] || { echo "not signed in" >&2; exit 1; } ;;
+    "auth login")
+        [ -f "$S/gh.login-fails" ] && exit 1
+        touch "$S/gh.authed" ;;
+    "auth logout")
+        rm -f "$S/gh.authed" ;;
+    "auth git-credential")
+        exit 0 ;;
+    "api user")
+        if [ "$host" = "$INT_HOST" ]; then
+            echo "gh: HTTP 403" >&2
+            exit 1
+        fi
+        if [ -f "$S/gh.user-error" ]; then
+            # Like the real gh: the error body on stdout, even with --jq.
+            echo '{"message":"Bad credentials","status":"401"}'
+            echo "gh: Bad credentials (HTTP 401)" >&2
+            exit 1
+        fi
+        if [ -f "$S/gh.authed" ]; then cat "$S/gh.login"; else exit 1; fi ;;
+    "api repos/"*)
+        repo="${2#repos/}"
+        if [ "$host" = "$INT_HOST" ]; then
+            if [ -f "$S/gh.int-denied" ] && grep -qxF "$repo" "$S/gh.int-denied"; then
+                # Like the real gh: the error body on stdout, even with --jq.
+                echo '{"message":"Not Found","status":"404"}'
+                echo "gh: Not Found (HTTP 404)" >&2
+                exit 1
+            fi
+        elif [ ! -f "$S/gh.authed" ]; then
+            exit 1
+        fi
+        echo "$repo" ;;
+    *)
+        echo "gh stub: unexpected call" >&2
+        exit 64 ;;
+esac
+exit 0

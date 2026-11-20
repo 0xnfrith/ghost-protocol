@@ -1,0 +1,8 @@
+schema = "ghost-protocol/instance/v0"
+name = "instance"
+[github]
+login = "example-bot"
+[claude]
+email = "agent@example.com"
+[setup]
+command = "setup.sh"

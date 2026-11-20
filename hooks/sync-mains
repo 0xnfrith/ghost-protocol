@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# sync-mains: fast-forward every clean checkout of an instance's workspace that
+# sits on its default branch, so a merge lands locally however it happened:
+# an auto-merge after CI, a button on GitHub, another agent, or the agent's own
+# `gh pr merge`. The auto-pull hook runs it right after a merge; a timer can
+# run it as a sweep.
+#
+# Which checkouts:
+#   - CHECKOUT arguments (the auto-pull hook): only those;
+#   - --home DIR [--root DIR] (a sweep, for a timer): the instance's home and
+#     every folder at <root>/repos/<owner>/<repo> (docs/layout.md).
+#
+# A checkout is fast-forwarded only when every guard holds; otherwise it is left
+# exactly as it was:
+#   - it is a main checkout: not a linked worktree, not bare;
+#   - its origin is on GitHub: github.com, or the installer's integration host
+#     (GP_GITHUB_INT_HOST in install/lib/github.sh). Other hosts are skipped:
+#     they may need a key or a token that a timer does not hold;
+#   - HEAD is on the default branch (origin/HEAD, else main). A detached HEAD
+#     or any other branch is left alone;
+#   - no tracked file is changed or staged, and no merge, cherry-pick, revert,
+#     rebase or am is in progress. Untracked and ignored files do not count:
+#     the merge runs with --ff-only and --no-overwrite-ignore, so git refuses
+#     to overwrite either kind and stops before it changes anything;
+#   - after fetching that one branch, HEAD is an ancestor of origin/<default>.
+#     Ahead of origin, or diverged from it: left alone, and logged.
+#   - right before the merge, HEAD is still on that branch and still clean
+#     (the fetch can take a while).
+# It never merges, rebases, resets, stashes, commits or switches branches.
+#
+# A fast-forward that stops PART-WAY (a smudge filter such as Git LFS fails,
+# or the run is killed: the hook's time limit, a timer's) can leave tracked
+# files changed with HEAD unmoved. That checkout then reads as dirty, so it is
+# never synced again until someone fixes it, and it must not be silent: on a
+# failure the script checks for changed tracked files and logs "fast-forward to
+# X failed PART-WAY; tracked files differ from HEAD" with git's first error
+# line, and prints it (the hook hands it to the agent). Not when another git
+# holds the index lock (the hook and a sweep overlapping): that process is the
+# one changing files, so the plain failure is logged. URLs in git's error line
+# lose any userinfo before it is logged.
+# A marker in the git folder (ghost-sync-mains.merging) is written before the
+# merge and removed after it; a run that finds it with tracked files changed
+# reports the same PART-WAY line (a killed run cannot report itself). Once the
+# checkout is clean again, the marker is removed and syncing resumes.
+#
+# Off switch: while ~/.local/state/ghost-protocol/sync-mains.off exists
+# ($XDG_STATE_HOME/ghost-protocol/ when that is set), the script does nothing,
+# for a sweep and the hook alike (touch it to stop, rm it to resume).
+#
+# Pacing: one checkout at a time, one fetch of one branch per checkout per run,
+# no tags. A git fetch is not a GitHub REST API call; an up-to-date fetch is a
+# ref listing and no pack. Each fetch gets 60 s (15 s and one retry after 2 s
+# in CHECKOUT mode, at most 32 s), through timeout, else perl's alarm (macOS
+# has no timeout), else with no limit. In CHECKOUT mode no fetch starts, and
+# no fetch is retried, after the first 25 s (SYNC_MAINS_BUDGET), so a run with
+# several checkouts ends about 40 s in at the latest, inside the hook's 60 s;
+# a checkout left out is logged and the next run catches it.
+# Background-safe: reads run with GIT_OPTIONAL_LOCKS=0, so `git status` never
+# refreshes the index or takes index.lock from the agent; fetch and merge run
+# with gc.auto=0 and maintenance.auto=false, so no gc starts in a live
+# checkout, with submodule.recurse=false, so no submodule is checked out, and
+# with core.hooksPath=/dev/null, so no repo hook runs unattended (a repo whose
+# hooksPath lives in its own tree must not run merged code; Git LFS content
+# still arrives through the smudge filter, which is not a hook);
+# GIT_TERMINAL_PROMPT=0 and ssh BatchMode, so nothing waits for a password.
+#
+# Output: one stdout line per fast-forward ("~/work/instance main
+# fast-forwarded 1a2b3c4..5d6e7f8") and per PART-WAY failure, nothing else.
+# --dry-run prints one verdict per checkout.
+# Log: ~/.local/state/ghost-protocol/sync-mains.log (--log FILE for another):
+# one line per fast-forward and per failure. In a sweep, a held checkout
+# (ahead, diverged), a failure or a PART-WAY checkout is logged once until its
+# reason changes (state in <log>.state), so a stuck checkout costs one line,
+# not one every run. Skips for an expected state (dirty, another branch, not
+# GitHub) are silent. In CHECKOUT mode every outcome is logged (the hook's
+# trail).
+# Exit status: always 0, except 2 for a usage error.
+#
+# Usage: sync-mains [--dry-run] [--log FILE] [--] CHECKOUT...
+#        sync-mains [--dry-run] [--log FILE] --home DIR [--root DIR]
+#   --dry-run  no fetch, no merge, no log: each checkout's verdict from the
+#              origin refs already on disk.
+# Test: install/test/hook-sync-mains.test.sh
+set -u
+
+DRY=0 MODE=sweep LOG="" STATE="" STATE_OLD="" STATE_NEW="" SEEN="" SWEEP_HOME="" SWEEP_ROOT=""
+CUR="" SHOWN="" BRANCH="" FETCH_TIMEOUT=60 TRIES=1 DEADLINE=""
+# For fetch and merge: no gc, no maintenance, no repo hooks (guard:hooks).
+QUIET_GIT="-c gc.auto=0 -c maintenance.auto=false -c submodule.recurse=false -c core.hooksPath=/dev/null"
+STATE_BASE="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol"
+OFF="$STATE_BASE/sync-mains.off"
+# The installer's integration host (install/lib/github.sh, GP_GITHUB_INT_HOST;
+# install/test/hook-sync-mains.test.sh keeps the two the same).
+INT_HOST="github.int.exe.xyz"
+HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd)" || HOME_P="$HOME"
+
+# Reads only: never take an optional lock.
+gro() { GIT_OPTIONAL_LOCKS=0 git -C "$CUR" "$@" 2>/dev/null; }
+short() { gro rev-parse --short "$1"; }
+
+# A path with the home folder written as ~ (a literal ~ is meant).
+# shellcheck disable=SC2088
+show() {
+    case "$1" in
+        "$HOME_P") printf '~' ;;
+        "$HOME_P"/*) printf '~/%s' "${1#"$HOME_P"/}" ;;
+        "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# The host of a git URL: https://host/..., ssh://user@host:port/..., user@host:path.
+url_host() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's#^[a-z][a-z0-9+.-]*://##; s#^[^@/]*@##; s#[:/].*$##'
+}
+
+log_line() {
+    [ -n "$LOG" ] || return 0
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null &&
+        printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$1" >>"$LOG" 2>/dev/null
+}
+
+state_get() { printf '%s' "$STATE_OLD" | awk -F'\t' -v p="$1" '$1 == p { print $2; exit }'; }
+
+# report KIND MESSAGE [DETAIL]. KIND: skip (an expected state), same (up to
+# date), ff (fast-forwarded), held (ahead or diverged), fail (fetch or merge
+# failed, nothing changed), broken (a fast-forward stopped PART-WAY: tracked
+# files differ from HEAD). DETAIL (git's first error line) goes on the line
+# but not into the key that de-duplicates a sweep's log.
+report() {
+    local kind="$1" line="$SHOWN${BRANCH:+ $BRANCH} $2${3:+: $3}" key new=1
+    if [ "$DRY" = 1 ]; then printf '%s\n' "$line"; return 0; fi
+    if [ "$MODE" = target ]; then
+        log_line "$line"
+    else
+        case "$kind" in
+            ff) log_line "$line" ;;
+            held | fail | broken)
+                key="$kind $2"
+                if [ "$(state_get "$CUR")" = "$key" ]; then new=0; else log_line "$line"; fi
+                STATE_NEW="$STATE_NEW$CUR	$key
+" ;;
+        esac
+    fi
+    case "$kind" in
+        ff) printf '%s\n' "$line" ;;
+        broken) [ "$new" = 0 ] || printf '%s\n' "$line" ;;
+    esac
+    return 0
+}
+partway() { printf 'fast-forward to %s failed PART-WAY; tracked files differ from HEAD; fix it by hand (git status), and syncing resumes once it is clean' "$1"; }
+
+fetch_branch() {
+    local def="$1" try=1 t=""
+    if command -v timeout >/dev/null 2>&1; then
+        t="timeout $FETCH_TIMEOUT"
+    elif command -v perl >/dev/null 2>&1; then
+        # alarm outlives exec, so git is stopped by SIGALRM at the limit.
+        t="perl -e alarm(shift);exec(@ARGV)||exit(127) $FETCH_TIMEOUT"
+    fi
+    while :; do
+        # The group's redirect also hides bash's own "Alarm clock" notice.
+        # shellcheck disable=SC2086  # $t is empty, "timeout <seconds>" or the perl alarm, one word each
+        { GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" \
+            $t git -C "$CUR" $QUIET_GIT \
+            fetch --quiet --no-tags --no-recurse-submodules origin \
+            "+refs/heads/$def:refs/remotes/origin/$def"; } >/dev/null 2>&1 && return 0
+        [ "$try" -lt "$TRIES" ] || return 1
+        # No retry once the run's time budget is spent.
+        { [ -n "$DEADLINE" ] && [ "$(date +%s)" -ge "$DEADLINE" ]; } && return 1
+        try=$((try + 1)); sleep 2
+    done
+}
+
+sync_one() {
+    local dir="$1" gd cdir url host def old up m p mark err locked
+    BRANCH=""
+    SHOWN="$(show "$dir")"
+    [ -d "$dir" ] || { [ "$MODE" = target ] && report skip "skipped: no such folder"; return 0; }
+    CUR="$(cd -P "$dir" 2>/dev/null && pwd)" || return 0
+    SHOWN="$(show "$CUR")"
+    case "$SEEN" in *"
+$CUR
+"*) return 0 ;; esac
+    SEEN="$SEEN
+$CUR
+"
+    [ -e "$CUR/.git" ] || { report skip "skipped: not a git checkout"; return 0; }
+    if ! gd="$(gro rev-parse --absolute-git-dir)" || ! cdir="$(gro rev-parse --path-format=absolute --git-common-dir)"; then
+        report skip "skipped: git cannot read it"; return 0
+    fi
+    gd="$(cd -P "$gd" 2>/dev/null && pwd)"; cdir="$(cd -P "$cdir" 2>/dev/null && pwd)"
+    [ "$gd" = "$cdir" ] || { report skip "skipped: a linked worktree (its main checkout is the one synced)"; return 0; } # guard:worktree
+    url="$(gro config --get remote.origin.url)" || { report skip "skipped: no origin remote"; return 0; }
+    host="$(url_host "$url")"
+    case "$host" in
+        github.com | "$INT_HOST") ;;
+        *) report skip "skipped: origin is not on GitHub (${host:-a local path})"; return 0 ;; # guard:host
+    esac
+    BRANCH="$(gro symbolic-ref --quiet --short HEAD)" || { BRANCH=""; report skip "skipped: detached HEAD"; return 0; }
+    def="$(gro symbolic-ref --quiet --short refs/remotes/origin/HEAD)"
+    def="${def#origin/}"; [ -n "$def" ] || def=main
+    [ "$BRANCH" = "$def" ] || { report skip "skipped: on $BRANCH, not the default branch $def"; return 0; } # guard:branch
+    mark="$gd/ghost-sync-mains.merging"
+    if [ -e "$mark" ]; then # guard:marker
+        if [ -n "$(gro status --porcelain --untracked-files=no)" ]; then
+            report broken "$(partway "$(head -n 1 "$mark" 2>/dev/null)")"; return 0
+        fi
+        [ "$DRY" = 1 ] || rm -f "$mark"
+    fi
+    m="$(gro status --porcelain --untracked-files=no)" || { report skip "skipped: git status failed"; return 0; }
+    [ -z "$m" ] || { report skip "skipped: tracked files are changed or staged"; return 0; } # guard:dirty
+    for m in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+        p="$gd/$m"
+        [ ! -e "$p" ] || { report skip "skipped: a ${m%_HEAD} is in progress"; return 0; } # guard:inprogress
+    done
+
+    old="$(gro rev-parse --verify --quiet HEAD)" || { report skip "skipped: no commit yet"; return 0; }
+    if [ -n "$DEADLINE" ] && [ "$DRY" = 0 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        report skip "skipped: out of time for this run; the next merge or sweep fetches it"; return 0
+    fi
+    if [ "$DRY" = 1 ]; then
+        up="$(gro rev-parse --verify --quiet "refs/remotes/origin/$def^{commit}")" \
+            || { report skip "would fetch origin/$def (never fetched)"; return 0; }
+    else
+        fetch_branch "$def" || { report fail "fetch failed (no network, or no read access); left as it was"; return 0; }
+        up="$(gro rev-parse --verify --quiet "refs/remotes/origin/$def^{commit}")" \
+            || { report fail "origin/$def is missing after the fetch; left as it was"; return 0; }
+    fi
+
+    if [ "$old" = "$up" ]; then
+        report same "already up to date at $(short "$old")"
+    elif gro merge-base --is-ancestor "$old" "$up"; then # guard:ancestor
+        if [ "$DRY" = 1 ]; then report ff "would fast-forward $(short "$old")..$(short "$up")"; return 0; fi
+        # The fetch can take a while: still on the branch, still clean?
+        { [ "$(gro symbolic-ref --quiet --short HEAD)" = "$def" ] && [ -z "$(gro status --porcelain --untracked-files=no)" ]; } || { report skip "skipped: switched branch or changed files during the fetch"; return 0; } # guard:recheck
+        short "$up" >"$mark" 2>/dev/null
+        # shellcheck disable=SC2086  # $QUIET_GIT is a list of -c options
+        if err="$(git -C "$CUR" $QUIET_GIT merge --ff-only --no-overwrite-ignore --quiet "refs/remotes/origin/$def" 2>&1 >/dev/null)"; then
+            rm -f "$mark"
+            report ff "fast-forwarded $(short "$old")..$(short HEAD)"
+        else
+            # No credentials in the log: drop userinfo from any URL (https://user:token@host).
+            err="$(printf '%s\n' "$err" | sed -E 's#//[^/@ ]*@#//#g')" # guard:userinfo
+            # A lock held by another git (the hook and a sweep overlapping, or
+            # the agent's own command) fails this merge while THAT process changes
+            # files: not a part-way merge of ours, so the plain failure is logged.
+            { [ -e "$gd/index.lock" ] || printf '%s' "$err" | grep -q 'index\.lock'; } && locked=1 || locked=0 # guard:lock
+            # git's first error line (Git LFS prints "Downloading ..." before its error)
+            err="$(printf '%s\n' "$err" | sed 's/^[[:space:]]*//' | grep -m 1 -iE 'error|fatal' \
+                || printf '%s\n' "$err" | sed -n 's/^[[:space:]]*//; /./{p;q;}')"
+            err="$(printf '%s' "$err" | cut -c1-200)"
+            if [ "$locked" = 0 ] && [ -n "$(gro status --porcelain --untracked-files=no)" ]; then # guard:partway
+                report broken "$(partway "$(short "$up")")" "${err:-no error text}"
+            else
+                rm -f "$mark"
+                report fail "fast-forward to $(short "$up") failed; left as it was" "${err:-no error text}"
+            fi
+        fi
+    elif gro merge-base --is-ancestor "$up" "$old"; then
+        report held "held: ahead of origin/$def at $(short "$up") by $(gro rev-list --count "$up..$old") local commits; left as it was"
+    else
+        report held "held: diverged from origin/$def at $(short "$up") ($(gro rev-list --count "$up..$old") local, $(gro rev-list --count "$old..$up") new commits); left as it was"
+    fi
+    return 0
+}
+
+main() {
+    local log_set=0 d
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) DRY=1 ;;
+            --log) [ $# -ge 2 ] || { echo "sync-mains: --log needs a file" >&2; exit 2; }
+                   LOG="$2"; log_set=1; shift ;;
+            --log=*) LOG="${1#--log=}"; log_set=1 ;;
+            --home) [ $# -ge 2 ] || { echo "sync-mains: --home needs a folder" >&2; exit 2; }
+                    SWEEP_HOME="$2"; shift ;;
+            --root) [ $# -ge 2 ] || { echo "sync-mains: --root needs a folder" >&2; exit 2; }
+                    SWEEP_ROOT="$2"; shift ;;
+            -h | --help) sed -n '2,/^set -u$/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
+            --) shift; break ;;
+            -*) echo "sync-mains: unknown option $1 (see --help)" >&2; exit 2 ;;
+            *) break ;;
+        esac
+        shift
+    done
+    if [ $# -eq 0 ] && [ -z "$SWEEP_HOME" ]; then
+        echo "sync-mains: give CHECKOUT folders, or --home DIR [--root DIR] (see --help)" >&2; exit 2
+    fi
+    if [ $# -gt 0 ] && [ -n "$SWEEP_HOME$SWEEP_ROOT" ]; then
+        echo "sync-mains: give CHECKOUT folders or --home, not both" >&2; exit 2
+    fi
+    if [ -e "$OFF" ]; then # guard:off
+        [ "$DRY" = 0 ] || echo "sync-mains is off: $(show "$OFF") exists (rm it to resume)"
+        exit 0
+    fi
+    [ "$log_set" = 1 ] || LOG="$STATE_BASE/sync-mains.log"
+    [ "$DRY" = 0 ] || LOG=""
+    command -v git >/dev/null 2>&1 || exit 0
+
+    if [ $# -gt 0 ]; then
+        MODE=target FETCH_TIMEOUT=15 TRIES=2
+        d="${SYNC_MAINS_BUDGET:-25}"
+        case "$d" in "" | *[!0-9]*) d=25 ;; esac
+        DEADLINE=$(( $(date +%s) + d ))
+        for d in "$@"; do sync_one "$d"; done
+        exit 0
+    fi
+
+    MODE=sweep
+    STATE="${LOG:+$LOG.state}"
+    [ -n "$STATE" ] && [ -f "$STATE" ] && STATE_OLD="$(cat "$STATE" 2>/dev/null)"
+    sync_one "$SWEEP_HOME"
+    if [ -n "$SWEEP_ROOT" ]; then
+        for d in "$SWEEP_ROOT"/repos/*/*; do
+            [ -d "$d" ] || continue
+            sync_one "$d"
+        done
+    fi
+    if [ -n "$STATE" ]; then
+        mkdir -p "$(dirname "$STATE")" 2>/dev/null &&
+            printf '%s' "$STATE_NEW" >"$STATE.tmp.$$" 2>/dev/null &&
+            mv -f "$STATE.tmp.$$" "$STATE" 2>/dev/null
+    fi
+    exit 0
+}
+
+# The whole file is read before main runs, so a fast-forward of the checkout
+# this script lives in cannot change it mid-run.
+main "$@"

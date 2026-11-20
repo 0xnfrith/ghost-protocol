@@ -1,0 +1,29 @@
+# The channel socket (gp-key-<name>-channel.socket) of the Ghost Protocol
+# instance @NAME@: its Buzz channel, served by its key service.
+# install/keyservice/setup makes it from install/service/key-channel.socket and
+# installs it in /etc/systemd/system.
+#
+# Each connection starts one gp-key-@NAME@-channel@.service as the key's user,
+# with the connection as its stdin and stdout. The session's side connects
+# through the Buzz adapter's pipe (buzz_key_socket = @RUN@): it holds no key.
+#
+# Only root and the group @AGENT_GROUP@ (the instance's own user's group, which
+# holds no other user) can connect. One channel per instance: while one
+# connection is open, a second is refused, and the pipe retries for a few
+# seconds (a restart of the session meets its old channel still stopping).
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the key service's Buzz channel socket
+
+[Socket]
+ListenStream=@RUN@/channel.sock
+Accept=yes
+MaxConnections=1
+SocketUser=root
+SocketGroup=@AGENT_GROUP@
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

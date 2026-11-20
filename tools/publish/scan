@@ -1,0 +1,407 @@
+#!/usr/bin/env -S python3 -I
+"""scan: looks for what must not be public: internal words, hosts, ids, names, mail domains and stray keys.
+
+  scan [--words FILE]... [--public-only] tree TREEISH [--since TREEISH]
+  scan [--words FILE]... [--public-only] commit REV [--public --allow-email ADDRESS]...
+  scan subject < TEXT
+
+`tree` reads every path and every file of a tree object (not a checkout; a file with a zero byte is also read as UTF-16 and with
+its zero bytes dropped); with --since only what the tree adds or changes
+since the other one. `commit` reads the raw commit object: its headers (tree, parent, author, committer) and its whole message,
+trailers included.
+
+Every text is read twice: as it is, and normalised. The normalised reading has the Unicode default-ignorable characters taken
+out (zero-width spaces and joiners, the soft hyphen, bidi marks, variation selectors, tags and the rest of that class), then is
+folded by NFKC (full-width letters and digits become plain ones), then has the default-ignorables taken out again, and last has
+the dashes made into `-`: every Unicode dash punctuation character (general category Pd: the hyphen, the en and em dash, the wave
+dash, the two- and three-em dash, the Armenian and Hebrew hyphens and the rest; NFKC alone turns U+2011 into U+2010, not `-`), and
+four that look like `-` but are not in that category, U+2212 minus sign, U+02D7 modifier letter minus sign, U+2043 hyphen bullet
+and U+2796 heavy minus sign. So a word split by an invisible character, written in full-width letters, or with a look-alike dash
+for its `-`, is still found. A text that cannot be normalised is a hit (fail closed), never a pass.
+
+The rules:
+  - the public words below, built from pieces so that this file holds none: the same list as install/test/clean-tree.test.sh;
+  - the internal words: every line of each --words file, or of tools/publish/internal/words.txt when none is given (a line is a
+    Python regular expression, matched without regard to case; a line starting with cs: is case-sensitive; # starts a comment).
+    That list is internal-only and is not on the allowlist. With no list the scan stops (exit 2), unless --public-only is given;
+  - a 64-hex string (a stray key), in a tree except where a fixture or a pin has one by design, and in every commit;
+  - an email address in a tree, except an example domain and git@github.com;
+  - a path under evals/, docs/plans/ or the scan's internal folder (what tools/publish/export never exports) in a tree;
+  - with --public, for a commit that is about to be public: every address other than --allow-email ones, any header besides tree,
+    parent, author and committer, a message of more than one line (a body or a trailer), an internal pull request number in the
+    message, and a # before a number at the start of a word. The internal pull request numbers are the merge's own forms: a
+    number after a # alone in brackets, as the merge adds it, `(#123)` (publish cuts the one at the end; any other, as in a
+    revert's subject, is caught here), and a merge subject: `Merge pull request #123`, `Merge pull-request #3`, `Merge PR #3`, in
+    any case. A # before a number at the start of a word (not after a letter, a digit or `_`: "issue #12", "[#12]",
+    "(#12, #13)", but not "C#9") would link to a pull request in the public repository; publish takes such a # out of the
+    subject (see `subject` below), so none should be left. Each is read in both readings, so a full-width # or digit, or one
+    split by an invisible character, is caught; U+266F (the music sharp sign) counts as a #;
+  - in every commit: an `encoding` header other than UTF-8 (the scan does not decode other encodings: such a commit is refused),
+    and bytes that are not UTF-8.
+
+`subject` makes the public subject of a commit from its subject (TEXT, on stdin: one line, or the lines it was joined from):
+it cuts the ` (#123)` the merge adds at the end; refuses (exit 1) a subject that still holds an internal pull request number in
+one of the merge's forms above, or U+266F (the music sharp sign) used as a # (before a number at the start of a word; after a
+letter, as in a chord's name, it stays); then takes out the # of each # before a number at the start of a word ("follow-up
+to #149" becomes "follow-up to 149", "[#12]" becomes "[12]", "(#12, #13)" becomes "(12, 13)"; "C#9" stays), in either reading,
+and prints the rest. It reads no word list.
+
+The output names a rule and a place for each hit, never the text it matched. Exit 0: nothing found. 1: something found. 2: usage.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_WORDS = os.path.join(HERE, "internal", "words.txt")
+
+# The paths tools/publish/export never exports: keep in step with NEVER there (the tests compare them).
+NEVER = ("evals/", "docs/plans/", "tools/publish/internal/", ".git/")
+
+# The public words, in pieces (as in install/test/clean-tree.test.sh).
+PUBLIC_WORDS = [
+    ("public-word-1", re.compile("sect" "ion-9", re.I)),
+    ("public-word-2", re.compile("s9" "t", re.I)),
+    ("public-word-3", re.compile("mega" "tech", re.I)),
+    ("public-word-4", re.compile("bu" "zz:" "//", re.I)),
+    ("public-word-5", re.compile("(^|[^a-z0-9])s" "9-", re.I | re.M)),
+    ("public-word-6", re.compile("GHO" "ST-")),
+]
+HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+# Where a 64-hex string is there by design: the installer's pins, CI's pinned tools, and fixtures.
+HEX64_OK = re.compile(r"^(install/pins\.env|\.github/workflows/.*|install/test/fixtures/.*|install/test/clean-tree\.test\.sh)$")
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+EMAIL_OK = re.compile(r"@example\.(com|org|net)$|^git@github\.com$", re.I)
+MAX_SHOWN = 100
+
+# Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt), all of it: checked code point by code point against Unicode 15.0.
+DEFAULT_IGNORABLE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164"
+    "\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]")
+# The dashes made `-` in the normalised reading (see the docstring): every character of general category Pd but `-` itself, in
+# this Python's Unicode version, and four look-alikes of other categories. NFKC has already made the small and full-width
+# hyphen-minus `-`. Built once, when the scan starts (a tenth of a second or so).
+DASHES = str.maketrans({chr(c): "-" for c in range(0x110000) if c != 0x2D and unicodedata.category(chr(c)) == "Pd"}
+                       | {c: "-" for c in "\u2212\u02d7\u2043\u2796"})
+# What counts as a # in the rules below: # (NFKC makes the full-width and the small one plain) and U+266F, the music sharp sign.
+HASH = "[#\u266f]"
+_NUM = r"(?:%s\s*)+\d+" % HASH
+# An internal pull request number in a public commit's message (see the docstring): the merge's own forms, a number after a #
+# alone in brackets and a merge subject. \d is any digit, as NFKC leaves some (Arabic-Indic ones) as they are; the normalised reading
+# makes full-width brackets, # and digits plain. A list or square brackets ("(#12, #13)", "[#12]") are not this: they are plain
+# references, which publish rewrites (strip_hash_refs) and HASH_REF backstops.
+PR_NUMBER = re.compile(
+    r"\(\s*{n}\s*\)"
+    r"|\bmerge[sd]?\s+(?:pull[\s_-]*requests?|prs?)\s*{n}".format(n=_NUM), re.I)
+# A # before a number at the start of a word: it would link in the public repository.
+HASH_REF = re.compile(r"(?<!\w)%s\d" % HASH)
+# U+266F used as a # (before a number at the start of a word): publish refuses it rather than rewrite it. NFKC leaves it as it is.
+SHARP_REF = re.compile(r"(?<!\w)\u266f\d")
+# The number the merge adds at the end of a subject, as it adds it (ASCII), which publish cuts.
+END_NUMBER = re.compile(r"^(.*\S)\s*\(#[0-9]+\)\s*$", re.A | re.S)
+UTF8_NAMES = ("utf-8", "utf8")
+
+
+def normalised(text):
+    """The normalised reading of a text: default-ignorables out, NFKC, default-ignorables out again (NFKC can make one, as the
+    half-width Hangul filler becomes the Hangul jungseong filler), then the look-alike dashes made `-`. Raises ValueError when it
+    cannot be made."""
+    try:
+        t = DEFAULT_IGNORABLE.sub("", text)
+        t = unicodedata.normalize("NFKC", t)
+        return DEFAULT_IGNORABLE.sub("", t).translate(DASHES)
+    except Exception as e:  # noqa: BLE001 - whatever it is, the text is not passed
+        raise ValueError(type(e).__name__) from None
+
+
+def readings(text):
+    """The readings to scan (the text, and its normalised form when that differs), and False when it cannot be normalised (the
+    caller makes that a hit)."""
+    try:
+        n = normalised(text)
+    except ValueError:
+        return [text], False
+    return ([text] if n == text else [text, n]), True
+
+
+def git(*args, check=True):
+    p = subprocess.run(("git",) + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and p.returncode != 0:
+        usage_error("git %s failed: %s" % (args[0], p.stderr.decode("utf-8", "replace").strip()))
+    return p.stdout
+
+
+def usage_error(msg):
+    sys.stderr.write("scan: %s\n" % msg)
+    sys.exit(2)
+
+
+def load_words(files):
+    rules = []
+    for f in files:
+        try:
+            lines = open(f, encoding="utf-8").read().splitlines()
+        except OSError as e:
+            usage_error("cannot read the word list %s: %s" % (os.path.basename(f), e.strerror))
+        for n, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            flags = re.I | re.M
+            if line.startswith("cs:"):
+                line, flags = line[3:], re.M
+            try:
+                rules.append(("internal-word:%s:%d" % (os.path.basename(f), n), re.compile(line, flags)))
+            except re.error as e:
+                usage_error("%s line %d is not a regular expression (%s)" % (os.path.basename(f), n, e))
+    if not rules:
+        usage_error("the word list is empty")
+    return rules
+
+
+class Hits:
+    def __init__(self):
+        self.items = []
+
+    def add(self, where, rule):
+        self.items.append("%s: %s" % (where, rule))
+
+    def report(self):
+        seen = []
+        for i in self.items:
+            if i not in seen:
+                seen.append(i)
+        for i in seen[:MAX_SHOWN]:
+            print(i)
+        if len(seen) > MAX_SHOWN:
+            print("... and %d more" % (len(seen) - MAX_SHOWN))
+        return 1 if seen else 0
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def scan_text(hits, where_of, text, rules, path=None, emails="tree", allow=()):
+    """where_of(line) names a place. emails: 'tree' (example domains only), 'public' (only `allow`), or None. The text is read as it
+    is and normalised (see normalised); the two readings have the same lines, so a place is the same in both."""
+    texts, ok = readings(text)
+    if not ok:
+        hits.add(where_of(1), "text the scan cannot normalise")
+    for t in texts:
+        scan_one(hits, where_of, t, rules, path, emails, allow)
+
+
+def scan_one(hits, where_of, text, rules, path, emails, allow):
+    for name, rx in rules:
+        for m in rx.finditer(text):
+            hits.add(where_of(line_of(text, m.start())), name)
+    for m in HEX64.finditer(text):
+        if path is None or not HEX64_OK.match(path):
+            hits.add(where_of(line_of(text, m.start())), "hex64 (a stray key)")
+    if emails:
+        for m in EMAIL.finditer(text):
+            a = m.group(0)
+            ok = (a.lower() in allow) if emails == "public" else bool(EMAIL_OK.search(a))
+            if not ok:
+                hits.add(where_of(line_of(text, m.start())), "email address")
+
+
+def ls_tree(treeish):
+    out = git("ls-tree", "-r", "-z", "--full-tree", treeish)
+    entries = {}
+    for rec in out.split(b"\0"):
+        if not rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        mode, typ, sha = meta.decode().split()
+        entries[path.decode("utf-8", "surrogateescape")] = (mode, typ, sha)
+    return entries
+
+
+def texts_of(data):
+    """The readings of a file's bytes to scan. A file with a zero byte is not skipped: UTF-16 text and binary metadata carry words
+    too, so it is read as UTF-16 (both byte orders), with its zero bytes dropped, and as it is."""
+    texts = [data.decode("utf-8", "replace")]
+    if b"\0" in data:
+        for enc in ("utf-16-le", "utf-16-be"):
+            texts.append(data[: len(data) // 2 * 2].decode(enc, "replace"))
+        texts.append(data.replace(b"\0", b"").decode("utf-8", "replace"))
+    return texts
+
+
+def scan_tree(args, rules):
+    cur = ls_tree(args.treeish)
+    base = ls_tree(args.since) if args.since else {}
+    todo = sorted(p for p, e in cur.items() if base.get(p) != e)
+    hits = Hits()
+    blobs = []
+    for p in todo:
+        mode, typ, sha = cur[p]
+        name = p.encode("utf-8", "replace").decode("utf-8", "replace")
+        for n in NEVER:
+            if name.startswith(n):
+                hits.add(n, "never-public path")
+        # A path that matches is named by its file's id, not its name: the name would carry the word into the log.
+        before = len(hits.items)
+        scan_text(hits, lambda _l, s=sha: "path of the file %s" % s[:12], name, rules, emails=None)
+        named_by_id = len(hits.items) > before
+        if typ == "commit":
+            hits.add(name, "a submodule")
+        elif typ == "blob":
+            blobs.append((name, sha, named_by_id))
+    # Read the blobs in one batch.
+    if blobs:
+        p = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        out, _ = p.communicate("".join(s + "\n" for _, s, _n in blobs).encode())
+        pos = 0
+        for name, sha, named_by_id in blobs:
+            nl = out.index(b"\n", pos)
+            head = out[pos:nl].split()
+            if len(head) != 3:
+                usage_error("git could not read a file of the tree")
+            size = int(head[2])
+            data = out[nl + 1:nl + 1 + size]
+            pos = nl + 1 + size + 1
+            # A file whose path holds a word is named by its id here too, as above.
+            label = ("file %s" % sha[:12]) if named_by_id else name
+            for text in texts_of(data):
+                scan_text(hits, lambda l, n=label: "%s:%d" % (n, l), text, rules, path=name)
+    return hits.report()
+
+
+def scan_commit(args, rules):
+    data = git("cat-file", "commit", args.rev)
+    short = git("rev-parse", "--short", args.rev + "^{commit}").decode().strip()
+    hits = Hits()
+    try:
+        raw = data.decode("utf-8")
+    except UnicodeDecodeError:
+        hits.add("commit %s" % short, "a commit that is not UTF-8")
+        raw = data.decode("utf-8", "replace")
+    head, _, message = raw.partition("\n\n")
+    allow = tuple(a.lower() for a in args.allow_email)
+    mode = "public" if args.public else None
+    for line in head.split("\n"):
+        field = line.split(" ", 1)[0]
+        if line.startswith(" "):
+            field = "header continuation"
+        if args.public and field not in ("tree", "parent", "author", "committer"):
+            hits.add("commit %s %s" % (short, field), "a header that a public commit does not have")
+        if field == "encoding" and line[len("encoding "):].lower() not in UTF8_NAMES:
+            hits.add("commit %s encoding" % short, "an encoding other than UTF-8 (not decoded: refused)")
+        scan_text(hits, lambda _l, f=field: "commit %s %s" % (short, f), line, rules, emails=mode, allow=allow)
+    scan_text(hits, lambda l: "commit %s message:%d" % (short, l), message, rules, emails=mode, allow=allow)
+    if args.public and len(message.strip("\n").split("\n")) != 1:
+        hits.add("commit %s message" % short, "a body or a trailer in a public commit")
+    if args.public:
+        for t in readings(message)[0]:
+            for m in PR_NUMBER.finditer(t):
+                hits.add("commit %s message:%d" % (short, line_of(t, m.start())), "an internal pull request number in a public commit")
+            for m in HASH_REF.finditer(t):
+                hits.add("commit %s message:%d" % (short, line_of(t, m.start())), "a # before a number in a public commit (it would link)")
+    return hits.report()
+
+
+def _fold(c):
+    """One character's normalised reading ('' for a default-ignorable)."""
+    try:
+        return normalised(c)
+    except ValueError:
+        return c
+
+
+def _is_word(c):
+    return bool(re.match(r"\w", c))
+
+
+def strip_hash_refs(text):
+    """The text with the # taken out of each # before a number at the start of a word, as HASH_REF reads it in either reading: a
+    # (or a character that NFKC makes one; U+266F is refused before this) whose next character, skipping default-ignorables, is
+    a digit, and whose character before is not a letter, a digit or `_`, as it is or normalised. Again until none is left (`##12`
+    becomes `12`)."""
+    while True:
+        chars = list(text)
+        folds = [_fold(c) for c in chars]
+        out = []
+        for i, c in enumerate(chars):
+            if folds[i] == "#":
+                j = i + 1
+                while j < len(chars) and folds[j] == "":
+                    j += 1
+                digit = (i + 1 < len(chars) and re.match(r"\d", chars[i + 1])) or (j < len(chars) and re.match(r"\d", folds[j]))
+                k = i - 1
+                while k >= 0 and folds[k] == "":
+                    k -= 1
+                initial = i == 0 or not _is_word(chars[i - 1]) or k < 0 or not _is_word(folds[k][-1])
+                if digit and initial:
+                    continue
+            out.append(c)
+        if len(out) == len(chars):
+            return text
+        text = "".join(out)
+
+
+def public_subject(text):
+    """The public subject of a commit's subject (see the docstring), or None when it is refused."""
+    m = END_NUMBER.match(text)
+    if m:
+        text = m.group(1)
+    if refused(text):
+        return None
+    text = strip_hash_refs(text)
+    # Taking a # out can bring a U+266F next to its number ("\u266f#1"): checked again on what is left.
+    return None if refused(text) else text
+
+
+def refused(text):
+    """Whether a subject is refused (see public_subject): it cannot be normalised, or in either reading it holds an internal pull
+    request number or U+266F used as a #."""
+    texts, ok = readings(text)
+    return not ok or any(PR_NUMBER.search(t) or SHARP_REF.search(t) for t in texts)
+
+
+def subject_main():
+    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+    s = public_subject(text)
+    if s is None:
+        sys.stderr.write("scan: the subject holds an internal pull request number (or U+266F used as a #)\n")
+        sys.exit(1)
+    sys.stdout.buffer.write(s.encode("utf-8", "surrogateescape"))
+    sys.exit(0)
+
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS: an option given before the subcommand must survive the subcommand's own parse.
+    common.add_argument("--words", action="append", default=argparse.SUPPRESS, metavar="FILE")
+    common.add_argument("--public-only", action="store_true", default=argparse.SUPPRESS)
+    ap = argparse.ArgumentParser(prog="scan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+    sub = ap.add_subparsers(dest="what", required=True)
+    t = sub.add_parser("tree", parents=[common])
+    t.add_argument("treeish")
+    t.add_argument("--since")
+    c = sub.add_parser("commit", parents=[common])
+    c.add_argument("rev")
+    c.add_argument("--public", action="store_true")
+    c.add_argument("--allow-email", action="append", default=[], metavar="ADDRESS")
+    sub.add_parser("subject")
+    args = ap.parse_args()
+    if args.what == "subject":
+        subject_main()
+    args.words = getattr(args, "words", [])
+    args.public_only = getattr(args, "public_only", False)
+    if args.public_only and args.words:
+        usage_error("--public-only and --words do not go together")
+    words = args.words or ([DEFAULT_WORDS] if not args.public_only else [])
+    if not args.public_only and not args.words and not os.path.exists(DEFAULT_WORDS):
+        usage_error("no internal word list (tools/publish/internal/words.txt); nothing is scanned without one")
+    rules = list(PUBLIC_WORDS) + (load_words(words) if words else [])
+    sys.exit(scan_tree(args, rules) if args.what == "tree" else scan_commit(args, rules))
+
+
+if __name__ == "__main__":
+    main()

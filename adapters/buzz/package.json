@@ -1,0 +1,20 @@
+{
+  "name": "ghost-protocol-buzz",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Ghost Protocol's Buzz adapter: a Claude Code channel that pushes Buzz mentions into a running session, with reconnect, catch-up and dedupe.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "nostr-tools": "2.25.2"
+  },
+  "devDependencies": {
+    "ws": "8.22.0"
+  }
+}

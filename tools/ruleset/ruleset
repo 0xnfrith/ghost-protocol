@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# ruleset: one branch ruleset for a GitHub repo, built from a list of
+# required checks.
+#
+# Usage:
+#   tools/ruleset/ruleset --repo <owner>/<name> [--branch <branch>] [--checks <file>] [--name <name>]           dry run (the default)
+#   tools/ruleset/ruleset --repo <owner>/<name> [--branch <branch>] [--checks <file>] [--name <name>] --apply   create or update it
+#   ... [--allow-unreported]   go ahead although a listed check has not reported on <branch>
+#
+# The ruleset covers refs/heads/<branch> (default: the repo's default branch)
+# and is named <name> (default: "Protect <branch>"):
+#   - a change lands only through a pull request, merged by squash. It needs
+#     no approval, except that a change to a path in the repo's CODEOWNERS
+#     file needs a code owner's; a new push dismisses an earlier approval.
+#     GitHub's extra approval for a pull request that Copilot opens under its
+#     own identity stays on, as GitHub sets it by default (it adds an approval
+#     only where at least one is required, so here it adds none);
+#   - every check in <file> must pass, each reported by the app named there.
+#     The pull request need not be up to date with <branch> first (not strict:
+#     with no merge queue, strict sends every open pull request back for an
+#     update after each merge);
+#   - no force-push and no deletion of <branch>;
+#   - no bypass: nobody, admins included, can skip it.
+# Nothing else changes: GitHub's auto-merge switch stays as it is.
+#
+# <file> (default: .github/required-checks in the checkout this script is in,
+# so give --checks for any other repo) holds one check per line,
+# "<app id> <check name>"; a line starting with # is a comment. 15368 is
+# GitHub Actions.
+#
+# A dry run reads the repo and its rulesets, prints the exact request (the gh
+# command and the JSON body) and sends nothing. --apply sends it: it creates
+# the ruleset, or updates the one with the same name, then reads it back and
+# compares, and reads the rules GitHub enforces on <branch> to prove each of
+# its rules is in force (a private repo on a free plan stores a ruleset but
+# does not enforce it). When that ruleset already says the same, it sends
+# nothing, so a second run changes nothing. The comparison covers every
+# setting of every rule, so one this script does not set (another merge
+# method, required reviewers, a setting GitHub adds later) counts as a
+# difference. A dry run and --apply name each setting that differs.
+#
+# A required check that never reports blocks every pull request, so both
+# refuse when a listed check has not reported on <branch>'s latest commit
+# (from the app named), or when those checks cannot be read. Wait until the
+# change that adds the check has merged; --allow-unreported is for a check
+# that runs only on pull requests.
+#
+# It needs jq and gh, signed in as an admin of the repo. A GitHub App or
+# integration token reports no admin rights on the repo, so it is refused.
+#
+# Exit codes: 0 ok (for a dry run: --apply would go ahead), 1 refused or
+# failed, 2 usage.
+set -uo pipefail
+
+SELF_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+GP_DIR="$(CDPATH='' cd -- "$SELF_DIR/../.." && pwd -P)"
+
+usage_error() { echo "ruleset: $*" >&2; echo "Try: tools/ruleset/ruleset --help" >&2; exit 2; }
+fail() { echo "ruleset: $*" >&2; exit 1; }
+
+REPO="" BRANCH="" CHECKS="$GP_DIR/.github/required-checks" NAME="" APPLY=0 ALLOW_UNREPORTED=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo)    [ $# -ge 2 ] || usage_error "--repo needs a value"; REPO="$2"; shift 2 ;;
+        --branch)  [ $# -ge 2 ] || usage_error "--branch needs a value"; BRANCH="$2"; shift 2 ;;
+        --checks)  [ $# -ge 2 ] || usage_error "--checks needs a value"; CHECKS="$2"; shift 2 ;;
+        --name)    [ $# -ge 2 ] || usage_error "--name needs a value"; NAME="$2"; shift 2 ;;
+        --apply)   APPLY=1; shift ;;
+        --allow-unreported) ALLOW_UNREPORTED=1; shift ;;
+        -h|--help) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)         usage_error "unknown option: $1" ;;
+    esac
+done
+# Names are checked character by character: only A-Z, a-z, 0-9, ".", "_",
+# "-" and "/"; no "..", no "//", no "/" at either end. (A pattern match on
+# the whole value, so a newline cannot hide a second line.)
+bad_repo() {
+    case "$1" in
+        */*/*|/*|*/|*..*|*[!A-Za-z0-9._/-]*) return 0 ;; # guard:reponame
+        ?*/?*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+bad_branch() {
+    case "$1" in
+        ''|/*|*/|*//*|*..*|*[!A-Za-z0-9._/-]*) return 0 ;; # guard:branchname
+        *) return 1 ;;
+    esac
+}
+[ -n "$REPO" ] || usage_error "--repo <owner>/<name> is needed"
+if bad_repo "$REPO"; then usage_error "not an <owner>/<name>: $REPO"; fi
+if [ -n "$BRANCH" ] && bad_branch "$BRANCH"; then usage_error "not a branch name: $BRANCH"; fi
+
+command -v jq >/dev/null 2>&1 || fail "jq is not installed (https://jqlang.org)"
+command -v gh >/dev/null 2>&1 || fail "gh is not installed (https://cli.github.com)"
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/ruleset.XXXXXX")" || fail "cannot make a temporary folder"
+trap 'rm -rf "$TMP"' EXIT
+
+# The first line of what gh said on stderr, for an error message.
+gh_said() { head -n 1 "$TMP/err" 2>/dev/null; }
+
+# --- the checks: "<app id> <check name>" per line, each name once
+[ -f "$CHECKS" ] || fail "no checks file: $CHECKS"
+TAB="$(printf '\t')"
+: >"$TMP/checks.tsv"
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    id="${line%% *}" ctx="${line#* }"
+    case "$id" in ''|*[!0-9]*) fail "$CHECKS line $n: expected \"<app id> <check name>\"" ;; esac
+    if [ "$ctx" = "$line" ] || [ -z "$ctx" ]; then fail "$CHECKS line $n: expected \"<app id> <check name>\""; fi
+    case "$ctx" in ' '*|*' '|*"$TAB"*|*"$(printf '\r')"*) fail "$CHECKS line $n: a stray space, tab or carriage return in the check name" ;; esac
+    if cut -f2- "$TMP/checks.tsv" | grep -qxF -- "$ctx"; then fail "$CHECKS line $n: \"$ctx\" is listed twice"; fi # guard:dupcheck
+    printf '%s\t%s\n' "$id" "$ctx" >>"$TMP/checks.tsv"
+done <"$CHECKS"
+[ -s "$TMP/checks.tsv" ] || fail "$CHECKS lists no checks"
+NCHECKS="$(wc -l <"$TMP/checks.tsv" | tr -d ' ')"
+
+# --- the repo: its default branch, and whether this account is an admin
+gh api "repos/$REPO" >"$TMP/repo.json" 2>"$TMP/err" || fail "cannot read $REPO with gh: $(gh_said)"
+[ -n "$BRANCH" ] || BRANCH="$(jq -r '.default_branch // empty' "$TMP/repo.json")"
+[ -n "$BRANCH" ] || fail "cannot tell $REPO's default branch; give --branch"
+if bad_branch "$BRANCH"; then fail "$REPO's default branch has a name this script does not take: $BRANCH"; fi
+[ -n "$NAME" ] || NAME="Protect $BRANCH"
+ADMIN="$(jq -r 'if .permissions.admin == true then "yes" else "no" end' "$TMP/repo.json")"
+
+# --- the ruleset this run wants
+jq -n --arg name "$NAME" --arg ref "refs/heads/$BRANCH" --rawfile checks "$TMP/checks.tsv" '{
+  name: $name,
+  target: "branch",
+  enforcement: "active",
+  bypass_actors: [],
+  conditions: { ref_name: { include: [$ref], exclude: [] } },
+  rules: [
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    { type: "pull_request", parameters: {
+        required_approving_review_count: 0,
+        require_code_owner_review: true,
+        dismiss_stale_reviews_on_push: true,
+        require_last_push_approval: false,
+        required_review_thread_resolution: false,
+        require_extra_approval_for_unattributed_changes: true,
+        allowed_merge_methods: ["squash"] } },
+    { type: "required_status_checks", parameters: {
+        strict_required_status_checks_policy: false,
+        required_status_checks: [ $checks | split("\n")[] | select(length > 0) | split("\t")
+          | { context: (.[1:] | join("\t")), integration_id: (.[0] | tonumber) } ] } }
+  ]
+}' >"$TMP/body.json" || fail "cannot build the request body"
+
+# What a ruleset says, for comparing. Left out: what GitHub adds (ids, links,
+# times, its source) and the parameters it fills in, while they hold the
+# value it fills in (DEFAULTS). Everything else is compared, so a rule with a
+# setting this script does not set never matches. A ruleset read without its
+# bypass list (by a login that is not an admin) never matches either.
+DEFAULTS='{ "pull_request": { "automatic_copilot_code_review_enabled": false, "required_reviewers": [] },
+            "required_status_checks": { "do_not_enforce_on_create": false } }'
+# shellcheck disable=SC2016  # a jq program: its $names are jq's own
+NORM='def drop_defaults($d):
+  reduce ($d | to_entries[]) as $e (.; if has($e.key) and .[$e.key] == $e.value then del(.[$e.key]) else . end);
+def norm($defaults):
+  { name: .name,
+    target: .target,
+    enforcement: .enforcement,
+    bypass_actors: (if has("bypass_actors") then (.bypass_actors | sort_by(.actor_type, .actor_id)) else "unknown" end),
+    conditions: ((.conditions // {}) | .ref_name |= { include: ((.include // []) | sort), exclude: ((.exclude // []) | sort) }),
+    rules: ((.rules // []) | map(.type as $t | { type: $t, parameters: ((.parameters // {})
+      | drop_defaults($defaults[$t] // {})
+      | if has("allowed_merge_methods") then .allowed_merge_methods |= sort else . end
+      | if has("required_status_checks") then .required_status_checks |= sort_by(.context, .integration_id) else . end) })
+      | sort_by(.type)) };'
+# Where two normalized rulesets differ: one line per setting, a rule named by
+# its type ("rules.pull_request.<setting>") and a list taken as one setting.
+# A setting one side does not have is "nothing", so one that GitHub adds and
+# this script does not send shows up as its own line.
+# shellcheck disable=SC2016  # a jq program: its $names are jq's own
+DIFF='def keyed: .rules |= (map({ key: .type, value: .parameters }) | from_entries);
+def leaves: if type == "object" and length > 0 then (keys[] as $k | (.[$k] | leaves) as $p | [$k] + $p) else [] end;
+def at($p): try (getpath($p[:-1]) | if type == "object" and has($p[-1]) then [.[$p[-1]]] else [] end) catch [];
+def shown: if length == 0 then "nothing" else (.[0] | tojson) end;
+def diffs($a; $b): ($a | keyed) as $x | ($b | keyed) as $y
+  | ([$x | leaves] + [$y | leaves] | unique)[] as $p
+  | ($x | at($p)) as $u | ($y | at($p)) as $v
+  | select($u != $v)
+  | "  differs at \($p | join(".")): this script sends \($u | shown), GitHub has \($v | shown)";'
+same_as_body() { # file: yes when it says what the body says
+    jq -rn --slurpfile a "$TMP/body.json" --slurpfile b "$1" --argjson d "$DEFAULTS" \
+        "$NORM"' if ($a[0] | norm($d)) == ($b[0] | norm($d)) then "yes" else "no" end'
+}
+# Each setting where a stored ruleset differs from the body.
+show_diff() { # file
+    jq -rn --slurpfile a "$TMP/body.json" --slurpfile b "$1" --argjson d "$DEFAULTS" \
+        "$NORM$DIFF"' diffs($a[0] | norm($d); $b[0] | norm($d))'
+}
+# The two sides of a mismatch, for the error message: what differs, then both whole.
+show_both() { # file
+    show_diff "$1" >&2
+    jq -rn --slurpfile a "$TMP/body.json" --slurpfile b "$1" --argjson d "$DEFAULTS" \
+        "$NORM"' "  sent:   \($a[0] | norm($d))", "  stored: \($b[0] | norm($d))"' >&2
+}
+# Every rule of the body is in force on the branch, from ruleset <id>.
+enforced() { # id
+    gh api --paginate "repos/$REPO/rules/branches/$BRANCH?per_page=100" >"$TMP/active.json" 2>"$TMP/err" \
+        || fail "cannot read the rules in force on $BRANCH: $(gh_said)"
+    missing="$(jq -rn --slurpfile b "$TMP/body.json" --slurpfile a "$TMP/active.json" --argjson id "$1" \
+        '[ $b[0].rules[].type | select(. as $t | any($a[][]; .ruleset_id == $id and .type == $t) | not) ] | join(", ")')" \
+        || fail "cannot read the rules in force on $BRANCH"
+    [ -z "$missing" ] || fail "ruleset $1 is stored, but GitHub does not enforce it on $BRANCH (not in force: $missing). On a private repo a ruleset is enforced only on a paid plan (GitHub Pro, Team or Enterprise). Look at https://github.com/$REPO/rules/$1" # guard:enforced
+}
+
+# --- the rulesets the repo has now: one with this name is updated
+gh api --paginate "repos/$REPO/rulesets?includes_parents=false" >"$TMP/list.json" 2>"$TMP/err" \
+    || fail "cannot list $REPO's rulesets: $(gh_said)"
+jq -r -s --arg name "$NAME" '[ .[] | arrays | .[] | select(.name == $name) | .id ] | .[] | tostring' \
+    "$TMP/list.json" >"$TMP/ids" || fail "cannot read $REPO's list of rulesets"
+ID="" SAME=no STATE="" DIFFERS=no
+case "$(wc -l <"$TMP/ids" | tr -d ' ')" in
+    0) STATE="$REPO has no ruleset named \"$NAME\": --apply creates it" ;;
+    1) ID="$(cat "$TMP/ids")"
+       gh api "repos/$REPO/rulesets/$ID" >"$TMP/current.json" 2>"$TMP/err" || fail "cannot read ruleset $ID: $(gh_said)"
+       SAME="$(same_as_body "$TMP/current.json")"
+       if [ "$SAME" = yes ]; then STATE="ruleset $ID (\"$NAME\") already says this: --apply sends nothing"
+       elif ! jq -e 'has("bypass_actors")' "$TMP/current.json" >/dev/null 2>&1; then
+           STATE="ruleset $ID (\"$NAME\") exists, but this login cannot read its bypass list, so whether it matches is not known: --apply, by an admin, compares it"
+       else STATE="ruleset $ID (\"$NAME\") says something else: --apply replaces it"; DIFFERS=yes; fi ;;
+    *) fail "$REPO has more than one ruleset named \"$NAME\" (ids $(tr '\n' ' ' <"$TMP/ids")); delete the extra ones, or give --name" ;; # guard:twins
+esac
+
+if [ -z "$ID" ]; then CALL=(gh api --method POST "repos/$REPO/rulesets" --input -)
+else CALL=(gh api --method PUT "repos/$REPO/rulesets/$ID" --input -); fi
+
+echo "ruleset \"$NAME\" for $REPO, branch $BRANCH"
+echo "  checks: $NCHECKS, from $CHECKS"
+echo "  now:    $STATE"
+if [ "$DIFFERS" = yes ]; then show_diff "$TMP/current.json"; fi
+echo
+echo "The request:"
+printf '%s' "${CALL[*]}"
+echo " <<'JSON'"
+jq . "$TMP/body.json"
+echo "JSON"
+echo
+
+# --- checks that have not reported on the branch's latest commit
+UNREPORTED=no
+if gh api --paginate "repos/$REPO/commits/$BRANCH/check-runs?per_page=100" >"$TMP/runs.json" 2>"$TMP/err" \
+    && jq -r -s '.[] | (.check_runs // [])[] | "\(.app.id)\t\(.name)"' "$TMP/runs.json" >"$TMP/seen" 2>"$TMP/err"; then
+    # An empty pattern file matches every line in some greps, so none is used.
+    # grep exits 1 when every check has reported, and above 1 on an error.
+    if [ -s "$TMP/seen" ]; then
+        grep -vxF -f "$TMP/seen" "$TMP/checks.tsv" >"$TMP/unseen"; rc=$?
+        [ "$rc" -le 1 ] || fail "cannot compare the listed checks with the reported ones (grep exit $rc)" # guard:greprc
+    else cp "$TMP/checks.tsv" "$TMP/unseen"; fi
+    unseen="$(cut -f2- "$TMP/unseen" | sed 's/^/        /')"
+    if [ -n "$unseen" ]; then
+        UNREPORTED=yes
+        echo "NOTE  not reported on $BRANCH's latest commit (by the app $CHECKS names):"
+        echo "$unseen"
+        echo "      A required check that never reports blocks every pull request. If the change"
+        echo "      that adds these is still open, apply after it merges."
+        echo
+    fi
+else
+    UNREPORTED=yes
+    echo "NOTE  cannot read the checks on $BRANCH's latest commit: $(gh_said)"
+    echo
+fi
+
+# --- only an admin may change rulesets: refused before anything is sent
+if [ "$ADMIN" != yes ]; then
+    who="$(gh api user 2>/dev/null | jq -r '.login // empty' 2>/dev/null || true)"
+    if [ -n "$who" ]; then who="($who) "; fi
+    fail "refused: the account gh is signed in as ${who}is not an admin of $REPO (GitHub reports permissions.admin as not true), and only an admin can change its rulesets. A GitHub App or integration token never reports admin here; run this with the gh login of a person who is an admin of $REPO (gh auth login)." # guard:admin
+fi
+
+if [ "$UNREPORTED" = yes ] && [ "$ALLOW_UNREPORTED" -ne 1 ]; then fail "refused: a listed check has not reported on $BRANCH (the NOTE above). Apply once it has; --allow-unreported goes ahead anyway."; fi # guard:unreported
+
+[ "$APPLY" -eq 1 ] || { echo "Dry run: nothing was sent. --apply sends it."; exit 0; } # guard:dryrun
+if [ "$SAME" = yes ]; then enforced "$ID"; echo "OK  ruleset $ID already says this, and is in force; nothing was sent."; exit 0; fi # guard:nochange
+
+"${CALL[@]}" <"$TMP/body.json" >"$TMP/resp.json" 2>"$TMP/err" || fail "GitHub did not take the ruleset: $(gh_said)"
+NEW_ID="$(jq -r '.id // empty' "$TMP/resp.json")"
+[ -n "$NEW_ID" ] || fail "GitHub's answer names no ruleset id"
+gh api "repos/$REPO/rulesets/$NEW_ID" >"$TMP/stored.json" 2>"$TMP/err" || fail "cannot read ruleset $NEW_ID back: $(gh_said)"
+if [ "$(same_as_body "$TMP/stored.json")" != yes ]; then show_both "$TMP/stored.json"; fail "ruleset $NEW_ID was sent, but GitHub stored something else (above); look at https://github.com/$REPO/rules/$NEW_ID"; fi # guard:readback
+enforced "$NEW_ID"
+if [ -z "$ID" ]; then echo "OK  created ruleset $NEW_ID, in force on $BRANCH: https://github.com/$REPO/rules/$NEW_ID"
+else echo "OK  updated ruleset $NEW_ID, in force on $BRANCH: https://github.com/$REPO/rules/$NEW_ID"; fi

@@ -1,0 +1,1318 @@
+#!/bin/bash
+# backup: the memory backup, for one instance. It keeps a copy of the
+# instance's Claude Code memory folder (its auto-memory: MEMORY.md and every
+# note beside it) in git, on a branch of the instance's own repo that holds
+# nothing else, memory/<instance>, and proves that the copy restores.
+#
+#   backup run [--dry-run]    one backup: commit the folder when it changed,
+#                             then push the branch (what the timer and the
+#                             path unit run)
+#   backup run --accept-removals
+#                             one backup that takes on the removals held back
+#                             (below), once: the notes that were reported,
+#                             and no other
+#   backup run --adopt-remote one backup that takes the remote branch's history
+#                             on as this machine's own (a rebuilt machine, the
+#                             one this one replaces, or a branch that moved
+#                             apart from this one's), once; commits made here
+#                             that it does not hold are kept under
+#                             refs/dropped/
+#   backup verify             the proof: back up, then fetch the branch from
+#                             the remote into a fresh repo, check its tip is the
+#                             last commit made here, restore it into a temporary
+#                             folder and compare that with the live folder, byte
+#                             for byte (what the verify timer runs)
+#   backup restore [--at <commit>] [--into <folder>]
+#                             fetch the branch from the remote, check the commit
+#                             (default: the branch's tip) out into a new folder
+#                             (default: a new temporary one), and list how it
+#                             differs from the live folder, by name. It never
+#                             writes the live folder: copy a note back by hand.
+#                             Every fetch is checked by git (fsckObjects), and
+#                             every entry before anything is written: regular
+#                             files only (never a symlink), no .. or bad name,
+#                             no path twice; each folder is made one part at a
+#                             time, never through a link, so nothing lands
+#                             outside the new folder.
+#
+# Installed by install/memory-backup/setup (or the installer's step 14) into a
+# root-owned folder, /usr/local/lib/ghost-protocol/<name>/memory-backup/, with
+# its settings file beside it (settings, root-owned; the manifest's
+# [memory_backup], install/schema/instance-v1.md). It reads its settings from
+# there and nowhere else, so nothing in the session's environment or in the
+# instance's own files can point it at another folder or another remote.
+#
+# What a run does:
+#   - It reads the folder as it is: every regular text file, in every
+#     subfolder, MEMORY.md included, its bytes as they are. Nothing in the
+#     folder can change that: no .gitignore or .gitattributes is read, and no
+#     filter or line-ending conversion runs. Empty folders are not kept. Left
+#     out, and reported (one alert, by name): symlinks (a memory folder needs
+#     none), other file types (a socket, a pipe), names git cannot store (a
+#     .git segment), a file over the size cap (MAX_FILE_KB, 1024 by default),
+#     and a file that is not text (binary or compressed, UTF-32, or text that
+#     still holds a NUL once decoded: the scan could not read it). A verify
+#     fails while any of them is there.
+#   - A missing folder is reported. A run that would leave the backup empty (a
+#     first run of an empty folder too) is held and never committed. When a
+#     run would remove more than MAX_REMOVED_PERCENT of the notes (30 by
+#     default), only the removals are held back and reported: the removed
+#     notes stay on the branch as they were, and the rest of the folder goes
+#     in. A note held back stays held while it is gone, whatever its share
+#     later; removals beyond the held ones are judged by the share rule and
+#     join them when held. run --accept-removals takes on the notes held back,
+#     and no other.
+#   - The folder lands under memory/ in the branch's tree, never at its top, so
+#     a file the folder holds can never be read as the repo's own (a workflow in
+#     .github/, say). The branch shares no history with main, opens no pull
+#     request, and its tree holds no workflow, so a push starts none.
+#   - It commits only when the folder differs from the branch's last commit.
+#   - Before each commit, it scans the files that are new or changed for secrets
+#     (the list in SECRET_RULES below: private key blocks and token shapes; a
+#     UTF-16 file is decoded first), every file and folder name, and the commit
+#     message. On a hit it commits nothing at all and pushes nothing; the alert
+#     names the file, the line and the rule, never the text. Every name an
+#     alert, the log or a listing shows is scanned first, and one that holds a
+#     secret shape is shown as a placeholder. It refuses again on every run
+#     until the hit is gone.
+#   - It pushes the commit by its id, without --force and with no + in the
+#     refspec, so the remote refuses anything but a fast-forward; it never
+#     resets, rebases or deletes the remote's branch. The local branch moves
+#     only once the push went through, or when the remote can't be reached
+#     (the commit then waits here). Every commit made here is recorded
+#     (STATE/made): a remote branch with a commit this machine did not make
+#     (another writer, the machine this one replaces) is reported and left as
+#     it is until run --adopt-remote. When the remote refuses a push for what
+#     it holds (a size rule, its own secret scan), the local branch goes back
+#     to the remote's tip and the folder is committed afresh; commits that
+#     waited here and leave the branch so (or with --adopt-remote) are kept
+#     under refs/dropped/<UTC time> in the state repo, never pushed, and
+#     reported once with their count and the ref.
+#   - A write that lands during a run is backed up by the same run.
+#   - Its own git repo is in the state folder (repo.git), bare. Its config is
+#     rewritten on every run, and git runs with no user or system config, no
+#     hooks and no credential helper: the remote must take the push as this
+#     machine is (an integration host, for example). The commits are not signed.
+#
+# Alerts: one message per change, by the auto-mode guard's rule: when a run is
+# held back (a secret, a refused push, a branch that moved or holds another
+# writer's commits, a missing or emptied folder, removals over the limit), an
+# entry is left out, or a verify does not match, and one more when it works
+# again. They go to Buzz through the
+# Buzz adapter's one-shot send, when the settings name a channel; otherwise
+# they are logged only. The state of each (alert-run, alert-verify) is one
+# word and a digest, never a name or a line of a note.
+#
+# The log (journalctl) gets counts and outcomes, and the file name, line and
+# rule of a secret hit; never a line of a note.
+#
+# Exit: 0 = done (nothing changed, or a commit pushed; a verify that matched);
+#       1 = held back or failed (tried again on the next run); 2 = usage or setup.
+#
+# GP_MB_SETTINGS names another settings file, whoever owns it, for a dry run
+# (the setup's preview) or a test.
+#
+# Tests only (GP_TEST=1): GP_MB_SEND (a command that stands in for the send), GP_MB_GIT (git),
+# GP_MB_AFTER_BACKUP (a command a verify runs after each of its backups, to
+# change the folder under it), GP_MB_MID_RUN (a command a run runs once after
+# its first backup, as a write landing during it), GP_MB_NO_FSCK=1 (fetches
+# unchecked, to reach the checks behind it), and file:// remotes. Without
+# GP_TEST=1 they are ignored.
+#
+# Limits: like the auto-mode guard, it is a backstop against accidents, not a
+# defence against a process running as the instance's user, which can change
+# the folder and the state folder. The remote's history is what it protects:
+# no run ever rewrites it.
+set -euo pipefail
+case "${1:-}" in
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
+esac
+HERE="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+BUZZ_DIR="$HERE/buzz"                                      # the installed copy
+[ -d "$BUZZ_DIR" ] || BUZZ_DIR="$HERE/../../adapters/buzz"   # a checkout
+PYTHON=/usr/bin/python3
+[ -x "$PYTHON" ] || { echo "backup: $PYTHON is needed" >&2; exit 2; }
+GP_MB_HERE="$HERE" GP_MB_BUZZ="$BUZZ_DIR" exec "$PYTHON" -I - "$@" <<'PY'
+import fcntl, hashlib, os, re, shutil, stat, subprocess, sys, tempfile, time, unicodedata
+
+E = os.environ
+TEST = E.get("GP_TEST") == "1"
+HERE = E["GP_MB_HERE"]
+BUZZ = E["GP_MB_BUZZ"]
+ARGS = sys.argv[1:]
+PREFIX = b"memory/"          # where the folder goes in the branch's tree
+ZERO = "0" * 40
+PLAIN = r"/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*"
+# The secret scan. Each rule is a token shape that is almost never anything
+# else; a bare 64-hex string is not one (notes are full of event ids and public
+# keys). A token may follow any character but a letter or a digit (so an _ or a
+# - before it does not hide it). The dashes of a key block are built here, so
+# this file holds none.
+B = r"(?<![A-Za-z0-9])"   # guard:boundary
+DASHES = "-" * 5
+SECRET_RULES = [
+    ("private-key", DASHES + r"BEGIN ([A-Z0-9]+ )*PRIVATE KEY( BLOCK)?" + DASHES),
+    ("nostr-secret-key", B + r"nsec1[02-9ac-hj-np-z]{58}"),
+    # GitHub's tokens: 40 characters before, and since October 2026 an App's
+    # installation token is stateless, about 520 characters with dots, - and
+    # _ in it. Taken as opaque: the prefix and 36 or more of those.
+    ("github-token", B + r"gh[pousr]_[A-Za-z0-9_.-]{36,}"),
+    ("github-fine-grained-token", B + r"github_pat_[A-Za-z0-9_]{40,}"),
+    ("gitlab-token", B + r"glpat-[A-Za-z0-9_-]{20,}"),
+    ("anthropic-key", B + r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("openai-key", B + r"sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"),
+    ("aws-access-key", B + r"(AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])"),
+    ("slack-token", B + r"xox[abposr]-[A-Za-z0-9-]{10,}"),
+    ("stripe-key", B + r"[rs]k_live_[A-Za-z0-9]{16,}"),
+    ("google-api-key", B + r"AIza[0-9A-Za-z_-]{35}"),
+    ("1password-service-account-token", B + r"ops_[A-Za-z0-9_-]{40,}"),
+    ("linear-api-key", B + r"lin_api_[A-Za-z0-9]{32,}"),
+    ("neon-api-key", B + r"napi_[A-Za-z0-9]{40,}"),
+    ("posthog-personal-api-key", B + r"phx_[A-Za-z0-9]{30,}"),
+    ("npm-token", B + r"npm_[A-Za-z0-9]{36}"),
+    ("huggingface-token", B + r"hf_[A-Za-z0-9]{30,}"),
+    ("digitalocean-token", B + r"do[opr]_v1_[a-f0-9]{64}"),
+    ("cloudflare-origin-ca-key", B + r"v1\.0-[a-f0-9]{24}-[a-f0-9]{146}"),
+    # Cloudflare and Hetzner tokens carry no prefix: a token-sized value right
+    # after the provider's name and a : or =.
+    ("cloudflare-api-token", r"(?i)cloudflare[\w .-]{0,30}?[:=][\s'\"]{0,3}[A-Za-z0-9_-]{37,40}(?![A-Za-z0-9_-])"),
+    ("hetzner-api-token", r"(?i)hetzner[\w .-]{0,30}?[:=][\s'\"]{0,3}[A-Za-z0-9]{64}(?![A-Za-z0-9])"),
+    ("jwt", B + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ("password-in-url", r"(?<![A-Za-z0-9+.-])[a-z][a-z0-9+.-]*://[^/\s:@'\"<>]+:[^/\s@'\"<>]+@[A-Za-z0-9.-]+"),
+]
+SECRET_RES = [(n, re.compile(p)) for n, p in SECRET_RULES]
+RESERVED = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|BASH_ENV|PS4|TERM|TMUX|TMPDIR|"
+                      r"CREDENTIALS_DIRECTORY|STATE_DIRECTORY|LD_.*|DYLD_.*|BASH_FUNC_.*|GP_.*|"
+                      r"NODE_.*|NPM_.*|PYTHON.*|BUZZ_.*|XDG_.*|GIT_.*)$")
+PASSED = frozenset({"BUZZ_AUTH_TAG"})
+
+
+def log(msg):
+    print("memory-backup: " + msg, flush=True)
+
+
+def die(msg, code=2):
+    print("memory-backup: ERROR: " + msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def usage():
+    die("usage: backup run [--dry-run | --accept-removals | --adopt-remote] | backup verify | "
+        "backup restore [--at <commit>] [--into <folder>]")
+
+
+# ------------------------------------------------------------------ settings
+
+KEYS = {
+    "NAME": r"[a-z0-9][a-z0-9-]*",
+    "FOLDER": PLAIN,
+    "REMOTE": r"https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/-]+" + (r"|file:///[A-Za-z0-9._+/-]+" if TEST else ""),
+    "BRANCH": r"memory/[a-z0-9][a-z0-9-]*",   # guard:branch (never main: always memory/<instance>)
+    "STATE": PLAIN,
+    "NODE": PLAIN,
+    "CHANNEL": r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    "MENTIONS": r"[0-9a-f]{64}( [0-9a-f]{64})*",
+    "RELAY_URL": r"(https|wss)://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?",
+    "KEY_COMMAND": r"[A-Za-z0-9_./~:=@+,-]+( +[A-Za-z0-9_./~:=@+,-]+)*",
+    "SEND_PATH": f"{PLAIN}(:{PLAIN})*",
+    "MAX_FILE_KB": r"[1-9][0-9]{0,6}",
+    "MAX_REMOVED_PERCENT": r"[1-9][0-9]?|100",
+    # The reaction that marks an alert open (a task root): a custom emoji's
+    # name with its image's URL, or one plain emoji. Unset: alerts get no state.
+    "TASK_EMOJI": r"[a-z0-9_-]{1,64}|[^\x00-\x7f\s]{1,64}",
+    "TASK_EMOJI_URL": r"https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/-]+",
+}
+REQUIRED = ("NAME", "FOLDER", "REMOTE", "BRANCH", "STATE")
+
+
+def load_settings():
+    # Another settings file only in a test, or for a dry run (the setup's
+    # preview, before anything is installed): a dry run writes, pushes and
+    # sends nothing.
+    other = TEST or ARGS == ["run", "--dry-run"]
+    path = (E.get("GP_MB_SETTINGS") if other else "") or os.path.join(HERE, "settings")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        die(f"no settings file at {path}: install it with install/memory-backup/setup")
+    if not stat.S_ISREG(st.st_mode):
+        die(f"the settings file {path} is not a plain file")
+    if not other and (st.st_uid != 0 or st.st_mode & 0o022):
+        die(f"the settings file {path} must be root-owned and writable by root alone")
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, eq, val = line.partition("=")
+            if not eq or key not in KEYS or key in out:
+                die(f"settings line {n}: not a known setting, or a second one")
+            if not re.fullmatch(KEYS[key], val.strip()):
+                die(f"settings line {n}: {key} has a value of the wrong form")
+            out[key] = val.strip()
+    for k in REQUIRED:
+        if k not in out:
+            die(f"the settings file has no {k}")
+    return out
+
+
+S = load_settings()
+NAME, FOLDER, REMOTE, BRANCH, STATE = S["NAME"], S["FOLDER"], S["REMOTE"], S["BRANCH"], S["STATE"]
+REF = "refs/heads/" + BRANCH
+GIT = (E.get("GP_MB_GIT") if TEST else "") or "/usr/bin/git"
+SEND_STUB = E.get("GP_MB_SEND", "") if TEST else ""
+AFTER_BACKUP = E.get("GP_MB_AFTER_BACKUP", "") if TEST else ""
+UNREACHABLE_RUNS = 4   # runs in a row (an hour of the timer) before a push that never goes through is reported
+CHANNEL = S.get("CHANNEL", "")
+MENTIONS = S.get("MENTIONS", "").split()
+SEND_PATH = S.get("SEND_PATH") or "/usr/local/bin:/usr/bin:/bin"
+UNIT = f"{NAME}-memory-backup"
+SELF = os.path.join(HERE, "backup")
+# A file over this size is left out of the backup and reported: a memory note
+# is text, and a remote refuses big files (GitHub at 100 MB).
+MAX_FILE_BYTES = int(S.get("MAX_FILE_KB", "1024")) * 1024
+# A run that would remove more than this share of the notes is held back and
+# reported, never committed, until the operator takes the removals on
+# (run --accept-removals); a run that would empty the backup is never committed.
+MAX_REMOVED_PERCENT = int(S.get("MAX_REMOVED_PERCENT", "30"))
+# A write that lands during a run is backed up by the same run, at most this
+# many times in a row.
+RUNS_IN_A_ROW = 3
+MID_RUN = E.get("GP_MB_MID_RUN", "") if TEST else ""
+
+
+# ----------------------------------------------------------------------- git
+
+def git_env(gitdir, index=None):
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": E.get("HOME", "/nonexistent"), "LANG": "C", "LC_ALL": "C",
+        "GIT_DIR": gitdir, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false",
+        "GIT_ALLOW_PROTOCOL": "https:file" if TEST else "https", "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_AUTHOR_NAME": f"{NAME} memory backup", "GIT_AUTHOR_EMAIL": f"{NAME}-memory-backup@localhost",
+        "GIT_COMMITTER_NAME": f"{NAME} memory backup", "GIT_COMMITTER_EMAIL": f"{NAME}-memory-backup@localhost",
+    }
+    if TEST and E.get("PATH"):
+        env["PATH"] = E["PATH"]
+    if index:
+        env["GIT_INDEX_FILE"] = index
+    return env
+
+
+def git(gitdir, *args, data=None, index=None, check=True):
+    argv = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=",
+            "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false", "-c", "protocol.version=2", *args]
+    r = subprocess.run(argv, input=data, capture_output=True, env=git_env(gitdir, index), cwd="/")
+    if check and r.returncode != 0:
+        raise GitError(args[0], r)
+    return r
+
+
+class GitError(Exception):
+    def __init__(self, what, r):
+        last = next((ln for ln in reversed(r.stderr.decode("utf-8", "replace").splitlines()) if ln.strip()), "")
+        super().__init__(f"git {what} exited {r.returncode}" + (f": {last[:200]}" if last else ""))
+
+
+def out(r):
+    return r.stdout.decode().strip()
+
+
+# git checks every object a fetch brings in, and refuses a malformed one (a
+# tree with two entries of one name, a .. or .git entry, and the like) before
+# anything here reads it. GP_MB_NO_FSCK=1 (tests only) leaves it out, so the
+# tests can reach the checks in extract() behind it.
+FSCK = ("" if TEST and E.get("GP_MB_NO_FSCK") == "1"
+        else "[transfer]\n\tfsckObjects = true\n[fetch]\n\tfsckObjects = true\n[receive]\n\tfsckObjects = true\n")   # guard:fsck
+
+
+def init_repo(gitdir):
+    """A bare repo of its own; its config is written whole on every run."""
+    if not os.path.isdir(os.path.join(gitdir, "objects")):
+        os.makedirs(gitdir, mode=0o700, exist_ok=True)
+        git(gitdir, "init", "-q", "--bare")
+    with open(os.path.join(gitdir, "config"), "w", encoding="utf-8") as f:
+        f.write("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n" + FSCK)
+
+
+def rev(gitdir, name):
+    r = git(gitdir, "rev-parse", "-q", "--verify", name + "^{commit}", check=False)
+    return out(r) if r.returncode == 0 else None
+
+
+def remote_tip(gitdir, depth=None):
+    """The branch on the remote, fetched into refs/remotes/backup/<branch>:
+    (commit or None when the remote has no such branch, reachable)."""
+    r = git(gitdir, "ls-remote", "--heads", REMOTE, REF, check=False)
+    if r.returncode != 0:
+        return None, False
+    if not out(r):
+        return None, True
+    args = ["fetch", "-q", "--no-tags", "--no-write-fetch-head"]
+    if depth:
+        args.append(f"--depth={depth}")
+    # The + is for this repo's own tracking ref; nothing here goes to the remote.
+    if git(gitdir, *args, REMOTE, f"+{REF}:refs/remotes/backup/{BRANCH}", check=False).returncode != 0:
+        return None, False
+    return rev(gitdir, f"refs/remotes/backup/{BRANCH}"), True
+
+
+def is_ancestor(gitdir, a, b):
+    return git(gitdir, "merge-base", "--is-ancestor", a, b, check=False).returncode == 0
+
+
+# ------------------------------------------------------------ the folder
+
+def blob_id(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def bad_name(rel):
+    return any(p in (b"", b".", b"..") or p.lower() == b".git" for p in rel.split(b"/"))
+
+
+NOT_TEXT = "not text (binary or compressed)"
+
+
+def text_of(data):
+    """(text, None) for a text file: UTF-8, or UTF-16 with a byte-order mark
+    (decoded, so the scan reads it). (None, why) for anything else, which is
+    left out of the backup: UTF-32 (its byte-order mark is checked first, as a
+    UTF-32 LE file starts like a UTF-16 one), and any file whose text, once
+    decoded, holds a NUL (a token spread out by NULs is one no rule matches)."""
+    if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):   # guard:utf32
+        return None, "UTF-32, which the secret scan cannot read"
+    try:
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):   # guard:utf16
+            text = data.decode("utf-16")
+        else:
+            text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, NOT_TEXT
+    if "\0" in text:   # guard:nul
+        return None, NOT_TEXT
+    return text, None
+
+
+def as_text(data):
+    """The text of a file, or None when it is not text (text_of)."""
+    return text_of(data)[0]
+
+
+def snapshot(folder):
+    """({relative path (bytes): (mode, bytes)} for every regular text file
+    under folder up to the size cap, as it is; [(relative path, why)] for every
+    entry left out: a symlink, a pipe or a socket, a name git cannot keep, a
+    file over the cap, a file that is not text (binary or compressed))."""
+    top = os.fsencode(folder)
+    files, skipped = {}, []
+
+    def walk(d, rel):
+        with os.scandir(d) as it:
+            ents = sorted(it, key=lambda e: e.name)
+        for e in ents:
+            r = rel + e.name if not rel else rel + b"/" + e.name
+            p = os.path.join(d, e.name)
+            st = os.lstat(p)
+            if bad_name(r):
+                skipped.append((r, "a name git cannot keep"))
+            elif stat.S_ISLNK(st.st_mode):
+                # Never kept: a memory folder needs none, and a restore never
+                # writes one (entries_of below refuses them).
+                skipped.append((r, "a symlink"))
+            elif stat.S_ISDIR(st.st_mode):
+                walk(p, r)
+            elif not stat.S_ISREG(st.st_mode):
+                skipped.append((r, "not a regular file"))
+            elif st.st_size > MAX_FILE_BYTES:   # guard:size
+                skipped.append((r, f"over the {MAX_FILE_BYTES // 1024} KB cap"))
+            else:
+                fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+                with os.fdopen(fd, "rb") as f:
+                    data = f.read()
+                text, why = text_of(data)
+                if text is None:   # guard:text
+                    skipped.append((r, why))
+                else:
+                    files[r] = ("100755" if st.st_mode & 0o100 else "100644", data)
+
+    walk(top, b"")
+    return files, skipped
+
+
+def tree_of(gitdir, files, write=()):
+    """The tree id for files (under PREFIX). The blobs of the paths in write are
+    stored first (the rest are in the base commit already); without any, the
+    tree is made with blobs missing, which is enough to compare it."""
+    for rel in write:
+        data = files[rel][1]
+        got = out(git(gitdir, "hash-object", "-w", "--stdin", data=data))
+        if got != blob_id(data):
+            raise RuntimeError("git stored a blob under another id")
+    fd, idx = tempfile.mkstemp(prefix="index.", dir=os.path.join(gitdir))
+    os.close(fd)
+    os.unlink(idx)
+    try:
+        lines = b"".join(b"%s %s\t%s\0" % (mode.encode(), blob_id(data).encode(), PREFIX + rel)   # guard:prefix
+                         for rel, (mode, data) in sorted(files.items()))
+        git(gitdir, "update-index", "-z", "--index-info", data=lines, index=idx)
+        args = ["write-tree"] if write else ["write-tree", "--missing-ok"]
+        return out(git(gitdir, *args, index=idx))
+    finally:
+        try:
+            os.unlink(idx)
+        except FileNotFoundError:
+            pass
+
+
+def changes(gitdir, base_tree, new_tree, files):
+    """(added, changed, removed): relative paths, sorted."""
+    if not base_tree:
+        return sorted(files), [], []
+    r = git(gitdir, "diff-tree", "-r", "-z", "--no-renames", "--name-status", base_tree, new_tree)
+    parts = r.stdout.split(b"\0")
+    a, m, d = [], [], []
+    for st, path in zip(parts[0::2], parts[1::2]):
+        if not path.startswith(PREFIX):
+            continue
+        rel = path[len(PREFIX):]
+        {b"A": a, b"D": d}.get(st[:1], m).append(rel)
+    return a, m, d
+
+
+def scan_text(text):
+    """[(line number, rule)] for every secret shape in text."""
+    hits = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for name, rx in SECRET_RES:
+            if rx.search(line):
+                hits.append((n, name))
+    return hits
+
+
+def scan(files, paths):
+    """[(path, line number, rule)] for every secret shape in the given files."""
+    return [(rel, n, rule) for rel in paths for n, rule in scan_text(as_text(files[rel][1]) or "")]
+
+
+def shown(rel):
+    """A path, raw: one line, invisible characters escaped. Only for the scan
+    and the commit message, which the scan checks; never for an alert or a
+    listing (safe)."""
+    s = rel.decode("utf-8", "replace")
+    return "".join(c if unicodedata.category(c)[0] != "C" else f"\\u{ord(c):04x}" for c in s)
+
+
+SECRET_NAME = "(a name that holds a possible secret)"
+
+
+def safe(rel):
+    """A path as an alert, the log or a listing shows it: shown(), or a
+    placeholder when the name holds a secret shape."""
+    s = shown(rel)
+    return SECRET_NAME if scan_text(s) else s   # guard:safename
+
+
+def read_made():
+    """The commits this machine made (or took on with --adopt-remote)."""
+    try:
+        with open(os.path.join(STATE, "made"), encoding="utf-8") as f:
+            return {ln.strip() for ln in f if re.fullmatch(r"[0-9a-f]{40}", ln.strip())}
+    except OSError:
+        return set()
+
+
+def add_made(commit):
+    with open(os.path.join(STATE, "made"), "a", encoding="utf-8") as f:
+        f.write(commit + "\n")
+
+
+# ----------------------------------------------------------------- alerts
+
+def credentials():
+    out_, d = [], E.get("CREDENTIALS_DIRECTORY", "")
+    if not d or not os.path.isdir(d):
+        return out_
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not os.path.isfile(path):
+            continue
+        var = name.upper().replace("-", "_").replace(".", "_")
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", var) or (RESERVED.match(var) and var not in PASSED):
+            log("skipped a credential: its name is reserved or not a variable name")
+            continue
+        with open(path, encoding="utf-8") as f:
+            out_.append((var, f.read().rstrip("\n")))
+    return out_
+
+
+def launcher():
+    """The adapter's launcher as argv (or the test stub), or None (logged)."""
+    if SEND_STUB:
+        return [SEND_STUB]
+    node, launch = S.get("NODE", ""), os.path.join(BUZZ, "src", "launch.mjs")
+    if not node or not os.path.isfile(node) or not os.path.isfile(launch):
+        log("alert NOT sent: node or the Buzz adapter is missing; rerun the setup")
+        return None
+    return [node, launch]
+
+
+def run_launcher(args, text, timeout):
+    """Runs the launcher with args (text on stdin, or none), in the send's
+    environment: the credentials, the relay settings, its own XDG folders,
+    all gone again afterwards. Returns the completed process; raises as
+    subprocess.run does."""
+    base = launcher()
+    if base is None:
+        raise OSError("no launcher")
+    scratch = tempfile.mkdtemp(prefix="memory-backup-send.")
+    env = {k: v for k, v in E.items() if not k.startswith("GP_MB_")}
+    env["PATH"] = SEND_PATH
+    env.update({"BUZZ_RELAY_URL": S.get("RELAY_URL", ""), "BUZZ_KEY_COMMAND": S.get("KEY_COMMAND", "")})
+    env.update({"BUZZ_TASK_OPEN_EMOJI": S.get("TASK_EMOJI", ""), "BUZZ_TASK_OPEN_EMOJI_URL": S.get("TASK_EMOJI_URL", "")})
+    for sub in ("config", "cache", "data", "state"):
+        p = os.path.join(scratch, sub)
+        os.mkdir(p, 0o700)
+        env[f"XDG_{sub.upper()}_HOME"] = p
+    try:
+        for var, value in credentials():
+            env[var] = value
+        if text is None:
+            return subprocess.run(base + args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=timeout, env=env, cwd="/")
+        return subprocess.run(base + args, input=text, capture_output=True, text=True, timeout=timeout, env=env, cwd="/")
+    finally:
+        env.clear()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def mark_open(event_id):
+    """Best effort, once an alert went out and its state is written: the open
+    state on it, so the alert is a task root (the Buzz adapter's one-shot
+    task, src/task.mjs). Only with TASK_EMOJI in the settings. It never
+    raises, and can't change whether the alert counts as sent (that is
+    already written): a failure is logged, never retried."""
+    if not S.get("TASK_EMOJI") or not CHANNEL:
+        return
+    if not event_id:
+        log("alert NOT marked open: the send printed no event id")
+        return
+    try:
+        r = run_launcher(["task", "set", "--channel", CHANNEL, "--id", event_id, "--state", "open"], None, 60)
+    except Exception as e:   # anything: the alert went out, and must not be sent again
+        log(f"alert NOT marked open: {type(e).__name__}")
+        return
+    log("alert marked open (a task root)" if r.returncode == 0 else f"alert NOT marked open: the task tool exited {r.returncode}")
+
+
+def send(text):
+    """(True, the event id or None) when the message went out (or there is
+    nowhere to send it), else (False, None)."""
+    if not CHANNEL:
+        log("alert (no Buzz channel in the settings; logged only): " + text.splitlines()[0])
+        return True, None
+    args = ["send", "--channel", CHANNEL]
+    for m in MENTIONS:
+        args += ["--mention", m]
+    try:
+        r = run_launcher(args, text, 150)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        if str(e) != "no launcher":
+            log(f"alert NOT sent: {type(e).__name__}")
+        return False, None
+    if r.returncode != 0:
+        log(f"alert NOT sent: the send exited {r.returncode}")
+        return False, None
+    log("alert sent")
+    m = re.search(r"^sent ([0-9a-f]{64})$", r.stdout or "", re.M)
+    return True, (m.group(1) if m else None)
+
+
+def alert(which, now, text, clear_text):
+    """One message per change of state. which: run or verify. now: 'clean' or
+    '<kind>:<sha256>'. Returns False when a message that was due did not go out."""
+    path = os.path.join(STATE, f"alert-{which}")
+    try:
+        with open(path, encoding="utf-8") as f:
+            last = f.read().strip()
+    except FileNotFoundError:
+        last = "clean"
+    if now == last:
+        if now != "clean":
+            log(f"{which}: already reported, nothing sent")
+        return True
+    sent = None
+    if now == "clean" and last != "clean":
+        ok, sent = send(clear_text)
+    elif now != "clean":
+        ok, sent = send(text)
+    else:
+        ok = True
+    if ok:
+        fd, tmp = tempfile.mkstemp(dir=STATE, prefix=f".alert-{which}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(now + "\n")
+        os.replace(tmp, path)
+        # Only now, with the alert recorded as sent: its open state (the
+        # all-clear gets none).
+        if now != "clean":   # guard:markwhen
+            mark_open(sent)   # guard:markopen
+    return ok
+
+
+def digest(*parts):
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+# ------------------------------------------------------------------- run
+
+class Held(Exception):
+    """A run that must not go on: (state word, message)."""
+    def __init__(self, kind, text):
+        super().__init__(text)
+        self.kind, self.text = kind, text
+
+
+def listed(items, most=10):
+    s = "; ".join(items[:most])
+    return s + (f"; and {len(items) - most} more" if len(items) > most else "")
+
+
+def set_local(gitdir, new, old):
+    """The local branch (this repo's own ref, never the remote's) to new."""
+    if new:
+        git(gitdir, "update-ref", REF, new, old or ZERO)
+    elif old:
+        git(gitdir, "update-ref", "-d", REF, old)
+
+
+def keep_dropped(gitdir, tip, remote):
+    """tip's commits are about to leave the local branch (a content refusal,
+    or --adopt-remote): keep them under refs/dropped/<UTC time>, a ref of this
+    machine's repo alone (the push names one commit and the branch, never any
+    other ref), so nothing that was in the folder is lost. Reported by
+    report_dropped."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name, n = f"refs/dropped/{stamp}", 1
+    while rev(gitdir, name):
+        n += 1
+        name = f"refs/dropped/{stamp}-{n}"
+    git(gitdir, "update-ref", name, tip, ZERO)
+    log(f"kept the commits leaving {BRANCH} under {name} ({tip[:12]})")
+    return name
+
+
+def report_dropped(gitdir):
+    """One alert for the newest refs/dropped/ ref: how many commits it holds
+    that the branch does not, and where they are."""
+    r = git(gitdir, "for-each-ref", "--format=%(refname)", "refs/dropped/", check=False)
+    names = sorted(out(r).split()) if r.returncode == 0 else []
+    if not names:
+        return True
+    name = names[-1]
+    have = rev(gitdir, REF)
+    n = out(git(gitdir, "rev-list", "--count", name, *(["--not", have] if have else [])))
+    repo = os.path.join(STATE, "repo.git")
+    return alert("dropped", "dropped:" + name,   # guard:reportdropped
+                 f"Memory backup on {NAME}: {n} commit(s) made on this machine never reached the remote and "
+                 f"left the branch {BRANCH} (the remote refused them, or --adopt-remote took the remote's "
+                 f"history on). They are kept on this machine only, under {name} in {repo}: see them with "
+                 f"git --git-dir={repo} log --stat {name}, and a note in one with "
+                 f"git --git-dir={repo} show <commit>:memory/<note>. The folder as it is now is backed up.",
+                 "")
+
+
+def read_held(path):
+    """The paths whose removal is held back (one hex-encoded path a line)."""
+    try:
+        with open(path, encoding="ascii") as f:
+            return {bytes.fromhex(ln.strip()) for ln in f if re.fullmatch(r"(?:[0-9a-f]{2})+", ln.strip())}
+    except (OSError, ValueError):
+        return set()
+
+
+def write_held(path, paths):
+    if not paths:
+        if os.path.exists(path):
+            os.unlink(path)
+        return
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".removals-held.")
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write("".join(p.hex() + "\n" for p in sorted(paths)))
+    os.replace(tmp, path)
+
+
+def base_files(gitdir, base, paths):
+    """{path: (mode, bytes)} of the given paths as commit base has them."""
+    want = {PREFIX + p: p for p in paths}
+    r = git(gitdir, "ls-tree", "-r", "-z", base, "--", PREFIX.decode())
+    entries = {}
+    for item in r.stdout.split(b"\0"):
+        if not item:
+            continue
+        meta, _, path = item.partition(b"\t")
+        mode, _, oid = meta.split(b" ")
+        if path in want:
+            entries[want[path]] = (mode.decode(), oid.decode())
+    if set(entries) != set(paths):
+        raise RuntimeError("a removed note is not in the base commit")
+    batch = git(gitdir, "cat-file", "--batch", data=b"".join(o.encode() + b"\n" for _, o in entries.values()))
+    data, at, out_ = batch.stdout, 0, {}
+    for rel, (mode, oid) in entries.items():
+        nl = data.index(b"\n", at)
+        size = int(data[at:nl].split(b" ")[2])
+        out_[rel] = (mode, data[nl + 1:nl + 1 + size])
+        at = nl + 1 + size + 1
+        if blob_id(out_[rel][1]) != oid:
+            raise RuntimeError("git gave a blob under another id")
+    return out_
+
+
+def backup(gitdir, dry=False, accept_removals=False, adopt=False, rebuilt=False):
+    """One backup. Returns (outcome, seen, skipped, hold): outcome 'pushed',
+    'unchanged' or 'unreachable' (committed here; the push waits for the next
+    run); seen, the tree of the folder as this run read it; the entries left
+    out; and hold, a Held for removals held back while the rest went in (or
+    None). Raises Held when it must stop and say so."""
+    if not os.path.isdir(FOLDER):   # guard:missing
+        raise Held("missing", f"the memory folder {FOLDER} is not there, so nothing was backed up; the "
+                   f"branch {BRANCH} keeps the last version")
+    init_repo(gitdir)
+    made = read_made()
+    remote, reachable = remote_tip(gitdir)
+    local = rev(gitdir, REF)
+    if reachable and remote and remote not in made:
+        if adopt and not dry:
+            add_made(remote)
+            made.add(remote)
+            log(f"took on the remote's {BRANCH} at {remote[:12]} (--adopt-remote)")
+        elif remote not in made:   # guard:foreign
+            raise Held("foreign", f"the branch {BRANCH} on the remote holds commits this machine did not make "
+                       "(another writer, or the machine this one replaces); nothing was committed or pushed, "
+                       "and the remote was left as it is. If this machine replaces that one, take the "
+                       f"remote's history on with: {SELF} run --adopt-remote")
+    if (adopt and not dry and reachable and remote and local and local != remote
+            and not is_ancestor(gitdir, local, remote)
+            and not is_ancestor(gitdir, remote, local)):   # guard:adoptahead
+        # The branches moved apart and the remote's history is the one to
+        # keep: commits made here that it does not hold leave the branch, kept
+        # under refs/dropped/, and the folder is committed afresh on the
+        # remote's tip. A local branch that is only ahead (commits that waited
+        # out an outage) is kept, and its commits go out with this run.
+        keep_dropped(gitdir, local, remote)
+        set_local(gitdir, remote, local)
+        local = remote
+    if reachable and remote:
+        if not local or local == remote or is_ancestor(gitdir, local, remote):
+            base = remote
+        elif is_ancestor(gitdir, remote, local):   # guard:diverged
+            base = local                           # commits made here that did not reach it yet
+        else:
+            raise Held("diverged", f"the branch {BRANCH} on the remote and the one here moved apart; "
+                       "nothing was committed or pushed, and the remote was left as it is. To keep the "
+                       f"remote's history and commit the folder on top of it, run: {SELF} run --adopt-remote "
+                       "(the commits made here stay on this machine, under refs/dropped/)")
+    else:
+        base = local
+    if base and base != local and not dry:   # guard:catchup
+        # The remote is ahead of this repo: a fast-forward of the local branch,
+        # so a verify finds the remote at the last commit known here.
+        set_local(gitdir, base, local)
+        local = base
+    files, skipped = snapshot(FOLDER)
+    base_tree = out(git(gitdir, "rev-parse", base + "^{tree}")) if base else None
+    tree = seen = tree_of(gitdir, files)
+    unchanged = bool(base) and tree == base_tree   # guard:unchanged
+    added = changed = removed = []
+    msg = b""
+    hold = None
+    held_path = os.path.join(STATE, "removals-held")
+    if not unchanged:
+        added, changed, removed = changes(gitdir, base_tree, tree, files)
+        msg = message(added, changed, removed)
+    # Every name in the folder, and the commit message, before any of them is
+    # written anywhere: a name is never shown when it holds a secret shape.
+    named = [shown(r) for r in files] + [shown(r) for r, _ in skipped] + [msg.decode("utf-8", "replace")]
+    hit_names = [t for t in named if scan_text(t)]
+    name_hits = sorted({rule for t in hit_names for _, rule in scan_text(t)})
+    if name_hits:   # guard:filenames
+        raise Held("secret:" + digest(*hit_names), "a file or folder name in the memory folder holds a possible "
+                   f"secret ({', '.join(name_hits)}), so nothing was committed or pushed; the name is not shown "
+                   "here. Rename it; the backup tries again on every run")
+    if skipped:
+        log(f"left out {len(skipped)}: " + listed([f"{safe(r)} ({why})" for r, why in skipped]))
+    if unchanged:
+        commit = base
+        if not dry:
+            log(f"nothing changed since {base[:12]}")
+            if os.path.exists(held_path):
+                os.unlink(held_path)
+    else:
+        n_base = len(files) - len(added) + len(removed)
+        if not files:   # guard:empty
+            raise Held("empty", (f"the memory folder is empty: this run would remove all {n_base} notes from the "
+                                 f"backup, so nothing was committed; the branch {BRANCH} keeps the last version")
+                       if base_tree else
+                       "the memory folder is empty, so there is nothing to back up yet; nothing was committed")
+        # A set held back before stays held, whatever its share now (the notes
+        # added since make it smaller); only --accept-removals takes it on.
+        # The notes held back before stay held while they are gone, whatever
+        # their share now; --accept-removals takes on exactly those. Removals
+        # beyond them are judged by the share rule, and join them when held.
+        held = read_held(held_path)
+        gone = set(removed)
+        keep = gone & held   # guard:heldpaths
+        if accept_removals and keep:
+            log(f"taking on the {len(keep)} removals held back before (--accept-removals)")
+            keep = set()
+        beyond = gone - held
+        if len(beyond) * 100 > MAX_REMOVED_PERCENT * n_base:   # guard:removals
+            keep |= beyond
+        if keep:
+            # Only these removals are held back: the notes stay as the base
+            # has them, and everything else goes in.
+            names = sorted(keep)
+            hold = Held("removals:" + digest(*(shown(p) for p in names)),   # guard:partial
+                        f"{len(names)} of {n_base} notes are gone from the folder, and their removal is held back "
+                        f"(over the {MAX_REMOVED_PERCENT}% limit when they went); the rest of the folder is backed "
+                        "up, and these notes stay on the branch as they were. Held back: "
+                        + listed([safe(p) for p in names]) + ". If these removals are meant (Claude Code's own "
+                        f"consolidation, say), take them on with: {SELF} run --accept-removals (it takes on "
+                        "these and no other)")
+            files = dict(files)
+            files.update(base_files(gitdir, base, names))   # guard:keepbase
+            tree = tree_of(gitdir, files)
+            added, changed, removed = changes(gitdir, base_tree, tree, files)
+            msg = message(added, changed, removed)
+        if not dry:
+            write_held(held_path, keep)
+    if not unchanged and base and tree == base_tree:
+        commit = base
+        if not dry:
+            log(f"nothing to commit since {base[:12]} but the removals held back")
+    elif not unchanged:
+        hits = scan(files, added + changed)
+        if hits:   # guard:scan
+            names = "; ".join(f"{safe(p)} line {n} ({rule})" for p, n, rule in hits[:20])
+            many = "s" if len(hits) > 1 else ""
+            log(f"secret scan: {len(hits)} hit{many}, commit refused: {names}")
+            raise Held("secret:" + digest(*(f"{shown(p)}:{n}:{r}" for p, n, r in hits)),
+                       f"the secret scan found {len(hits)} possible secret{many}, so nothing was committed or "
+                       f"pushed: {names}. Take the secret out of the note; the backup tries again on every run")
+        if dry:
+            log(f"dry run: would commit {len(added)} added, {len(changed)} changed, {len(removed)} removed "
+                f"({len(files)} files); secret scan clean")
+            return "dry-run", seen, skipped, hold
+        tree = tree_of(gitdir, files, write=added + changed)
+        args = ["commit-tree", tree] + (["-p", base] if base else [])
+        commit = out(git(gitdir, *args, data=msg))
+        add_made(commit)
+        log(f"committed {commit[:12]}: {len(added)} added, {len(changed)} changed, {len(removed)} removed")
+    if dry:
+        log("dry run: nothing to commit, the folder matches the branch")
+        return "dry-run", seen, skipped, hold
+    if reachable and remote == commit:
+        return "unchanged", seen, skipped, hold
+    # The commit by its id; the local branch moves only once the remote took it,
+    # or when the remote can't be reached (the commit then waits here).
+    r = git(gitdir, "push", "--porcelain", "--no-verify", REMOTE, f"{commit}:{REF}", check=False)   # guard:push
+    if r.returncode == 0:
+        set_local(gitdir, commit, local)
+        log(f"pushed {commit[:12]} to {BRANCH}")
+        return "pushed", seen, skipped, hold
+    text = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+    if "[remote rejected]" in text:
+        # The remote refused what the push holds (a file over its size limit,
+        # a secret its own scan found). Commits made here since its tip can
+        # never get through, so the local branch goes back to that tip (this
+        # repo's own ref), and the folder is committed afresh once.
+        reason = next((ln.split("[remote rejected]", 1)[1].strip() for ln in text.splitlines()
+                       if "[remote rejected]" in ln), "")
+        if reachable:
+            if local and local != remote and not (remote and is_ancestor(gitdir, local, remote)):
+                keep_dropped(gitdir, local, remote)   # guard:keepdropped
+            set_local(gitdir, remote, local)   # guard:reset
+        if reachable and base != remote and not rebuilt:   # guard:rebuild
+            log("the remote refused the push; the commits waiting here were dropped, committing afresh")
+            return backup(gitdir, accept_removals=accept_removals, rebuilt=True)
+        raise Held("refused:" + digest(reason), f"the remote refused the push to {BRANCH} ({reason or 'no reason'}); "
+                   "this machine put its branch back to the remote's tip (commits that waited here are kept "
+                   "under refs/dropped/) and commits the folder afresh on the next run. Take out what the remote "
+                   "refuses (a file over its size limit, say)")
+    if "[rejected]" in text:
+        raise Held("rejected", f"the remote refused the push to {BRANCH} (not a fast-forward); this machine "
+                   "never forces it, so the remote was left as it is")
+    set_local(gitdir, commit, local)
+    log("the push did not go through (the remote cannot be reached?); the commit waits here")
+    return "unreachable", seen, skipped, hold
+
+
+def message(added, changed, removed):
+    body = "\n".join(f"{t} {shown(p)}" for t, ps in (("A", added), ("M", changed), ("D", removed))
+                     for p in ps[:200])
+    return (f"memory backup: {len(added)} added, {len(changed)} changed, {len(removed)} removed\n\n"
+            f"{body}\n").encode()
+
+
+def held_text(e):
+    return f"Memory backup on {NAME}: {e.text}. Its log: journalctl -u {UNIT}."
+
+
+def clear_run():
+    return f"Memory backup on {NAME}: backing up again; the branch {BRANCH} has the memory folder."
+
+
+def lock():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE, "lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deadline = time.time() + 300
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > deadline:
+                die("another backup has held the lock for 5 minutes", 1)
+            time.sleep(0.5)
+
+
+def cmd_run(dry, accept_removals=False, adopt=False):
+    if dry:
+        tmp = tempfile.mkdtemp(prefix="memory-backup-dry.")
+        try:
+            hold = backup(os.path.join(tmp, "repo.git"), dry=True)[3]
+            if hold:
+                raise hold
+        except Held as e:
+            log(f"dry run: a run would be held back: {e.text}")
+            return 1
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return 0
+    lock()
+    return 0 if run_once(accept_removals, adopt) == "ok" else 1
+
+
+def folder_moved(gitdir, seen):
+    """True when the folder no longer matches the tree the run read (a write
+    during the run)."""
+    if not os.path.isdir(FOLDER):
+        return False
+    files, _ = snapshot(FOLDER)
+    return tree_of(gitdir, files) != seen
+
+
+def run_once(accept_removals=False, adopt=False):
+    """A backup under the lock, with its alert: 'ok', 'held' or 'failed'. A
+    write that lands during it is backed up by it too."""
+    gitdir = os.path.join(STATE, "repo.git")
+    for i in range(RUNS_IN_A_ROW):
+        try:
+            outcome, seen, skipped, hold = backup(gitdir, accept_removals=accept_removals, adopt=adopt)
+        except Held as e:
+            report_dropped(gitdir)
+            kind = e.kind if ":" in e.kind else e.kind + ":" + digest(e.text)
+            alert("run", kind, held_text(e), clear_run())
+            return "held"
+        if outcome == "unreachable":
+            break
+        if MID_RUN and i == 0:
+            subprocess.run([MID_RUN], check=False)
+        if not folder_moved(gitdir, seen):   # guard:again
+            break
+        log("the folder changed during the run; backing it up again")
+    report_dropped(gitdir)
+    count = os.path.join(STATE, "unreachable-runs")
+    if outcome == "unreachable":
+        try:
+            with open(count, encoding="utf-8") as f:
+                n = int(f.read().strip() or 0) + 1
+        except (FileNotFoundError, ValueError):
+            n = 1
+        with open(count, "w", encoding="utf-8") as f:
+            f.write(f"{n}\n")
+        if n >= UNREACHABLE_RUNS:
+            alert("run", "unreachable:" + digest(REMOTE, BRANCH),
+                  f"Memory backup on {NAME}: the last {n} runs could not push {BRANCH} to the remote; the "
+                  f"commits wait here, in the state folder. Its log: journalctl -u {UNIT}.", clear_run())
+        return "failed"
+    if os.path.exists(count):
+        os.unlink(count)
+    if hold:
+        alert("run", hold.kind, held_text(hold), clear_run())
+        return "held"
+    if skipped:
+        items = [f"{safe(r)} ({why})" for r, why in skipped]
+        ok = alert("run", "skipped:" + digest(*items), f"Memory backup on {NAME}: backed up, but "
+                   f"{len(skipped)} entr{'y is' if len(skipped) == 1 else 'ies are'} left out of the backup: "
+                   + listed(items) + f". A memory folder holds text notes only. Its log: journalctl -u {UNIT}.",
+                   clear_run())
+        return "ok" if ok else "failed"
+    return "ok" if alert("run", "clean", "", clear_run()) else "failed"
+
+
+# --------------------------------------------------------- restore, verify
+
+class Unreachable(RuntimeError):
+    pass
+
+
+def fetch_fresh(tmp, depth=None):
+    """A new repo in tmp with the branch fetched from the remote: (gitdir, tip)."""
+    gitdir = os.path.join(tmp, "repo.git")
+    init_repo(gitdir)
+    if git(gitdir, "ls-remote", "--heads", REMOTE, REF, check=False).returncode != 0:
+        raise Unreachable("the remote cannot be reached")
+    tip, reachable = remote_tip(gitdir, depth=depth)
+    if not reachable:
+        raise RuntimeError("the fetch was refused: git's check of the fetched objects failed, or the remote "
+                           "went away")
+    if not tip:
+        raise RuntimeError(f"the remote has no branch {BRANCH} yet")
+    return gitdir, tip
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def entries_of(gitdir, commit):
+    """[(relative path, mode, oid)] of the commit's memory/ folder, every entry
+    checked before anything is written: regular files only, under memory/, no
+    bad name, no path twice."""
+    r = git(gitdir, "ls-tree", "-r", "-z", "--full-tree", commit, "--", PREFIX.decode())
+    entries, seen = [], set()
+    for item in r.stdout.split(b"\0"):
+        if not item:
+            continue
+        meta, path = item.split(b"\t", 1)
+        mode, kind, oid = meta.split(b" ")
+        rel = path[len(PREFIX):] if path.startswith(PREFIX) else b""
+        if not rel or rel.startswith(b"/") or bad_name(rel):   # guard:names
+            raise Refused(f"refused: an entry with a bad name ({safe(path)})")
+        if mode == b"120000":   # guard:symlink
+            raise Refused(f"refused: a symlink ({safe(path)}); this tool never writes one")
+        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"):
+            raise Refused(f"refused: an entry that is not a file ({safe(path)})")
+        if rel in seen:   # guard:duplicate
+            raise Refused(f"refused: a path that is there twice ({safe(path)})")
+        seen.add(rel)
+        entries.append((rel, mode.decode(), oid.decode()))
+    return entries
+
+
+def real_folder(fd, part):
+    """True when part, in the folder fd, is a real folder: not a symlink, a
+    file, or an empty, . or .. part."""
+    if part in (b"", b".", b".."):
+        return False
+    try:
+        return stat.S_ISDIR(os.lstat(part, dir_fd=fd).st_mode)
+    except OSError:
+        return False
+
+
+def open_parent(dest_fd, rel):
+    """A descriptor of rel's folder under dest, made one part at a time: each
+    part a real folder (never a symlink, a file or a .. part), opened with
+    O_NOFOLLOW."""
+    fd = os.dup(dest_fd)
+    try:
+        for part in rel.split(b"/")[:-1]:
+            if part not in (b"", b".", b".."):
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            if not real_folder(fd, part):   # guard:parent
+                raise Refused(f"refused: a parent of {safe(rel)} is not a folder")
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def extract(gitdir, commit, dest):
+    """The memory/ folder of commit, written into dest (new or empty), as it
+    is. Nothing is written outside dest: the entries are checked first
+    (entries_of), and each file is created in its own folder's descriptor."""
+    entries = entries_of(gitdir, commit)
+    dest_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    proc = subprocess.Popen([GIT, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            env=git_env(gitdir), cwd="/")
+    try:
+        for rel, mode, oid in entries:
+            proc.stdin.write(oid.encode() + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            size = int(header[2])
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)
+            pfd = open_parent(dest_fd, rel)
+            try:
+                fd = os.open(rel.split(b"/")[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o755 if mode == "100755" else 0o644, dir_fd=pfd)
+            finally:
+                os.close(pfd)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+    finally:
+        os.close(dest_fd)
+        proc.stdin.close()
+        proc.wait()
+    return len(entries)
+
+
+def compare(a, b):
+    """(only in a, only in b, differ, left out of b): relative paths, byte for
+    byte, and the entries of b (the live folder) no backup keeps."""
+    fa, _ = snapshot(a)
+    fb, skipped_b = snapshot(b)
+    only_a = sorted(set(fa) - set(fb))
+    only_b = sorted(set(fb) - set(fa))
+    differ = sorted(p for p in set(fa) & set(fb) if fa[p] != fb[p])   # guard:compare
+    return only_a, only_b, differ, skipped_b
+
+
+def inside(path, folder):
+    p, f = os.path.realpath(path), os.path.realpath(folder)
+    return p == f or p.startswith(f + os.sep) or f.startswith(p + os.sep)
+
+
+def cmd_restore(at, into):
+    if into:
+        if inside(into, FOLDER):   # guard:live
+            die("the restore folder may not be the live memory folder, inside it or above it", 2)
+        if os.path.lexists(into) and (not os.path.isdir(into) or os.path.islink(into) or os.listdir(into)):
+            die(f"{into} must be a new or empty folder", 2)
+        os.makedirs(into, mode=0o700, exist_ok=True)
+        dest = into
+    else:
+        dest = tempfile.mkdtemp(prefix=f"{NAME}-memory-restore.")
+    tmp = tempfile.mkdtemp(prefix="memory-backup-restore.")
+    try:
+        gitdir, tip = fetch_fresh(tmp)
+        commit = tip
+        if at:
+            if not re.fullmatch(r"[0-9a-f]{4,40}|tip(~[0-9]+)?", at):
+                die("--at takes a commit id, tip or tip~<n>", 2)
+            name = f"refs/remotes/backup/{BRANCH}" + at[3:] if at.startswith("tip") else at
+            commit = rev(gitdir, name)
+            if not commit or not is_ancestor(gitdir, commit, tip):
+                die(f"{at} is not a commit on {BRANCH}", 2)
+        n = extract(gitdir, commit, dest)
+    except (GitError, RuntimeError, OSError) as e:
+        die(f"{e} (restoring into {dest})", 1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    only_b, only_l, differ, left_out = compare(dest, FOLDER)
+    log(f"restored {commit} ({n} files) into {dest}")
+    for label, ps in (("only in the backup", only_b), ("only in the live folder", only_l),
+                      ("differs", differ)):
+        for p in ps:
+            print(f"  {label}: {safe(p)}")
+    for p, why in left_out:
+        print(f"  left out of every backup: {safe(p)} ({why})")
+    if only_b or only_l or differ:
+        log(f"the backup differs from the live folder: {len(only_b)} only in the backup, "
+            f"{len(only_l)} only in the live folder, {len(differ)} differ")
+        return 1
+    log("the backup matches the live folder, byte for byte")
+    return 0
+
+
+def cmd_verify():
+    lock()
+    gitdir = os.path.join(STATE, "repo.git")
+    problem = ""
+    for attempt in (1, 2):
+        state = run_once()
+        if state == "held":
+            log("verify: the backup is held back; its own alert covers it")
+            return 1
+        if state == "failed" and not rev(gitdir, REF):
+            log("verify: nothing has reached the remote yet; tried again on the next verify")
+            return 1
+        if AFTER_BACKUP:
+            subprocess.run([AFTER_BACKUP], check=False)
+        local = rev(gitdir, REF)
+        tmp = tempfile.mkdtemp(prefix="memory-backup-verify.")
+        try:
+            fresh, tip = fetch_fresh(tmp, depth=1)
+            if tip != local:
+                problem = (f"the remote's {BRANCH} is at {tip[:12]}, not at the last commit made here "
+                           f"({(local or 'none')[:12]})")
+                continue
+            dest = os.path.join(tmp, "restored")
+            os.mkdir(dest, 0o700)
+            extract(fresh, tip, dest)
+            only_b, only_l, differ, left_out = compare(dest, FOLDER)
+            if only_b or only_l or differ:   # guard:mismatch
+                problem = (f"restoring {tip[:12]} from the remote does not give the live folder back: "
+                           f"{len(only_b)} only in the backup, {len(only_l)} only in the live folder, "
+                           f"{len(differ)} differ")
+                continue
+            if left_out:   # guard:leftout
+                items = [f"{safe(p)} ({why})" for p, why in left_out]
+                for item in items:
+                    print(f"  left out of every backup: {item}")
+                problem = (f"{len(left_out)} entr{'y' if len(left_out) == 1 else 'ies'} in the live folder "
+                           "are in no backup: " + listed(items))
+                break
+            problem = ""
+            log(f"verify: the remote's {tip[:12]} restores to the live folder, byte for byte")
+            break
+        except Unreachable:
+            # The run's own count reports a remote that stays out of reach.
+            log("verify: the remote cannot be reached; tried again on the next verify")
+            return 1
+        except (GitError, RuntimeError, OSError) as e:
+            problem = f"the check could not run ({e})"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if problem:
+        log("verify: " + problem)
+        alert("verify", "mismatch:" + digest(problem), f"Memory backup on {NAME}: the verify failed: {problem}. "
+              f"Its log: journalctl -u {NAME}-memory-verify.",
+              f"Memory backup on {NAME}: the verify passes again.")
+        return 1
+    return 0 if alert("verify", "clean", "", f"Memory backup on {NAME}: the verify passes again; the "
+                      f"remote's {BRANCH} restores to the live folder, byte for byte.") else 1
+
+
+# ------------------------------------------------------------------ main
+
+if not ARGS:
+    usage()
+cmd, rest = ARGS[0], ARGS[1:]
+try:
+    if cmd == "run":
+        if rest not in ([], ["--dry-run"], ["--accept-removals"], ["--adopt-remote"]):
+            usage()
+        sys.exit(cmd_run(rest == ["--dry-run"], rest == ["--accept-removals"], rest == ["--adopt-remote"]))
+    if cmd == "verify":
+        if rest:
+            usage()
+        sys.exit(cmd_verify())
+    if cmd == "restore":
+        at = into = ""
+        while rest:
+            if rest[0] == "--at" and len(rest) > 1:
+                at, rest = rest[1], rest[2:]
+            elif rest[0] == "--into" and len(rest) > 1:
+                into, rest = os.path.abspath(rest[1]), rest[2:]
+            else:
+                usage()
+        sys.exit(cmd_restore(at, into))
+    usage()
+except (GitError, RuntimeError, OSError) as e:
+    log(f"{cmd}: failed: {e}")
+    if cmd == "run" and os.path.isdir(STATE):
+        alert("run", "broken:" + digest(str(e)), f"Memory backup on {NAME}: a run failed: {e}. "
+              f"Its log: journalctl -u {UNIT}.", clear_run())
+    sys.exit(1)
+PY

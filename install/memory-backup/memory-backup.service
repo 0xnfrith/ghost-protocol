@@ -1,0 +1,85 @@
+# @WHAT@ for the Ghost Protocol instance @NAME@ (this unit is
+# @UNIT@). The installer (install/lib/memory-backup.sh, step 14, or
+# install/memory-backup/setup) makes it from
+# install/memory-backup/memory-backup.service with the manifest's
+# [memory_backup] filled in, and installs it in /etc/systemd/system with its
+# timer. Two units come from this one file: <name>-memory-backup.service (a
+# backup, run every 15 minutes by its timer and right after a memory write by
+# <name>-memory-backup.path) and <name>-memory-verify.service (the hourly
+# proof). The backup itself (install/memory-backup/backup) says what it reads,
+# keeps and sends; its settings are the root-owned file
+# @LIB@/settings.
+#
+# Credentials for the alerts' key command belong to the instance, in a drop-in
+# it owns, /etc/systemd/system/@UNIT@.service.d/instance.conf (as for the
+# auto-mode guard). The backup hands each one to the alert's send alone.
+#
+# The sandbox: it runs as @USER@, the instance home's owner (never root: the
+# installer refuses), with no capabilities and no way to gain any. Everything
+# is read-only except its state folder,
+# /var/lib/ghost-protocol/@NAME@-memory-backup (0700, its git repo and its
+# alert state; both units share it, one run at a time). Home folders are an
+# empty read-only tmpfs: only the memory folder is there, read-only, and node
+# and the manifest's read_paths when alerts go to Buzz. Network: IPv4, IPv6 and
+# local sockets, for the push and the alerts.
+#
+# Read it:  journalctl -u @UNIT@ (counts and outcomes, never a line of a note)
+# Run now:  sudo systemctl start @UNIT@.service
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: @WHAT@
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=/
+Environment=HOME=@HOME@ USER=@USER@ LOGNAME=@USER@
+Environment=PATH=/usr/bin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=@LIB@/backup @COMMAND@
+StateDirectory=ghost-protocol/@NAME@-memory-backup
+StateDirectoryMode=0700
+UMask=0077
+# Up to 5 minutes waiting for the other unit's run, then the fetch, the push
+# and an alert.
+TimeoutStartSec=15min
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere except the state folder.
+ProtectSystem=strict
+# Home folders: an empty read-only tmpfs, with only these paths in it, read-only.
+# A path that is missing does not stop the start (the "-"): the backup then
+# finds the folder missing and says so.
+ProtectHome=tmpfs
+BindReadOnlyPaths=-@FOLDER@
+@READ_PATHS@
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+RemoveIPC=yes
+KeyringMode=private
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+Nice=10

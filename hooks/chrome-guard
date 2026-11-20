@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# chrome-guard: a Claude Code PreToolUse hook (matcher mcp__claude-in-chrome__.*).
+# The instance's main thread does not drive Chrome; a subagent does. Before
+# any Claude in Chrome tool call, this hook checks who is calling:
+#   - a subagent (the hook input carries `agent_id`) passes;
+#   - the instance's main thread is denied, with guidance: hand the job to a
+#     subagent, one at a time;
+#   - unless the operator explicitly said in chat that the agent may drive this
+#     one: the agent then opens a pass first, `touch <pass file>`, valid 15
+#     minutes from its mtime, and says so in its reply.
+# The plugin option chrome_guard switches it off.
+#
+# Which sessions are guarded: the instance's own, from the manifest of the
+# session's project (.ghost-protocol/instance.toml; hooks/lib/hook.sh). A
+# session is the instance's main thread when it carries no agent label or the
+# instance's name as its label, and it was launched in the instance's home (its
+# transcript lives in the project folder Claude Code names after the home,
+# which stays fixed after EnterWorktree or a cd) or is working there now
+# (outside .claude/worktrees). Sessions with another agent label, sessions
+# working in a worktree or another repo, and sessions with no manifest are left
+# alone. Any parse failure, a missing jq, or empty input fails open.
+#
+# The pass is self-serve (an honour system): the guard makes the agent stop
+# and route, it cannot verify what the operator said. The pass file
+# (<plugin data>/hooks/chrome-pass) is per machine, so a pass opened in one
+# session also covers another for its 15 minutes.
+#
+# Test: install/test/hook-chrome-guard.test.sh
+set -uo pipefail
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+hook_on chrome_guard || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+TTL=900
+input=$(cat)
+[ -n "$input" ] || exit 0
+agent_id=$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null) || exit 0
+agent_type=$(printf '%s' "$input" | jq -r '.agent_type // empty' 2>/dev/null) || exit 0
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null) || exit 0
+transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null) || exit 0
+
+# A subagent (or teammate) is calling: allowed.
+[ -n "$agent_id" ] && exit 0
+
+hook_instance "${CLAUDE_PROJECT_DIR:-$cwd}" || exit 0
+PRIMARY="$HOOK_HOME"   # a real path, as the hook input's cwd is
+
+# Only the instance's main thread is guarded: no label or the instance's name,
+# and launched in the home or working there (not in one of its worktrees).
+case "$agent_type" in
+  '' | "$HOOK_NAME") ;;
+  *) exit 0 ;;
+esac
+# Launched in the home: the transcript's project folder is fixed at launch, so
+# it still says so after EnterWorktree or a cd; cwd alone would not. Claude
+# Code names that folder after the launch path with every character but
+# A-Z, a-z and 0-9 turned to -, and a name longer than 200 characters cut to
+# 200 with - and a hash added.
+slug=$(printf '%s' "$PRIMARY" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')
+launched=""
+if [ -n "$transcript" ]; then
+  proj=$(basename "$(dirname "$transcript")")
+  if [ "${#slug}" -le 200 ]; then
+    [ "$proj" = "$slug" ] && launched=1
+  else
+    case "$proj" in "${slug:0:200}"-?*) launched=1 ;; esac
+  fi
+fi
+if [ -z "$launched" ]; then
+  case "$cwd" in
+    "$PRIMARY"/.claude/worktrees | "$PRIMARY"/.claude/worktrees/*) exit 0 ;;
+    "$PRIMARY" | "$PRIMARY"/*) ;;
+    *) exit 0 ;;
+  esac
+fi
+
+# The operator's explicit pass, still fresh: allowed.
+PASS="$(hook_state_dir)/chrome-pass"
+if [ -f "$PASS" ]; then
+  now=$(date +%s)
+  mtime=$(stat -c %Y "$PASS" 2>/dev/null || stat -f %m "$PASS" 2>/dev/null || echo 0)
+  case "$mtime" in '' | *[!0-9]*) mtime=0 ;; esac
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$TTL" ] && exit 0
+fi
+
+# Its folder exists, so the pass is one touch.
+mkdir -p "$(dirname "$PASS")" 2>/dev/null
+jq -n --arg pass "$PASS" '{
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: ("Chrome guard: you are the main thread of this instance, and the main thread does not drive the browser. Hand the job to a subagent, one browser job at a time, never several in parallel tabs. The subagent stops before any final button (a purchase, a send, a sign-in or an account setting) and reports back; those stay your operator'\''s. Only if your operator explicitly said in this chat that you may drive this one yourself: run touch " + ($pass | @sh) + " (the pass is valid for 15 minutes) and say so in your reply.")
+  }
+}'

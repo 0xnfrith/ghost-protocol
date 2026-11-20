@@ -1,0 +1,18 @@
+#!/bin/sh
+# Test stand-in for tesseract. It records only the call name and the argument
+# count. Its behaviour comes from files in $STUB_STATE: tesseract.version (the
+# version it reports), tesseract.nolang (no English data installed).
+S="${STUB_STATE:?}"
+echo "tesseract ${1:-} $#" >>"$S/calls"
+case "${1:-}" in
+    --version)
+        printf 'tesseract %s\n leptonica-1.82.0\n' "$(cat "$S/tesseract.version")" ;;
+    --list-langs)
+        echo 'List of available languages in "/usr/share/tessdata/" (2):'
+        [ -f "$S/tesseract.nolang" ] || echo eng
+        echo osd ;;
+    *)
+        echo "tesseract stub: unexpected call" >&2
+        exit 64 ;;
+esac
+exit 0

@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# install: the Ghost Protocol installer. It sets up a machine to run an
+# instance: a repo that holds a .ghost-protocol/instance.toml manifest.
+#
+# Usage: install/install --instance <owner/repo> [options]
+#
+# Steps, in order (each records OK, DONE, PLAN, SKIP or FAIL; a FAIL stops):
+#    1. preflight   OS, arch, sudo, free disk, git 2.46 or newer
+#    2. github      GitHub access: an exe.dev GitHub integration, a gh sign-in, or
+#                   a deploy key made here for the instance repo alone
+#    3. instance    clone the instance at main into <root>/<name> (an existing
+#                   clone is left as it is)
+#    4. manifest    read and check the manifest; then the GitHub account check
+#    5. layout      the root layout's folders and the worktree hook (docs/layout.md)
+#    6. setup       the instance's setup hook (setup.command in the manifest)
+#    7. claude      the pinned Claude Code, then the Claude sign-in check
+#   7b. statusline  GHOST Protocol's status line in the user's Claude Code settings
+#    8-16           secrets, lease, restore, plugins, ears, managed settings,
+#                   boot service, kit timer, status: built in later PRs, except
+#                   these parts of steps 11 and 14:
+#                   11: GHOST Protocol's own plugin, from this checkout as a
+#                       directory marketplace, at user scope (installed, or
+#                       refreshed when it is there; a failure stops the run),
+#                       and Anthropic's security-guidance plugin (installed if
+#                       missing; a failure is a warning)
+#                   14: the memory guard (earlyoom on Debian and Ubuntu; the
+#                       manifest's [memory_guard]) and the auto-mode guard (a
+#                       systemd timer; the manifest's [automode_guard]), where
+#                       a failure is a warning; and, on an update, the restart
+#                       of the instance's service
+#   17. tools       the tools the plugin's agents use: checked, never
+#                   installed; a missing one is a SKIP, not a stop
+#
+# An update (--update, which boot.sh --update passes after it moved the
+# checkout to the new pinned commit) runs only steps 1, 3 (the home already on
+# this machine: --instance-dir, or ~/<repo>; never a clone), 4, 7 (the pinned
+# Claude Code, without the sign-in check), 11 (with the Buzz adapter's
+# dependencies installed again when its lockfile changed) and 14 (the memory
+# and auto-mode guards, then the restart of <name>.service when the checkout
+# moved). It asks no menu questions. A run without --update checks everything.
+#
+# Options:
+#   --instance <owner/repo>        the instance repo (required)
+#   --instance-dir <path>          where to clone it (default: <root>/<name> from the manifest)
+#   --profile vm|laptop            default: vm on Linux, laptop on macOS
+#   --identity real|rehearsal      menu item 4 (default real)
+#   --old dead|stopped             menu item 1: where the old ghost is (default dead)
+#   --takeover <host>              menu item 1: take over from a ghost that may be running
+#   --kit latest|<host>[@<time>]   menu item 2 (default latest, the newest kit)
+#   --with-transcripts             menu item 3: pull transcripts too (default off)
+#   --github auto|integration|token|deploykey
+#                                  how to reach GitHub (default auto; deploykey is
+#                                  only ever chosen by this flag: see
+#                                  install/lib/github.sh)
+#   --yes                          no menu: take the defaults and the flags given
+#   --dry-run                      print every step, change nothing (read-only checks only)
+#   --update                       the update steps only (see above); boot.sh --update passes it
+#   --no-restore, --no-service, --no-start, --no-archive, --no-announce
+#                                  accepted and recorded; their steps come in later PRs
+#   -h, --help                     this help
+#
+# The menu and the sign-ins read from $GP_TTY (default /dev/tty).
+# Exit codes: 0 ok, 1 a step failed, 2 usage, 3 unsupported platform,
+#             4 needs a terminal, 5 wrong account, 6 the deploy key is not
+#             added to the instance repo yet (deploykey mode: its public key is
+#             printed; add it with write access, then run again).
+set -uo pipefail
+
+GP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+LIB="$GP_DIR/install/lib"
+# shellcheck source=lib/common.sh
+. "$LIB/common.sh"
+# shellcheck source=lib/report.sh
+. "$LIB/report.sh"
+# shellcheck source=lib/menu.sh
+. "$LIB/menu.sh"
+# shellcheck source=lib/preflight.sh
+. "$LIB/preflight.sh"
+# shellcheck source=lib/github.sh
+. "$LIB/github.sh"
+# shellcheck source=lib/instance.sh
+. "$LIB/instance.sh"
+# shellcheck source=lib/layout.sh
+. "$LIB/layout.sh"
+# shellcheck source=lib/claude.sh
+. "$LIB/claude.sh"
+# shellcheck source=lib/plugins.sh
+. "$LIB/plugins.sh"
+# shellcheck source=lib/tools.sh
+. "$LIB/tools.sh"
+# shellcheck source=lib/statusline.sh
+. "$LIB/statusline.sh"
+# shellcheck source=lib/service.sh
+. "$LIB/service.sh"
+# shellcheck source=lib/memory-backup.sh
+. "$LIB/memory-backup.sh"
+
+usage() { sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; }
+usage_error() { echo "install: $*" >&2; echo "Try: install/install --help" >&2; exit 2; }
+
+INSTANCE=""
+INSTANCE_DIR_OPT=""
+PROFILE=""
+IDENTITY=real
+OLD=dead
+TAKEOVER=""
+KIT=latest
+TRANSCRIPTS=0
+GITHUB_OPT=auto
+YES=0
+DRY_RUN=0
+UPDATE_MODE=0
+LATER_FLAGS=""
+EXIT_CODE=""
+HAVE_TTY=0
+
+need_value() { [ "$2" -ge 2 ] || usage_error "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --instance)       need_value "$1" $#; INSTANCE="$2"; shift 2 ;;
+        --instance-dir)   need_value "$1" $#; INSTANCE_DIR_OPT="$2"; shift 2 ;;
+        --profile)        need_value "$1" $#; PROFILE="$2"; shift 2 ;;
+        --identity)       need_value "$1" $#; IDENTITY="$2"; shift 2 ;;
+        --old)            need_value "$1" $#; OLD="$2"; shift 2 ;;
+        --takeover)       need_value "$1" $#; OLD=takeover; TAKEOVER="$2"; shift 2 ;;
+        --kit)            need_value "$1" $#; KIT="$2"; shift 2 ;;
+        --with-transcripts) TRANSCRIPTS=1; shift ;;
+        --github)         need_value "$1" $#; GITHUB_OPT="$2"; shift 2 ;;
+        --yes|-y)         YES=1; shift ;;
+        --dry-run|-n)     DRY_RUN=1; shift ;;
+        --update)         UPDATE_MODE=1; shift ;;
+        --no-restore|--no-service|--no-start|--no-archive|--no-announce)
+                          LATER_FLAGS="$LATER_FLAGS $1"; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                usage_error "unknown option: $1" ;;
+    esac
+done
+
+# ---------------------------------------------------------------- checks
+
+[ -n "$INSTANCE" ] || usage_error "--instance <owner/repo> is required"
+RE_REPO='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+[[ $INSTANCE =~ $RE_REPO ]] || usage_error "--instance must be owner/repo, not '$INSTANCE'"
+case "$INSTANCE" in .*|*/.*) usage_error "--instance: owner and repo must not start with a dot" ;; esac
+case "$IDENTITY" in real|rehearsal) ;; *) usage_error "--identity must be real or rehearsal" ;; esac
+case "$OLD" in dead|stopped|takeover) ;; *) usage_error "--old must be dead or stopped (to take over a running one: --takeover <host>)" ;; esac
+if [ "$OLD" = "takeover" ] && ! [[ $TAKEOVER =~ $RE_HOST ]]; then usage_error "--takeover needs a host name"; fi
+[[ $KIT =~ $RE_KIT ]] || usage_error "--kit must be latest or <host>[@<time>]"
+case "$GITHUB_OPT" in auto|integration|token|deploykey) ;; *) usage_error "--github must be auto, integration, token or deploykey" ;; esac
+
+if ! detect_platform; then
+    echo "install: unsupported platform $GP_OS/$GP_ARCH (Linux x86_64 or aarch64, macOS arm64)" >&2
+    exit 3
+fi
+if [ -z "$PROFILE" ]; then
+    if [ "$GP_OS" = "macos" ]; then PROFILE=laptop; else PROFILE=vm; fi
+fi
+case "$PROFILE" in vm|laptop) ;; *) usage_error "--profile must be vm or laptop" ;; esac
+
+GP_COMMIT="${GP_COMMIT:-$(git -C "$GP_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
+load_pins || exit 1
+
+trap cleanup_work EXIT
+
+printf 'Ghost Protocol installer (%s/%s, ghost-protocol %s, instance %s)%s\n' \
+    "$GP_OS" "$GP_ARCH" "$GP_COMMIT" "$INSTANCE" \
+    "$([ "$DRY_RUN" = "1" ] && echo ', DRY RUN: nothing is changed')"
+for f in $LATER_FLAGS; do say "$f: recorded; built in a later PR"; done
+if [ "$UPDATE_MODE" = "1" ]; then
+    if [ -n "${GP_PREVIOUS_COMMIT:-}" ] && [ "$GP_PREVIOUS_COMMIT" != "$GP_COMMIT" ]; then
+        say "update: from $GP_PREVIOUS_COMMIT to $GP_COMMIT"
+    else
+        say "update: the checkout is at $GP_COMMIT and did not move"
+    fi
+fi
+
+# The terminal, opened once on file descriptor 3 for the menu and the sign-ins.
+GP_TTY="${GP_TTY:-/dev/tty}"
+if ( : <"$GP_TTY" ) 2>/dev/null; then
+    exec 3<"$GP_TTY"
+    HAVE_TTY=1
+fi
+
+# ---------------------------------------------------------------- menu
+
+if [ "$UPDATE_MODE" = "1" ]; then
+    heading "Choices (update: none asked)"
+    menu_print
+elif [ "$YES" = "1" ]; then
+    heading "Choices (--yes)"
+    menu_print
+elif [ "$HAVE_TTY" = "1" ]; then
+    menu_run
+    rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+elif [ "$DRY_RUN" = "1" ]; then
+    heading "Choices (no terminal; a real run asks, or takes --yes)"
+    menu_print
+else
+    echo "install: no terminal for the menu. Run it in a terminal (ssh -t), or pass --yes." >&2
+    exit 4
+fi
+
+# ---------------------------------------------------------------- steps
+
+finish() {
+    report_print
+    say "choices: $(menu_choices_line)"
+    if [ -n "$LATER_FLAGS" ]; then say "recorded for later PRs:$LATER_FLAGS"; fi
+    if [ "$UPDATE_MODE" = "1" ] && [ "$DRY_RUN" != "1" ] && [ "$REPORT_FAILS" -gt 0 ] \
+        && [ -n "${GP_PREVIOUS_COMMIT:-}" ] && [ "$GP_PREVIOUS_COMMIT" != "$GP_COMMIT" ]; then
+        # The checkout already moved, and Claude Code reads the plugin from it:
+        # the instance's next start of any kind (a crash, a reboot) loads it.
+        case "$RESULTS" in
+            *"FAIL|restart|"*)
+                say "The update is in place ($GP_DIR is at $GP_COMMIT), but the running instance was not restarted:"
+                say "  restart it with the command above, or go back to $GP_PREVIOUS_COMMIT:" ;;
+            *)
+                say "The update stopped, but $GP_DIR is already at $GP_COMMIT, and Claude Code reads the plugin"
+                say "  from that folder: the instance's next start (a crash, a reboot) would load it. Go back now:" ;;
+        esac
+        say "  bash $GP_DIR/install/boot.sh --instance $INSTANCE --dir $GP_DIR --rollback (and the other options you gave)"
+    fi
+    if [ -n "$EXIT_CODE" ]; then exit "$EXIT_CODE"; fi
+    if [ "$REPORT_FAILS" -gt 0 ]; then exit 1; fi
+    exit 0
+}
+
+later_step() {   # number name what which-later-PR
+    heading "$1. $2"
+    if [ "$DRY_RUN" = "1" ]; then
+        say "would: $3 (built in $4)"
+        record PLAN "$2" "$3: built in $4"
+    else
+        say "skipped: $3 (built in $4)"
+        record SKIP "$2" "$3: built in $4"
+    fi
+}
+KIT_PR="the later store, kit and lease PR"
+BOOT_PR="the later supervisor and boot PR"
+
+tr_note=OFF
+[ "$TRANSCRIPTS" = "1" ] && tr_note=ON
+
+if [ "$UPDATE_MODE" = "1" ]; then
+    step_preflight        || finish
+    step_instance_update  || finish
+    step_manifest         || finish
+    step_claude           || finish
+    record SKIP update "update: GitHub access, the layout, the setup hook, the Claude sign-in, the status line and the tools are not checked; a run without --update checks them"
+    step_plugins          || finish
+    step_service          || finish
+    finish
+fi
+
+step_preflight      || finish
+step_github         || finish
+step_instance       || finish
+step_manifest       || finish
+if [ -n "$M_GITHUB_LOGIN" ]; then
+    step_github_account || finish
+    step_github_config  || finish
+else
+    record PLAN account "would check the GitHub account once the manifest is read"
+fi
+step_layout         || finish
+step_setup          || finish
+step_claude         || finish
+step_statusline     || finish
+later_step 8  secrets   "the instance's secrets hook" "$KIT_PR"
+later_step 9  lease     "the lease check (old ghost: $(menu_old_label))" "$KIT_PR"
+later_step 10 restore   "restore the kit ($KIT; transcripts $tr_note; identity $IDENTITY)" "$KIT_PR"
+step_plugins        || finish
+later_step 12 ears      "ears config from the instance's templates" "$BOOT_PR"
+later_step 13 managed   "managed settings: the channel allowlist" "$BOOT_PR"
+step_service        || finish
+later_step 15 kit-timer "the kit timer" "$BOOT_PR"
+later_step 16 status    "status, then wait for the back-online message" "$BOOT_PR"
+step_tools
+finish

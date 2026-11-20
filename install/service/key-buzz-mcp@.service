@@ -1,0 +1,79 @@
+# One buzz-mcp (gp-key-<name>-buzz-mcp@.service: Block's Buzz tools) of the
+# Ghost Protocol instance @NAME@, started by its socket for each connection.
+# install/keyservice/setup makes it from install/service/key-buzz-mcp@.service
+# for GHOST Protocol commit @COMMIT@.
+#
+# It runs as @KEY_USER@, the key's user: never the instance's own user, so the
+# model's processes cannot read this process's memory or environment. The key
+# arrives as a file descriptor systemd opens as root (OpenFile=); that user
+# cannot open the file itself. launch.mjs serve reads it, closes it, and sets
+# it from inside this one process (adapters/buzz/README.md, "Key service").
+#
+# Files: buzz-mcp's path and files arguments read only @SRV@/files
+# (BUZZ_MCP_ROOT), which only the key's user writes; the session puts a file
+# there through its outbox (@SRV@/outbox: the key service's copy step).
+# media_get saves into @SRV@/media, which the instance's user can read.
+#   journalctl -u 'gp-key-@NAME@-buzz-mcp@*'
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: buzz-mcp, as the key's user
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=@KEY_USER@
+Group=@KEY_USER@
+ExecStart=@NODE@ --disable-sigusr1 @CODE@/adapters/buzz/src/launch.mjs serve buzz-mcp
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+OpenFile=@ETC@/buzz-key:buzz-key:read-only
+@TAG_CREDENTIAL@
+EnvironmentFile=@ETC@/buzz.env
+Environment=BUZZ_MCP_PATH=@CODE@/buzz-mcp/buzz-mcp.mjs
+Environment=BUZZ_MCP_ROOT=@SRV@/files
+Environment=BUZZ_STATE_DIR=@STATE@
+Environment=TMPDIR=@SRV@/media
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_COMPILE_CACHE LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF OPENSSL_MODULES OPENSSL_ENGINES
+WorkingDirectory=@SRV@/files
+StateDirectory=ghost-protocol-key/@NAME@
+StateDirectoryMode=0700
+ReadWritePaths=@SRV@/media
+# Media it saves is readable by the instance's group (the folder is setgid).
+UMask=0027
+LimitCORE=0
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere but its state and media folders; home folders are not
+# there at all.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+KeyringMode=private
+# Other processes are hidden, and /proc shows only process folders.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# The relay only: IPv4, IPv6, local sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

@@ -1,0 +1,8 @@
+#!/bin/sh
+# gp: the image's commands (gp.mjs), always as the agent's own user, node,
+# also when docker exec runs as root (the image's user is root so that the
+# update helper can reach the Docker socket; see docker/entrypoint.sh).
+if [ "$(id -u)" = 0 ]; then
+    exec setpriv --reuid=node --regid=node --init-groups -- node /opt/gp/gp.mjs "$@"
+fi
+exec node /opt/gp/gp.mjs "$@"

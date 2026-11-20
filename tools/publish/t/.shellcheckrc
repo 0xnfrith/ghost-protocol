@@ -1,0 +1,3 @@
+# Plain `shellcheck tools/publish/t/*.sh` follows the `. lib.sh` of each test file, from the file's own folder.
+external-sources=true
+source-path=SCRIPTDIR

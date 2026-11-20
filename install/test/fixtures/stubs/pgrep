@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test stand-in for pgrep. It records the call and finds a process only when
+# $STUB_STATE/claude.running exists.
+echo "pgrep $#" >>"${STUB_STATE:?}/calls"
+[ -f "$STUB_STATE/claude.running" ] && { echo 4242; exit 0; }
+exit 1

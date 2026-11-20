@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+// gp-github-review: the session's side of a key service's GitHub review
+// action (README.md here). It holds no key: it sends one request to the key
+// service's socket (/run/ghost-protocol-key/<name>/github.sock) and prints
+// the answer. The key's side checks everything again, and is the only side
+// that decides.
+//
+//   gp-github-review [--socket <folder>] [--json] review <owner/repo> <pr> <head-sha> <APPROVE|REQUEST_CHANGES|COMMENT> [<body> | -]
+//   gp-github-review [--socket <folder>] [--json] fingerprint | app
+//
+// Exit codes: 0 done; 1 refused (the reason on stderr); 2 usage.
+//
+// A plain script (no extension, so CommonJS): it loads the module beside it
+// in this checkout, also when it is reached through a link (node runs a
+// script from its real path).
+"use strict";
+const { join } = require("node:path");
+const { pathToFileURL } = require("node:url");
+
+import(pathToFileURL(join(__dirname, "..", "..", "adapters", "buzz", "src", "github-review.mjs")).href).then(async (m) => {
+  process.exitCode = await m.main(process.argv.slice(2));
+});

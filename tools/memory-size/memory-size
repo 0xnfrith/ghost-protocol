@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# memory-size: measures an agent's Claude Code auto memory, and says once when
+# a measure first passes the limit set for it. It only reads the memory
+# folder: it never writes, moves or deletes anything in it. Its one file of
+# its own, the state, lives wherever the caller says (the hook keeps it in the
+# instance's own state folder, never in the memory folder).
+#
+#   memory-size measure <folder>
+#       Prints the four measures, one KEY=value line each:
+#         index_lines   MEMORY.md's lines (a last line with no newline counts)
+#         index_bytes   MEMORY.md's bytes
+#         notes         the .md files in the folder and below it, MEMORY.md not counted
+#         folder_bytes  the bytes of every file in the folder and below it, MEMORY.md included
+#       A missing folder or MEMORY.md measures 0.
+#
+#   memory-size check <folder> <state file> [--index-lines N] [--index-bytes N] [--notes N] [--folder-kib N]
+#       The limits: a measure is past its limit when it is more than N
+#       (--folder-kib in KiB, 1024 bytes). A limit that is not a whole number
+#       of at least 1 is unset. With no limit set it reads nothing, writes
+#       nothing and prints nothing.
+#       Otherwise it measures, and prints one note, for the agent to pass on
+#       to its operator, when a measure is past its limit and was not at the
+#       last check: the measures that just passed, with their limits (the
+#       defaults or the operator's), all four numbers, and the plugin setting
+#       of each limit that passed (memory_limit_index_lines,
+#       memory_limit_index_bytes, memory_limit_notes or
+#       memory_limit_folder_kib), which the operator can set to another
+#       number, or to off. A measure that stays past its limit is not said
+#       again; one that comes back to its limit or under it is forgotten, so
+#       passing it again is said again. The state file holds one line per
+#       measure past its limit and is replaced in one step, only when it
+#       changes. A state file that is a symlink is not read or written.
+#       Exit 0, also when it prints nothing; 2 on a usage error.
+#
+# bash 3.2 compatible (macOS). Test: tools/memory-size/test
+set -uo pipefail
+
+usage() {
+    echo "usage: memory-size measure <folder>" >&2
+    echo "       memory-size check <folder> <state file> [--index-lines N] [--index-bytes N] [--notes N] [--folder-kib N]" >&2
+    exit 2
+}
+
+# commas N: 21028 -> 21,028
+commas() {
+    local n="$1" out=""
+    while [ "${#n}" -gt 3 ]; do
+        out=",${n: -3}$out"
+        n="${n:0:${#n}-3}"
+    done
+    printf '%s%s' "$n" "$out"
+}
+
+# limit VALUE: VALUE when it is a whole number of at least 1 (at most 15 digits), else empty.
+limit() {
+    case "$1" in
+        '' | 0* | *[!0-9]*) return 0 ;;
+    esac
+    [ "${#1}" -le 15 ] || return 0
+    printf '%s' "$1"
+}
+
+# measure FOLDER: sets INDEX_LINES INDEX_BYTES NOTES FOLDER_BYTES. Reads only.
+measure() {
+    local dir="$1" index="$1/MEMORY.md" n
+    INDEX_LINES=0 INDEX_BYTES=0 NOTES=0 FOLDER_BYTES=0
+    [ -d "$dir" ] || return 0
+    if [ -f "$index" ]; then
+        INDEX_LINES=$(awk 'END { print NR }' "$index" 2>/dev/null) || INDEX_LINES=0
+        INDEX_BYTES=$(wc -c <"$index" 2>/dev/null | tr -d ' ') || INDEX_BYTES=0
+    fi
+    # -H: the folder itself may be a symlink; nothing below it is followed.
+    n=$(find -H "$dir" -type f -name '*.md' -print0 2>/dev/null | tr -cd '\000' | wc -c | tr -d ' ')
+    NOTES=${n:-0}
+    if [ -f "$index" ] && [ ! -L "$index" ] && [ "$NOTES" -gt 0 ]; then NOTES=$((NOTES - 1)); fi
+    n=$(find -H "$dir" -type f -exec cat {} + 2>/dev/null | wc -c | tr -d ' ')
+    FOLDER_BYTES=${n:-0}
+    case "$INDEX_LINES$INDEX_BYTES$NOTES$FOLDER_BYTES" in *[!0-9]*) INDEX_LINES=0 INDEX_BYTES=0 NOTES=0 FOLDER_BYTES=0 ;; esac
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    measure)
+        [ $# -eq 2 ] || usage
+        measure "$2"
+        printf 'index_lines=%s\nindex_bytes=%s\nnotes=%s\nfolder_bytes=%s\n' "$INDEX_LINES" "$INDEX_BYTES" "$NOTES" "$FOLDER_BYTES"
+        exit 0
+        ;;
+    check) ;;
+    *) usage ;;
+esac
+
+[ $# -ge 3 ] || usage
+folder="$2" state="$3"
+shift 3
+L_INDEX_LINES="" L_INDEX_BYTES="" L_NOTES="" L_FOLDER_KIB=""
+while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || usage
+    case "$1" in
+        --index-lines) L_INDEX_LINES=$(limit "$2") ;;
+        --index-bytes) L_INDEX_BYTES=$(limit "$2") ;;
+        --notes) L_NOTES=$(limit "$2") ;;
+        --folder-kib) L_FOLDER_KIB=$(limit "$2") ;;
+        *) usage ;;
+    esac
+    shift 2
+done
+
+# No limit set: nothing is read, written or printed.
+[ -n "$L_INDEX_LINES$L_INDEX_BYTES$L_NOTES$L_FOLDER_KIB" ] || exit 0
+[ ! -L "$state" ] || exit 0
+
+measure "$folder"
+FOLDER_KIB=$(((FOLDER_BYTES + 1023) / 1024))
+
+was=""
+[ -f "$state" ] && was=$(cat "$state" 2>/dev/null)
+had() { printf '%s\n' "$was" | grep -qx "$1 over"; }
+
+now=""     # the state after this check
+passed=()  # what passed its limit since the last check
+settings=() # the plugin settings of those limits
+# over KEY VALUE LIMIT TEXT: VALUE is past LIMIT (both in the same unit). KEY's setting is memory_limit_KEY.
+over() {
+    [ -n "$3" ] || return 0
+    [ "$2" -gt "$3" ] || return 0
+    now="$now$1 over
+"
+    had "$1" && return 0
+    passed+=("$4")
+    settings+=("memory_limit_$1")
+}
+over index_lines "$INDEX_LINES" "$L_INDEX_LINES" "MEMORY.md has $(commas "$INDEX_LINES") lines (limit $(commas "${L_INDEX_LINES:-0}"))"
+over index_bytes "$INDEX_BYTES" "$L_INDEX_BYTES" "MEMORY.md has $(commas "$INDEX_BYTES") bytes (limit $(commas "${L_INDEX_BYTES:-0}"))"
+over notes "$NOTES" "$L_NOTES" "the folder has $(commas "$NOTES") notes (limit $(commas "${L_NOTES:-0}"))"
+over folder_kib "$FOLDER_BYTES" "${L_FOLDER_KIB:+$((L_FOLDER_KIB * 1024))}" "the folder holds $(commas "$FOLDER_KIB") KiB (limit $(commas "${L_FOLDER_KIB:-0}") KiB)"
+
+if [ "$now" != "${was:+$was
+}" ]; then
+    if [ -z "$now" ]; then
+        rm -f "$state"
+    else
+        dir=$(dirname "$state")
+        if [ -d "$dir" ] && tmp=$(mktemp "$dir/.memory-size.XXXXXX"); then
+            if printf '%s' "$now" >"$tmp" && mv -f "$tmp" "$state"; then :; else rm -f "$tmp"; exit 0; fi
+        else
+            exit 0 # no state kept, so no note: one could never stop repeating
+        fi
+    fi
+fi
+
+[ ${#passed[@]} -gt 0 ] || exit 0
+# and_list ITEM...: "a", "a and b", "a, b and c".
+and_list() {
+    local out="$1"
+    shift
+    while [ $# -gt 0 ]; do
+        if [ $# -eq 1 ]; then out="$out and $1"; else out="$out, $1"; fi
+        shift
+    done
+    printf '%s' "$out"
+}
+what=$(and_list "${passed[@]}")
+names=$(and_list "${settings[@]}")
+if [ ${#passed[@]} -eq 1 ]; then
+    limits="its memory limit (the default, or one your operator set)" change="it: set $names to another number"
+else
+    limits="its memory limits (the defaults, or ones your operator set)" change="them: set $names to other numbers"
+fi
+printf '%s' "[GHOST Protocol] Your Claude Code auto memory passed $limits: $what. Tell your operator once, in your DM with them on Buzz, with these numbers: MEMORY.md $(commas "$INDEX_LINES") lines and $(commas "$INDEX_BYTES") bytes; $(commas "$NOTES") notes; $(commas "$FOLDER_KIB") KiB in all. Tell them too how to change $change, or to off. Only tell them: do not change your memory because of this note. You will not be told again until a measure comes back under its limit and passes it again."
+exit 0

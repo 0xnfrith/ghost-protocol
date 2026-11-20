@@ -1,0 +1,31 @@
+# The backlog's tests (backlog/test/), on Linux. They run the real command lines of backlog/schema/ against made-up records and
+# repositories in temp folders (git needs no configuration: each repository gets its own, and ignores the machine's), so they need
+# node 22 and git, which the runner has. No secrets, no network, no bun.
+name: backlog-test
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when backlog/ or
+  # the plugin manifest changes (or anything under .github/). Its `all-tests`
+  # check is the one that is required. Run by hand from the Actions tab with
+  # workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backlog-test:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml).
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: backlog tests
+        run: node --test backlog/test/*.test.mjs

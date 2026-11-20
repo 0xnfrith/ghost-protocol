@@ -1,0 +1,4 @@
+# The block/buzz-app commit that buzz-mcp is built from.
+# Change it only by pull request; see README.md, "Updating buzz-mcp".
+repo=https://github.com/block/buzz-app
+commit=facef4d5bdb494dca46f20c5bd881e402d2b4331

@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# The tests of tools/release/release, in temporary repositories, with a stand-in gh (no network, no secret). Passes by exiting 0.
+set -u
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+REL=$ROOT/tools/release/release
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+pass=0
+fail=0
+check_eq() { # name got want
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok    $1"; else
+    fail=$((fail + 1)); echo "FAIL  $1"; printf '      got:  %s\n      want: %s\n' "${2//$'\n'/ | }" "${3//$'\n'/ | }"
+  fi
+}
+has() { grep -qF -e "$1" <<<"$2"; } # has <text> <output>
+check_has() { if has "$2" "$3"; then pass=$((pass + 1)); echo "ok    $1"; else fail=$((fail + 1)); echo "FAIL  $1"; printf '      wanted: %s\n      in:     %s\n' "$2" "${3//$'\n'/ | }"; fi; }
+export GIT_AUTHOR_NAME="Dev" GIT_AUTHOR_EMAIL="dev@example.com" GIT_COMMITTER_NAME="Dev" GIT_COMMITTER_EMAIL="dev@example.com"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+for tool in git jq; do command -v "$tool" >/dev/null || { echo "SKIP  $tool is not installed"; exit 0; }; done
+
+# A stand-in gh: `gh api --paginate <path>` prints $GH_RUNS (a JSON file) and logs the path to $GH_LOG; anything else fails.
+mkdir "$T/bin"
+cat >"$T/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = api ] && [ "${2:-}" = --paginate ]; then
+  echo "$3" >>"$GH_LOG"
+  [ -f "$GH_RUNS" ] || exit 1
+  cat "$GH_RUNS"
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "$T/bin/gh"
+export PATH="$T/bin:$PATH" GH_LOG="$T/gh.log" GH_RUNS="$T/runs.json"
+
+# runs <name:app:status:conclusion>...: what GitHub reports for the commit.
+runs() {
+  local items=() a name app status concl
+  for a in "$@"; do
+    IFS=: read -r name app status concl <<<"$a"
+    items+=("{\"name\":\"$name\",\"app\":{\"id\":$app},\"status\":\"$status\",\"conclusion\":$([ -n "$concl" ] && echo "\"$concl\"" || echo null)}")
+  done
+  printf '{"total_count":%d,"check_runs":[%s]}\n' "$#" "$(IFS=,; echo "${items[*]:-}")" >"$GH_RUNS"
+}
+green() { runs all-tests:15368:completed:success gates:15368:completed:success; }
+
+# A world: a bare origin at $T/acme/widget.git and a clone at $T/w, main at version $1.
+world() {
+  rm -rf "$T/acme" "$T/w" "$GH_LOG"
+  mkdir -p "$T/acme"
+  git init -q -b main --bare "$T/acme/widget.git"
+  git clone -q "$T/acme/widget.git" "$T/w" 2>/dev/null
+  mkdir -p "$T/w/.claude-plugin" "$T/w/.github"
+  printf '{"name":"x","version":"%s"}\n' "$1" >"$T/w/.claude-plugin/plugin.json"
+  printf '# the checks\n15368 all-tests\n' >"$T/w/.github/required-checks"
+  git -C "$T/w" add -A
+  git -C "$T/w" commit -q -m "Start at $1"
+  git -C "$T/w" push -q origin main 2>/dev/null
+  green
+}
+bump() { # version: a new commit on origin/main with that plugin.json version
+  printf '{"name":"x","version":"%s"}\n' "$1" >"$T/w/.claude-plugin/plugin.json"
+  git -C "$T/w" commit -q -am "Version $1"
+  git -C "$T/w" push -q origin main 2>/dev/null
+}
+rel() { (cd "$T/w" && "$REL" "$@" 2>&1); }
+out=""
+rc=0
+run() { rc=0; out=$(rel "$@") || rc=$?; }
+remote_tags() { git -C "$T/acme/widget.git" tag --list | tr '\n' ' '; }
+
+# A dry run prints the plan and tags nothing.
+world 1.2.3
+run
+check_eq "dry run: exit 0" "$rc" "0"
+check_has "dry run: names the tag, remote and repository" "release: v1.2.3 from origin/main (acme/widget)" "$out"
+check_has "dry run: names the version" "version:  1.2.3" "$out"
+check_has "dry run: shows the required check" "required: all-tests  success" "$out"
+check_has "dry run: says what it would do" "would:    make the annotated tag v1.2.3" "$out"
+check_has "dry run: says it is a dry run" "dry run, nothing tagged" "$out"
+check_eq "dry run: no tag on the remote" "$(remote_tags)" ""
+check_eq "dry run: no tag here" "$(git -C "$T/w" tag --list)" ""
+check_eq "the check runs of the tip commit were asked for" "$(cat "$GH_LOG")" "repos/acme/widget/commits/$(git -C "$T/w" rev-parse HEAD)/check-runs?per_page=100"
+
+# --apply cuts an annotated tag on the commit, and pushes it.
+run --apply
+check_eq "apply: exit 0" "$rc" "0"
+check_eq "apply: the tag is on the remote" "$(remote_tags)" "v1.2.3 "
+check_eq "apply: it is an annotated tag" "$(git -C "$T/w" cat-file -t refs/tags/v1.2.3)" "tag"
+check_eq "apply: it points at the commit" "$(git -C "$T/w" rev-parse 'v1.2.3^{commit}')" "$(git -C "$T/w" rev-parse HEAD)"
+check_eq "apply: the remote's tag is the same object" "$(git -C "$T/acme/widget.git" rev-parse v1.2.3)" "$(git -C "$T/w" rev-parse v1.2.3)"
+run --apply
+check_eq "again: refused (exit 2)" "$rc" "2"
+check_has "again: says the tag exists" "already exists" "$out"
+
+# A tag that is not plugin.json's version.
+world 1.2.3
+run v1.2.4
+check_eq "tag differs from the version: refused" "$rc" "2"
+check_has "tag differs: says so" "is not plugin.json's version at that commit (v1.2.3)" "$out"
+run 1.2.3
+check_eq "a tag without the v: refused" "$rc" "2"
+printf '{"name":"x","version":"1.2"}\n' >"$T/w/.claude-plugin/plugin.json"
+git -C "$T/w" commit -q -am "bad version" && git -C "$T/w" push -q origin main 2>/dev/null
+run
+check_eq "a version that is not x.y.z: refused" "$rc" "2"
+printf '{"name":"x"}\n' >"$T/w/.claude-plugin/plugin.json"
+git -C "$T/w" commit -q -am "no version" && git -C "$T/w" push -q origin main 2>/dev/null
+run
+check_eq "no version in plugin.json: refused" "$rc" "2"
+
+# Not green.
+world 1.2.3
+for case in "not reported|gates:15368:completed:success" \
+  "failed|all-tests:15368:completed:failure" \
+  "cancelled|all-tests:15368:completed:cancelled" \
+  "still running|all-tests:15368:in_progress:" \
+  "queued|all-tests:15368:queued:" \
+  "from another app|all-tests:99:completed:success" \
+  "another check failed|all-tests:15368:completed:success lint:15368:completed:failure" \
+  "another check running|all-tests:15368:completed:success lint:15368:in_progress:"; do
+  label=${case%%|*}
+  # shellcheck disable=SC2086
+  runs ${case#*|}
+  run --apply
+  check_eq "$label: refused (exit 2)" "$rc" "2"
+  check_has "$label: says it is not green" "is not green: nothing is tagged" "$out"
+  check_eq "$label: nothing tagged" "$(remote_tags)$(git -C "$T/w" tag --list)" ""
+done
+runs all-tests:15368:completed:success docs:15368:completed:skipped lint:15368:completed:neutral
+run
+check_eq "skipped and neutral checks do not stop it" "$rc" "0"
+rm "$GH_RUNS"
+run
+check_eq "GitHub unreadable: refused (exit 2)" "$rc" "2"
+green
+git -C "$T/w" rm -q .github/required-checks && git -C "$T/w" commit -q -m "no list" && git -C "$T/w" push -q origin main 2>/dev/null
+run
+check_eq "no list of required checks: refused" "$rc" "2"
+check_has "no list: says why" "no way to tell what green means" "$out"
+
+# Tags are never moved, and a new one is higher.
+world 1.2.3
+git -C "$T/w" tag v0.9.0 && git -C "$T/w" push -q origin v0.9.0 2>/dev/null
+run
+check_eq "a higher version than the existing tags: ok" "$rc" "0"
+git clone -q "$T/acme/widget.git" "$T/w2" 2>/dev/null
+git -C "$T/w2" tag v1.2.3 && git -C "$T/w2" push -q origin v1.2.3 2>/dev/null
+rm -rf "$T/w2"
+git -C "$T/w" tag -d v0.9.0 >/dev/null
+run
+check_eq "a tag that exists only on the remote: refused" "$rc" "2"
+check_has "a remote-only tag: says so" "already exists on origin" "$out"
+
+order() { # existing... -- new: what the script says about v<new> after those tags exist
+  world "${*: -1}"
+  local t
+  for t in "${@:1:$#-1}"; do git -C "$T/w" tag "v$t" && git -C "$T/w" push -q origin "v$t" 2>/dev/null; done
+  git -C "$T/w" tag -l | xargs -r git -C "$T/w" tag -d >/dev/null # only the remote holds them: fetched back by the script
+  run
+  echo "$rc"
+}
+check_eq "1.10.0 is higher than 1.9.0" "$(order 1.9.0 1.10.0)" "0"
+check_eq "1.9.0 is not higher than 1.10.0" "$(order 1.10.0 1.9.0)" "2"
+check_eq "the same version as a tag: refused" "$(order 1.2.3 1.2.3)" "2"
+check_eq "a release is higher than its release candidate" "$(order 1.2.3-rc1 1.2.3)" "0"
+check_eq "a release candidate is not higher than the release" "$(order 1.2.3 1.2.3-rc1)" "2"
+check_eq "rc2 is higher than rc1" "$(order 1.2.3-rc1 1.2.3-rc2)" "0"
+check_eq "rc1 is not higher than rc2" "$(order 1.2.3-rc2 1.2.3-rc1)" "2"
+check_eq "rc10 is not higher than rc9 (a word compares as text; use rc.10 for numbers)" "$(order 1.2.3-rc9 1.2.3-rc10)" "2"
+check_eq "rc.10 is higher than rc.9 (numbers compare as numbers)" "$(order 1.2.3-rc.9 1.2.3-rc.10)" "0"
+check_eq "a pre-release of the next version is higher" "$(order 1.2.3 1.2.4-rc1)" "0"
+check_eq "a longer pre-release is higher than its prefix" "$(order 1.2.3-rc 1.2.3-rc.1)" "0"
+check_eq "a tag that is not a version is ignored" "$(world 1.0.0; git -C "$T/w" tag nightly; git -C "$T/w" tag vNext; run; echo "$rc")" "0"
+
+# --commit: an older commit of main, with its own version.
+world 1.0.0
+first=$(git -C "$T/w" rev-parse HEAD)
+bump 1.1.0
+run --commit "$first"
+check_eq "--commit an older commit: ok" "$rc" "0"
+check_has "--commit: the tag is that commit's version" "release: v1.0.0 from" "$out"
+check_has "--commit: it says the commit is not the tip" "is not the tip of origin/main" "$out"
+run --apply --commit "$first"
+check_eq "--commit --apply: the tag is on that commit" "$(git -C "$T/acme/widget.git" rev-parse 'v1.0.0^{commit}')" "$first"
+run --commit "$first" v1.1.0
+check_eq "--commit with a tag of another version: refused" "$rc" "2"
+git -C "$T/w" checkout -q -b side
+git -C "$T/w" commit -q --allow-empty -m "off main"
+run --commit "$(git -C "$T/w" rev-parse HEAD)"
+check_eq "--commit outside main's history: refused" "$rc" "2"
+git -C "$T/w" checkout -q main
+
+# A push that the remote refuses leaves no local tag.
+world 1.2.3
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nwhile read old new ref; do case "$ref" in refs/tags/*) echo "no tags" >&2; exit 1;; esac; done\n' >"$T/acme/widget.git/hooks/pre-receive"
+chmod +x "$T/acme/widget.git/hooks/pre-receive"
+run --apply
+check_eq "a refused push: exit 2" "$rc" "2"
+check_eq "a refused push: no local tag is left" "$(git -C "$T/w" tag --list)" ""
+check_eq "a refused push: no remote tag" "$(remote_tags)" ""
+
+# Options and the repository name.
+world 1.2.3
+run --repo other/name
+check_has "--repo is used for GitHub" "(other/name)" "$out"
+check_eq "--repo: GitHub is asked about it" "$(sed 's#/commits.*##' "$GH_LOG")" "repos/other/name"
+run --no-such-option
+check_eq "an unknown option: refused" "$rc" "2"
+run --remote nowhere
+check_eq "an unknown remote: refused" "$rc" "2"
+run v1.2.3 v1.2.4
+check_eq "two tags: refused" "$rc" "2"
+
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ] || exit 1
+
+# The other tools' tests, tools/release/t/*.sh, each in its own process.
+for t in "$ROOT"/tools/release/t/*.sh; do
+  [ -e "$t" ] || continue
+  echo "== ${t##*/}"
+  "$t" || exit 1
+done

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# The tests of tools/publish: every executable tools/publish/t/*.sh, each in its own process, in temporary repositories (no network,
+# no secret). Run from anywhere. Passes by exiting 0.
+set -u
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+failed=()
+ran=0
+for t in "$here"/t/*.sh; do
+  [ -e "$t" ] || continue
+  if [ ! -x "$t" ]; then echo "FAIL  $t is not executable"; failed+=("$t"); continue; fi
+  ran=$((ran + 1))
+  echo "== ${t##*/}"
+  "$t" || failed+=("$t")
+done
+echo
+if [ "$ran" -eq 0 ]; then echo "no tests found"; exit 1; fi
+if [ ${#failed[@]} -gt 0 ]; then echo "FAILED: ${failed[*]##*/}"; exit 1; fi
+echo "all passed ($ran files)"

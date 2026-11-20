@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test stand-in for `dpkg-query -W -f=<format> <package>`. It records the call
+# and the argument count. A package counts as installed when
+# $STUB_STATE/dpkg.<package> exists; that file holds its version. The format's
+# ${Status} and ${Version} are filled in (the status is "hold ok installed"
+# when $STUB_STATE/dpkg.<package>.held exists, else "install ok installed"); anything else in it is printed as is,
+# except \n, which becomes the one newline at the end.
+S="${STUB_STATE:?}"
+echo "dpkg-query $#" >>"$S/calls"
+fmt="" pkg=""
+for a in "$@"; do
+    case "$a" in
+        -f=*|--showformat=*) fmt="${a#*=}" ;;
+        -*) ;;
+        *) pkg="$a" ;;
+    esac
+done
+if [ -z "$pkg" ] || [ ! -f "$S/dpkg.$pkg" ]; then
+    echo "dpkg-query: no packages found matching $pkg" >&2
+    exit 1
+fi
+ver="$(cat "$S/dpkg.$pkg")"
+st="install ok installed"
+[ -f "$S/dpkg.$pkg.held" ] && st="hold ok installed"
+# The format's \n is dropped and one newline printed at the end.
+printf '%s\n' "$fmt" | sed -e "s/[$]{Status}/$st/g" -e "s/[$]{Version}/$ver/g" -e 's/[\\]n//g'

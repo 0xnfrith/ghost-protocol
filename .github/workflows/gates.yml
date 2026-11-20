@@ -1,0 +1,84 @@
+# The two scans that every change calls, because a change anywhere can add
+# what they look for: a secret scan of the whole history, and the scan of the
+# tree for internal names, stray keys and email addresses (clean-tree, which
+# install-test also runs). tests.yml calls this workflow; its `all-tests`
+# check is the one in .github/required-checks (which tools/ruleset/ruleset
+# turns into the branch ruleset); .github/CODEOWNERS lists the paths that
+# also need a person.
+name: gates
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group. Run by hand from the Actions tab with
+  # workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clean-tree:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml). The
+    # same for the two jobs below.
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # install/test/run.sh ends with a shellcheck pass, which skips where shellcheck is not installed (a self-hosted runner's image
+      # may lack it). install-test, whose row covers every file that pass reads, fetches a pinned shellcheck there and runs it.
+      - name: whether this runner has shellcheck
+        run: |
+          command -v shellcheck >/dev/null 2>&1 && exit 0
+          echo "::notice title=shellcheck skipped here::No shellcheck on this runner, so clean-tree's shellcheck pass skips; install-test runs it on every change to the files it reads."
+      - name: no internal names, stray keys or email addresses in the tree
+        run: bash install/test/run.sh clean-tree
+
+  secret-scan:
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # From the release's own gitleaks_8.30.1_checksums.txt.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: fetch gitleaks (pinned, checksum-verified)
+        run: |
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" gitleaks
+      # The scan takes its settings only from .github/: its config (gitleaks'
+      # default rules, nothing allowed), and an ignore file only if one is ever
+      # put in .github/. A change to those settings merges on the required
+      # checks and agent review like any other change, since CODEOWNERS lists
+      # only itself. A pull request cannot silence the scan from anywhere else:
+      #   - gitleaks always reads a .gitleaksignore at the folder it scans,
+      #     whatever --gitleaks-ignore-path says, so that file is removed from
+      #     the checkout first (the history it scans is untouched);
+      #   - a .gitleaks.toml anywhere is not read, since --config names one;
+      #   - inline gitleaks:allow comments are ignored.
+      - name: scan every commit for keys, tokens and passwords
+        run: |
+          rm -f .gitleaksignore
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 \
+            --config .github/gitleaks.toml --gitleaks-ignore-path .github --ignore-gitleaks-allow .
+
+  # The merge-by-policy job's tests (.github/merge-by-policy/test_merge_by_policy.py): its script against a
+  # stand-in gh, and the shape of merge-by-policy.yml and merge-by-policy-wake.yml. Standard-library Python
+  # and jq only; no key, no network.
+  merge-by-policy-tests:
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: merge-by-policy tests
+        run: python3 -I .github/merge-by-policy/test_merge_by_policy.py

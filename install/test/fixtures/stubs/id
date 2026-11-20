@@ -1,0 +1,33 @@
+#!/bin/sh
+# Test stand-in for id, for the key service's group checks: id -G <user> and
+# id -Gn <user> (with or without --) answer from $STUB_STATE/passwd and
+# $STUB_STATE/group, in the /etc formats: the primary group first, then each
+# group that lists the user, as id does, then the lines "<name>:<gid>" of
+# $STUB_STATE/id.extra.<user>: groups only a directory service knows, which
+# getent group does not list (sssd with enumeration off). Exit 1 for a user
+# that is not there. Any other form (id -u, id -un) is the system's id.
+S="${STUB_STATE:?}"
+case "${1:-}" in
+    -G|-Gn)
+        form="$1"; shift
+        [ "${1:-}" = -- ] && shift
+        if [ $# -eq 1 ]; then
+            gid="$(awk -F: -v u="$1" '$1 == u { print $4; exit }' "$S/passwd" 2>/dev/null)"
+            [ -n "$gid" ] || { echo "id: '$1': no such user" >&2; exit 1; }
+            awk -F: -v u="$1" -v g="$gid" -v f="$form" '
+                { k = (f == "-G") ? $3 : $1 }
+                $3 == g { first = k; next }
+                { n = split($4, m, ","); for (i = 1; i <= n; i++) if (m[i] == u) { rest = rest " " k; break } }
+                END { printf "%s%s", first, rest }' "$S/group"
+            if [ -f "$S/id.extra.$1" ]; then
+                awk -F: -v f="$form" '{ printf " %s", (f == "-G") ? $2 : $1 }' "$S/id.extra.$1"
+            fi
+            echo
+            exit 0
+        fi ;;
+esac
+for d in /usr/bin /bin; do
+    if [ -x "$d/id" ]; then exec "$d/id" "$@"; fi
+done
+echo "id stub: no system id" >&2
+exit 127

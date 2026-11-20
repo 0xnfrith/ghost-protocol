@@ -1,0 +1,10 @@
+# The paths whose changes wait for a person: none, except this file.
+# Everything merges on its own once every required check passes. The owner
+# decided on 2026-11-11 that no other path waits for a person's approval; a
+# new gate is added as an automated check, not as a line here.
+#
+# This file keeps one line, for itself. The ruleset's code-owner rule stays
+# on, so a pull request that changes this list still needs the owner's
+# approval, and no pull request nobody approves can add a gate or remove
+# this one. Delete the line and the file protects nothing, itself included.
+/.github/CODEOWNERS   @0xnfrith

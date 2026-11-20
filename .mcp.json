@@ -1,0 +1,43 @@
+{
+  "mcpServers": {
+    "buzz-channel": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/adapters/buzz/src/launch.mjs",
+        "channel"
+      ],
+      "env": {
+        "BUZZ_RELAY_URL": "${user_config.buzz_relay_url}",
+        "BUZZ_KEY_COMMAND": "${user_config.buzz_key_command}",
+        "BUZZ_KEY_SOCKET": "${user_config.buzz_key_socket}",
+        "BUZZ_CHANNELS": "${user_config.buzz_channels}",
+        "BUZZ_DM_MESSAGES": "${user_config.buzz_dm_messages}",
+        "BUZZ_TRUSTED_PUBKEYS": "${user_config.buzz_trusted_pubkeys}",
+        "BUZZ_WATCH_PUBKEY": "${user_config.buzz_watch_pubkey}",
+        "BUZZ_ALLOWED_PUBKEYS": "${user_config.buzz_allowed_pubkeys}",
+        "BUZZ_ALLOWLIST_FILE": "${user_config.buzz_allowlist_file}",
+        "BUZZ_TASK_ROOTS": "${user_config.task_roots}",
+        "BUZZ_OPERATOR_PUBKEYS": "${user_config.buzz_operator_pubkeys}",
+        "BUZZ_TASK_OPEN_EMOJI": "${user_config.task_open_emoji}",
+        "BUZZ_TASK_OPEN_EMOJI_URL": "${user_config.task_open_emoji_url}",
+        "BUZZ_TASK_DONE_EMOJI": "${user_config.task_done_emoji}",
+        "BUZZ_TASK_DONE_EMOJI_URL": "${user_config.task_done_emoji_url}",
+        "BUZZ_STATUS": "${user_config.status_line}",
+        "BUZZ_STATUS_AGENTS": "${user_config.status_agents}"
+      }
+    },
+    "buzz": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/adapters/buzz/src/launch.mjs",
+        "buzz-mcp"
+      ],
+      "env": {
+        "BUZZ_RELAY_URL": "${user_config.buzz_relay_url}",
+        "BUZZ_KEY_COMMAND": "${user_config.buzz_key_command}",
+        "BUZZ_KEY_SOCKET": "${user_config.buzz_key_socket}",
+        "BUZZ_MCP_PATH": "${user_config.buzz_mcp_path}"
+      }
+    }
+  }
+}

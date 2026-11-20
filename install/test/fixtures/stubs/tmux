@@ -1,0 +1,194 @@
+#!/bin/sh
+# Test stand-in for tmux. It records, in $STUB_STATE/calls:
+#   "tmux <subcommand> <n>"           every call (n: the subcommand and its arguments)
+#   "tmux on <socket> <subcommand>"   the -L socket of every call
+#   "tmux target <subcommand> <t>"    the -t target of has-session, capture-pane,
+#                                     display-message, kill-session, new-window,
+#                                     list-panes and kill-pane
+#   "tmux parent <name>"              for has-session, the process name of its
+#                                     caller (/proc/<pid>/comm, Linux only)
+#   "env <NAME> set"                  for new-session and new-window, which of
+#                                     the test's names are set (never a value)
+#   "tmux pane-unset <NAME>"          for new-session and new-window, each env -u NAME
+#                                     on the pane's command line
+#   "tmux pane-env <NAME> set"        for new-session and new-window, each NAME=value that a
+#                                     leading `env` on the pane's command line
+#                                     sets (claude's alone, not the server's);
+#                                     the NAME=value lines go to tmux.pane-env
+#                                     (start passes only GP_INSTANCE_NAME and
+#                                     GP_UNATTENDED there, never a credential)
+# For new-session and new-window it also writes the program's arguments to tmux.args, one per
+# line (one over 300 characters as "<long N>"), and copies the file after
+# --settings to tmux.settings. The program is the one after that env and its
+# NAME=value words. With TMUX_TMPDIR set, new-session leaves a socket
+# file where tmux puts one, TMUX_TMPDIR/tmux-<uid>/<socket>, and kill-server
+# leaves it there (as tmux 3.4 does), so a test sees who removes it.
+# Its behaviour comes from files in $STUB_STATE: tmux.alive (has-session
+# succeeds), tmux.fail (new-session fails), tmux.screen (what capture-pane
+# prints), tmux.pane-pid (what display-message prints for #{pane_pid}),
+# tmux.on-display.<n> (a sh script the n-th display-message runs first, n
+# counted in tmux.display-count: what changes while a caller waits), and
+# tmux.claude-files: new-session then makes the files Claude Code keeps for a
+# session (HOME/.claude/projects/<folder>/<id>.jsonl, a <id>/ folder beside
+# it, HOME/.claude/session-env/<id>/ and TMPDIR/claude-<uid>/<folder>/<id>/),
+# from -c <folder> and --session-id <id>. kill-session removes tmux.alive (the
+# session is gone). tmux.end-with-fresh holds a path: the next has-session
+# creates that file first and removes tmux.end-with-fresh (a session that ended
+# with a fresh start asked for).
+# Panes: tmux.panes holds one line per pane, "<id> <dead> <pid>". new-session
+# makes it one pane (a new server), new-window adds one; the ids count up
+# (%0, %1, ...) in tmux.pane-count, the pid is tmux.pane-pid's (none when that
+# file is missing). With -P, both print "<id> <pid>". list-panes prints the
+# lines in its -F format (#{pane_id}, #{pane_pid}, #{pane_dead}) while
+# tmux.alive is there, and fails without it; it first runs tmux.on-list.<n>, a
+# sh script (n counted in tmux.list-count: what changes while start watches,
+# such as claude's pane closing). kill-pane removes its pane's line.
+# tmux.no-pane-id: with -P, new-session and new-window print nothing (tmux
+# gave no pane id). list-clients prints tmux.clients (one client a line; none
+# when missing).
+# show-options prints update-environment from tmux.update-env-global (-gv)
+# or tmux.update-env-session; set-environment is recorded with its words
+# ("tmux set-environment ..."; start sets only GP_CLAUDE_SETTINGS, a path).
+S="${STUB_STATE:?}"
+sub=""
+sock=default
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -L) sock="$2"; shift 2 ;;
+        *) sub="$1"; break ;;
+    esac
+done
+echo "tmux $sub $#" >>"$S/calls"
+echo "tmux on $sock $sub" >>"$S/calls"
+target() {
+    prev=""
+    for a in "$@"; do
+        [ "$prev" = "-t" ] && echo "tmux target $sub $a" >>"$S/calls"
+        prev="$a"
+    done
+}
+new_pane() {   # print?
+    n=$(cat "$S/tmux.pane-count" 2>/dev/null || echo 0)
+    echo $((n + 1)) >"$S/tmux.pane-count"
+    pid=""; [ -f "$S/tmux.pane-pid" ] && pid="$(cat "$S/tmux.pane-pid")"
+    echo "%$n 0 $pid" >>"$S/tmux.panes"
+    [ "$1" = 1 ] && [ ! -f "$S/tmux.no-pane-id" ] && echo "%$n $pid"
+    return 0
+}
+case "$sub" in
+    new-session|new-window)
+        [ -f "$S/tmux.fail" ] && exit 1
+        [ "$sub" = new-session ] && : >"$S/tmux.panes"
+        target "$@"
+        for n in API_TOKEN OTHER_KEY BUZZ_PRIVATE_KEY BUZZ_KEY_COMMAND BUZZ_AUTH_TAG NOSTR_SECRET_KEY CREDENTIALS_DIRECTORY GP_CLAUDE_SETTINGS CANARY_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SESSION_ID CLAUDE_CODE_MESSAGING_SOCKET DISABLE_AUTOUPDATER TZ GP_INSTANCE_NAME GP_UNATTENDED; do
+            eval "v=\${$n:-}"
+            [ -n "$v" ] && echo "env $n set" >>"$S/calls"
+        done
+        shift
+        dir=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -d) shift ;;
+                -c) dir="$2"; shift 2 ;;
+                -P) print=1; shift ;;
+                -s|-x|-y|-t|-F) shift 2 ;;
+                *) break ;;
+            esac
+        done
+        : >"$S/tmux.pane-env"
+        if [ "${1:-}" = env ]; then
+            shift
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    -u) echo "tmux pane-unset $2" >>"$S/calls"; shift 2 ;;
+                    [A-Za-z_]*=*) echo "tmux pane-env ${1%%=*} set" >>"$S/calls"; printf '%s\n' "$1" >>"$S/tmux.pane-env"; shift ;;
+                    *) break ;;
+                esac
+            done
+        fi
+        shift   # the program; its arguments follow
+        : >"$S/tmux.args"
+        prev=""
+        for a in "$@"; do
+            if [ "${#a}" -gt 300 ]; then echo "<long ${#a}>" >>"$S/tmux.args"; else printf '%s\n' "$a" >>"$S/tmux.args"; fi
+            [ "$prev" = "--settings" ] && cp "$a" "$S/tmux.settings"
+            [ "$prev" = "--session-id" ] && sid="$a"
+            prev="$a"
+        done
+        if [ -f "$S/tmux.claude-files" ] && [ -n "${sid:-}" ] && [ -n "$dir" ]; then
+            folder="$(printf '%s' "$dir" | sed 's/[^A-Za-z0-9]/-/g')"
+            proj="$HOME/.claude/projects/$folder"
+            mkdir -p "$proj/$sid/subagents" "$HOME/.claude/session-env/$sid" \
+                "${TMPDIR:-/tmp}/claude-$(id -u)/$folder/$sid/scratchpad"
+            echo '{}' >"$proj/$sid.jsonl"
+        fi
+        if [ -n "${TMUX_TMPDIR:-}" ]; then
+            mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)" && : >"$TMUX_TMPDIR/tmux-$(id -u)/$sock"
+        fi
+        new_pane "${print:-0}"
+        exit 0 ;;
+    list-panes)
+        target "$@"
+        n=$(( $(cat "$S/tmux.list-count" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" >"$S/tmux.list-count"
+        if [ -f "$S/tmux.on-list.$n" ]; then sh "$S/tmux.on-list.$n"; fi
+        [ -f "$S/tmux.alive" ] || exit 1
+        fmt=""; prev=""
+        for a in "$@"; do [ "$prev" = "-F" ] && fmt="$a"; prev="$a"; done
+        [ -f "$S/tmux.panes" ] || exit 0
+        while read -r id dead pid; do
+            printf '%s\n' "$fmt" | sed -e "s/#{pane_id}/$id/g" -e "s/#{pane_dead}/$dead/g" -e "s/#{pane_pid}/$pid/g"
+        done <"$S/tmux.panes"
+        exit 0 ;;
+    list-clients)
+        target "$@"
+        [ -f "$S/tmux.clients" ] && cat "$S/tmux.clients"
+        exit 0 ;;
+    show-options)
+        # update-environment: tmux.update-env-global for -g, else
+        # tmux.update-env-session (one name a line; none when missing).
+        case " $* " in
+            *" -gv "*) [ -f "$S/tmux.update-env-global" ] && cat "$S/tmux.update-env-global" ;;
+            *) target "$@"; [ -f "$S/tmux.update-env-session" ] && cat "$S/tmux.update-env-session" ;;
+        esac
+        exit 0 ;;
+    set-environment)
+        shift
+        echo "tmux set-environment $*" >>"$S/calls"
+        exit 0 ;;
+    kill-pane)
+        target "$@"
+        prev=""; t=""
+        for a in "$@"; do [ "$prev" = "-t" ] && t="$a"; prev="$a"; done
+        if [ -f "$S/tmux.panes" ]; then
+            awk -v id="$t" '$1 != id' "$S/tmux.panes" >"$S/tmux.panes.new" && mv "$S/tmux.panes.new" "$S/tmux.panes"
+        fi
+        exit 0 ;;
+    has-session)
+        target "$@"
+        if [ -r "/proc/$PPID/comm" ]; then echo "tmux parent $(cat "/proc/$PPID/comm")" >>"$S/calls"; fi
+        if [ -f "$S/tmux.end-with-fresh" ]; then
+            f="$(cat "$S/tmux.end-with-fresh")"; rm -f "$S/tmux.end-with-fresh"; : >"$f"
+        fi
+        [ -f "$S/tmux.alive" ] ;;
+    kill-session)
+        target "$@"
+        rm -f "$S/tmux.alive"
+        exit 0 ;;
+    display-message)
+        target "$@"
+        n=$(( $(cat "$S/tmux.display-count" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" >"$S/tmux.display-count"
+        if [ -f "$S/tmux.on-display.$n" ]; then sh "$S/tmux.on-display.$n"; fi
+        if [ -f "$S/tmux.pane-pid" ]; then cat "$S/tmux.pane-pid"; fi
+        exit 0 ;;
+    capture-pane)
+        target "$@"
+        if [ -f "$S/tmux.screen" ]; then cat "$S/tmux.screen"; fi
+        exit 0 ;;
+    kill-server)
+        exit 0 ;;
+    *)
+        echo "tmux stub: unexpected call" >&2
+        exit 64 ;;
+esac

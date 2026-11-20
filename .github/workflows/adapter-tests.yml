@@ -1,0 +1,34 @@
+# The Buzz adapter's tests (adapters/buzz), with the reply guard's.
+name: adapter-tests
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when adapters/buzz/
+  # changes (or anything under .github/). Its `all-tests` check is the one
+  # that is required. Run by hand from the Actions tab with workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adapter-tests:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml).
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    # About 3.5 minutes on GitHub's runners (2026-11-17); 30 leaves room for a slower self-hosted runner.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: adapters/buzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: install (exact versions from package-lock.json)
+        run: npm ci --ignore-scripts
+      - name: adapter tests
+        run: npm test

@@ -1,0 +1,178 @@
+# The evals of a real agent: evals/ci/run, when the tree has it. An eval makes a throwaway VM, installs the change on it, holds a
+# scripted conversation with the agent on a relay, grades the reply and deletes the VM. evals/ is not copied into the public
+# repository, so there this workflow finds no evals/ci/run and passes with a notice: the file is the same in both.
+#
+# evals/ci/run runs from the root of the repository, with node 22 and npm, python3, git, ssh, curl, jq, gzip, base64, split,
+# shred and flock on the PATH and the settings below in its environment. It needs no Docker on the runner: the image is built on
+# the eval VM, and the runner reaches that VM through the VM provider's HTTPS API. Its exit code is the result: a failed eval fails `all-tests`, and so does an eval that could not run (no VM,
+# no relay, a secret not set); the script says which it was. One eval at a time is the script's job; tests.yml already cancels a
+# pull request's older run when a newer push comes.
+#
+# The outage switch: the repository variable GP_EVAL_OFF set to `on` turns this job into a pass with a warning, for a dead relay,
+# a VM provider outage or spent credits, not for a failing eval. The hermetic tests and the gates still run and still gate.
+name: evals
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when a path in its
+  # row of .github/tests-to-run.sh changes (or anything under .github/). Its
+  # `all-tests` check is the one that is required. Run by hand from the
+  # Actions tab with workflow_dispatch.
+  workflow_call:
+    secrets:
+      GP_EVAL_EXE_TOKEN:
+        description: The VM provider's API token, short-lived and limited to making, listing and deleting eval VMs and running commands on them.
+        required: false
+      GP_EVAL_OPERATOR_KEY:
+        description: The CI operator's relay key, a relay member and an admin of the eval channel; it signs the test agent's attestation.
+        required: false
+      ANTHROPIC_API_KEY:
+        description: The Claude API key the agent under test runs on (it draws on a plan's included credits).
+        required: false
+      GP_EVAL_RELAY_URL:
+        description: The relay the evals use.
+        required: false
+      GP_EVAL_CHANNEL_ID:
+        description: The eval channel on that relay.
+        required: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml), as
+    # for every other job. This job holds the eval secrets (the VM provider's token, the CI operator's relay key, the Claude
+    # credential), so the runners that variable names must be single-use: one job each, in a container or VM that is thrown away
+    # after it. The way back is to delete the variable (every job moves back) or to put ubuntu-latest here (this job alone).
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      actions: read # the status of the GitHub run that made another CI eval's VM (evals/ci/run)
+    # The job's clock starts when a runner takes it, so the wait for a free runner is not in it. What is: evals/ci/run's wait for
+    # another CI eval (up to GP_EVAL_JOB_MINUTES below less 30 minutes, once evals/ci/run reads that variable; 30 until then), then
+    # this one's run (22 to 28 minutes on GitHub's runners on 2026-11-17; most of it is the eval VMs' and the agent's time, which a
+    # slower runner does not change), with room for a slower runner. GP_EVAL_JOB_MINUTES below must say the same as this limit.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the history, so the eval can name and build the exact commit under test
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # What the evals need, checked on the runner that took the job before any eval starts, so that a missing tool or a network
+      # that cannot reach the relay, the VM provider or GitHub's API fails here with its name and not halfway through a run. On a
+      # self-hosted runner a missing tool is installed from the Ubuntu archive first, as root in the job's own single-use
+      # container or VM (sudo -n fails at once where sudo needs a password); node and npm are not from that archive (setup-node
+      # puts them on the PATH), so a missing one is an error that names it. What was found goes in the job's summary (the
+      # runner's kind, not its name). Nothing secret is printed: the relay's address is a secret (GitHub masks it) and only an
+      # HTTP code is shown.
+      - name: what the evals need on this runner
+        timeout-minutes: 10
+        env:
+          GP_EVAL_OFF: ${{ vars.GP_EVAL_OFF }}
+          GP_EVAL_RELAY_URL: ${{ secrets.GP_EVAL_RELAY_URL }}
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GP_EVAL_OFF:-}" = "on" ] || [ ! -e evals/ci/run ]; then echo "no eval runs in this job: nothing to check"; exit 0; fi
+          # tool:Ubuntu package
+          need="git:git ssh:openssh-client curl:curl jq:jq gzip:gzip base64:coreutils split:coreutils shred:coreutils flock:util-linux python3:python3 node: npm:"
+          missing() { local t; for t in $need; do command -v "${t%%:*}" >/dev/null 2>&1 || echo "${t%%:*}"; done; }
+          gone=$(missing)
+          if [ -n "$gone" ] && [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            pkgs=$(for t in $gone; do for n in $need; do [ "${n%%:*}" != "$t" ] || echo "${n#*:}"; done; done | sed '/^$/d' | sort -u | tr '\n' ' ')
+            pkgs=${pkgs% }
+            if [ -n "$pkgs" ]; then
+              echo "not on this runner: ${gone//$'\n'/ }; installing from the Ubuntu archive: $pkgs"
+              read -ra pk <<<"$pkgs"
+              sudo -n apt-get update -qq && sudo -n apt-get install -y -qq --no-install-recommends "${pk[@]}" \
+                || echo "::warning title=Evals runner::could not install $pkgs"
+            fi
+            gone=$(missing)
+          fi
+          bad=0
+          row() { printf '| %s | %s |\n' "$1" "$2" >>"$GITHUB_STEP_SUMMARY"; echo "$1: $2"; }
+          printf '### What the evals need on this runner\n\n| | |\n| --- | --- |\n' >>"$GITHUB_STEP_SUMMARY"
+          row runner "$RUNNER_ENVIRONMENT, $(uname -m)"
+          # What the job runs in, as seen from inside: a container, a VM, or neither that systemd-detect-virt can name.
+          c=$(systemd-detect-virt -c 2>/dev/null || true); v=$(systemd-detect-virt -v 2>/dev/null || true)
+          [ "$c" != none ] && [ -n "$c" ] || [ ! -e /.dockerenv ] || c=docker
+          row "runs in" "container: ${c:-none}; VM: ${v:-none}"
+          for t in $need; do
+            t=${t%%:*}
+            if command -v "$t" >/dev/null 2>&1; then
+              if [ "$t" = ssh ]; then v=$(ssh -V 2>&1 || true); else v=$("$t" --version 2>&1 | sed -n 1p || true); fi
+              row "$t" "${v:-present}"
+            else
+              case $t in
+                node | npm) why="not on the PATH (actions/setup-node above puts it there; it is not installed from the Ubuntu archive)" ;;
+                *) why="not installed, and could not be installed from the Ubuntu archive" ;;
+              esac
+              row "$t" "MISSING"; echo "::error title=Evals runner::$t is $why on this runner"; bad=1
+            fi
+          done
+          if command -v docker >/dev/null 2>&1; then row docker "present (not used here: the image is built on the eval VM)"
+          else row docker "absent (not needed: the image is built on the eval VM)"; fi
+          # Network. An HTTP code, any code, means the address answered; 000 means it did not.
+          http() { curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$@" 2>/dev/null || true; }
+          code=$(http https://exe.dev/); row "VM provider's HTTPS API" "HTTP ${code:-000}"
+          [ "${code:-000}" != 000 ] || { echo "::error title=Evals runner::the VM provider's API did not answer from this runner"; bad=1; }
+          if timeout 10 bash -c 'exec 3<>/dev/tcp/exe.dev/22' 2>/dev/null; then v=open; else v="closed (not used: the eval reaches its VMs through the HTTPS API)"; fi
+          row "VM provider's ssh port" "$v"
+          if [ -n "${GP_EVAL_RELAY_URL:-}" ]; then
+            u=$GP_EVAL_RELAY_URL; case $u in wss://*) u=https://${u#wss://} ;; ws://*) u=http://${u#ws://} ;; esac
+            code=$(http -H 'Accept: application/nostr+json' "$u"); row relay "HTTP ${code:-000}"
+            [ "${code:-000}" != 000 ] || { echo "::error title=Evals runner::the relay did not answer from this runner"; bad=1; }
+          else
+            row relay "not checked (GP_EVAL_RELAY_URL not set; evals/ci/run says so)"
+          fi
+          # The eval lock reads other runs' status from GitHub's API with the job's own token: this run's status, read the same way.
+          run_json=$RUNNER_TEMP/this-run.json
+          curl -sS --max-time 20 -o "$run_json" -H @<(printf 'Authorization: Bearer %s\n' "$GH_API_TOKEN") \
+            -H 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" 2>/dev/null || true
+          # A run's own record (it has an id); GitHub's error answers carry a "status" of their own (the HTTP code), not a run's.
+          st=$(jq -r 'select(.id != null) | .status // empty' "$run_json" 2>/dev/null || true); rm -f "$run_json"
+          row "GitHub's API (the eval lock)" "${st:-no answer}"
+          [ -n "$st" ] || { echo "::error title=Evals runner::GitHub's API did not give this run's status on this runner"; bad=1; }
+          exit "$bad"
+      - name: evals/ci/run
+        env:
+          GP_EVAL_OFF: ${{ vars.GP_EVAL_OFF }}
+          # Public keys of the eval channel's members that the sweep never removes, space-separated.
+          GP_EVAL_KEEP_MEMBERS: ${{ vars.GP_EVAL_KEEP_MEMBERS }}
+          GP_EVAL_EXE_TOKEN: ${{ secrets.GP_EVAL_EXE_TOKEN }}
+          GP_EVAL_OPERATOR_KEY: ${{ secrets.GP_EVAL_OPERATOR_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GP_EVAL_RELAY_URL: ${{ secrets.GP_EVAL_RELAY_URL }}
+          GP_EVAL_CHANNEL_ID: ${{ secrets.GP_EVAL_CHANNEL_ID }}
+          # The commit under test, and its pull request when there is one (for the eval's ledger).
+          GP_EVAL_REF: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          GP_EVAL_PR: ${{ github.event.pull_request.number }}
+          # The job's own token, read-only: evals/ci/run asks the API whether the run that made another CI eval's VM has
+          # finished, so that a VM a teardown left does not hold up every eval after it.
+          GP_EVAL_GITHUB_TOKEN: ${{ github.token }}
+          # The job's time limit, as above: evals/ci/run waits for another CI eval up to this less 30 minutes.
+          GP_EVAL_JOB_MINUTES: 120
+        run: |
+          set -euo pipefail
+          if [ "${GP_EVAL_OFF:-}" = "on" ]; then
+            msg="The evals are switched off (the repository variable GP_EVAL_OFF is on): nothing was evaluated. Turn it off once the outage is over."
+            echo "::warning title=Evals switched off::$msg"
+            printf '### evals\n\n**%s**\n' "$msg" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -e evals/ci/run ]; then
+            msg="No evals/ci/run in this tree: no eval to run."
+            echo "::notice title=No evals::$msg"
+            printf '### evals\n\n%s\n' "$msg" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -x evals/ci/run ]; then
+            echo "::error file=evals/ci/run::evals/ci/run is not executable (chmod +x, and commit the mode)"
+            exit 1
+          fi
+          exec ./evals/ci/run

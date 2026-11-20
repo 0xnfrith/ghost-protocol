@@ -1,0 +1,22 @@
+# The timer of @UNIT@.service, for the Ghost Protocol instance @NAME@: @WHEN@.
+# Made by the installer from install/memory-backup/memory-backup.timer. Two
+# timers come from this one file: <name>-memory-backup.timer (every 15
+# minutes, on the quarter hour) and <name>-memory-verify.timer (every hour, at
+# 7 minutes past, off the backup's quarter hours).
+#
+# A calendar timer fires on the clock whatever the last run's result was, and
+# Persistent= runs a missed one once the machine is up again. The service is a
+# oneshot, so its runs never overlap.
+#
+# Check: systemctl list-timers @UNIT@.timer
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: @WHAT@, @WHEN@
+
+[Timer]
+OnCalendar=@CALENDAR@
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

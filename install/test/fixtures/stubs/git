@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test stand-in for git --version only. It answers from $STUB_STATE/git.version,
+# so no test depends on the git installed on the machine running it. Every
+# other call goes to the real git (the sandbox's sysbin link). It records
+# nothing.
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ] && [ -f "${STUB_STATE:-}/git.version" ]; then
+    printf 'git version %s\n' "$(cat "$STUB_STATE/git.version")"
+    exit 0
+fi
+exec "$(dirname "$0")/../sysbin/git" "$@"

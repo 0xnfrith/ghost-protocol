@@ -1,0 +1,14 @@
+{
+  "name": "ghost-protocol",
+  "owner": {
+    "name": "0xnfrith"
+  },
+  "description": "Ghost Protocol, a personal agent system for Claude Code.",
+  "plugins": [
+    {
+      "name": "ghost-protocol",
+      "source": "./",
+      "description": "A personal agent system for Claude Code. First adapter: Buzz."
+    }
+  ]
+}

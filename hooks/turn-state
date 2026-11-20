@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# turn-state: a Claude Code UserPromptSubmit, Stop and StopFailure hook. It
+# keeps a marker of whether the instance's session is in a turn, for
+# install/service/start --fresh, which restarts the instance into a new
+# session only while it is idle, so a fresh start never cuts off a turn. The
+# marker is the file ~/.local/state/ghost-protocol/<name>/turn, one line:
+#   busy <prompt id>   written at UserPromptSubmit, when a turn begins;
+#   idle <prompt id>   written at the Stop with that prompt's id, when the
+#                      marker still says busy for it. A Stop of any other
+#                      prompt leaves it alone. StopFailure counts as a Stop:
+#                      Claude Code fires it instead of Stop when an API error
+#                      (a rate limit, a sign-in, a prompt too long) ended the
+#                      turn, with the same prompt id.
+# A Stop that a hook blocks is followed by more of the same turn, under the
+# same prompt id, so --fresh also reads the transcript, which says when the
+# turn is really over.
+#
+# Which sessions: only the instance's own conversation, as start launched it:
+# GP_INSTANCE_NAME is set (start passes it to the pane's claude alone; --test
+# never does), the hook was run by that claude itself (hooks/lib/own-claude.sh:
+# the first claude above the hook is the one whose pid start wrote to
+# <state>/pane-pid), not a subagent, and the session id is the one in start's
+# file (~/.local/state/ghost-protocol/<name>/session-id). A claude the agent
+# runs itself inherits the environment, but neither its process nor its
+# session id is the instance's, so its turns never touch the marker; nor do a
+# claude's in another window of the same tmux server.
+#
+# The marker is replaced in one step. It prints nothing (a UserPromptSubmit
+# hook's output would join the prompt), and always exits 0. Needs jq; without
+# it, it does nothing, and --fresh goes by the transcript alone.
+# Test: install/test/hook-turn-state.test.sh
+set -uo pipefail
+name="${GP_INSTANCE_NAME:-}"
+case "$name" in '' | -* | *[!a-z0-9-]*) exit 0 ;; esac
+command -v jq >/dev/null 2>&1 || exit 0
+# shellcheck source=lib/own-claude.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/own-claude.sh" || exit 0
+
+input=$(cat)
+[ -n "$input" ] || exit 0
+fields=$(printf '%s' "$input" | jq -r '[(.hook_event_name // ""), (.session_id // ""), (.prompt_id // ""), (.agent_id // "")]
+    | map(tostring) | join("\u001f")' 2>/dev/null) || exit 0
+IFS=$'\037' read -r event sid prompt agent <<<"$fields"
+[ -z "$agent" ] && [ -n "$sid" ] || exit 0
+case "$prompt" in '' | *[!A-Za-z0-9-]*) prompt=- ;; esac
+prompt="${prompt:0:64}"
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol/$name"
+[ -f "$state/session-id" ] || exit 0
+[ "$(tr -d '[:space:]' <"$state/session-id")" = "$sid" ] || exit 0
+own_claude "$state" || exit 0
+marker="$state/turn"
+
+case "$event" in
+  UserPromptSubmit) line="busy $prompt" ;;
+  Stop | StopFailure)
+    [ "$(head -n 1 "$marker" 2>/dev/null)" = "busy $prompt" ] || exit 0
+    line="idle $prompt" ;;
+  *) exit 0 ;;
+esac
+tmp=$(mktemp "$state/.turn.XXXXXX") || exit 0
+if printf '%s\n' "$line" >"$tmp" && mv -f "$tmp" "$marker"; then exit 0; fi
+rm -f "$tmp"
+exit 0

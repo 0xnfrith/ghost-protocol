@@ -1,0 +1,12 @@
+#!/bin/sh
+# Test stand-in for getent, for the key service's user checks: getent passwd
+# and getent group, with or without a name or id, answered from
+# $STUB_STATE/passwd and $STUB_STATE/group (in the /etc formats). It records
+# "getent <database> <n>". Exit 2 when the name or id is not there, as getent.
+S="${STUB_STATE:?}"
+db="${1:-}"
+echo "getent $db $#" >>"$S/calls"
+case "$db" in passwd|group) f="$S/$db" ;; *) echo "getent stub: unexpected database" >&2; exit 64 ;; esac
+[ -f "$f" ] || exit 2
+if [ $# -lt 2 ]; then cat "$f"; exit 0; fi
+awk -F: -v k="$2" '$1 == k || $3 == k { print; found = 1; exit } END { exit found ? 0 : 2 }' "$f"

@@ -1,0 +1,15 @@
+# The checks every pull request into main must pass: the input of
+# tools/ruleset/ruleset, which turns this list into the branch ruleset.
+#
+# One check per line: the id of the app that reports it, a space, then the
+# check's name exactly as GitHub shows it on a pull request. 15368 is GitHub
+# Actions, so a status that any other app or token posts under the same name
+# does not count.
+#
+# all-tests (.github/workflows/tests.yml) is the one check: it calls every
+# test workflow that a change touches and fails unless each one it called
+# passed. install/test/ruleset.test.sh holds this list against
+# .github/workflows/: each name here must come from exactly one job there, and
+# every job that runs on pull requests must be listed, or be one that a listed
+# job needs.
+15368 all-tests

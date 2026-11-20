@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test stand-in for curl. It never touches the network. It records only the
+# call name and the argument count, then writes $STUB_STATE/curl.body to the
+# -o file. With $STUB_STATE/curl.expect-url, any other address fails (22),
+# so a test proves the address without recording it. No body: it fails too.
+S="${STUB_STATE:?}"
+echo "curl $#" >>"$S/calls"
+out=""
+url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="${2:-}"; shift 2 ;;
+        --proto|--retry|--max-filesize) shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [ -f "$S/curl.expect-url" ] && [ "$url" != "$(cat "$S/curl.expect-url")" ]; then
+    echo "curl stub: not the expected address" >&2
+    exit 22
+fi
+if [ ! -f "$S/curl.body" ] || [ -z "$out" ]; then
+    echo "curl stub: nothing to serve" >&2
+    exit 22
+fi
+cp "$S/curl.body" "$out"

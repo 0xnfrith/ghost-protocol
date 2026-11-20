@@ -1,0 +1,69 @@
+# The installer's hermetic tests (install/test/run.sh) on Linux; macOS is
+# paused (see the matrix).
+# No secrets: every download, sign-in and remote is a stand-in, and git may
+# use only file:// inside the tests.
+name: install-test
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when a path its
+  # tests read changes (or anything under .github/). Its `all-tests` check is
+  # the one that is required. Run by hand from the Actions tab with
+  # workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # A name of its own: blackout-test's job is also called test.
+    name: install-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is paused: its runner minutes cost too much on a private repo. To
+        # turn it back on, restore macos-latest here. all-tests covers every
+        # leg of the matrix, so .github/required-checks does not change.
+        os: [ubuntu-latest] # paused: macos-latest
+    # Where the Linux leg runs: GitHub's runner, unless the repository variable
+    # GP_CI_RUNS_ON names other runner labels as JSON (for example
+    # ["self-hosted","<label>"]). A private copy pays for GitHub's runner
+    # minutes and this job is the bulk of them, so it can point the job at its
+    # own runners; a public copy, where GitHub's runners cost nothing, leaves
+    # the variable unset. The way back is to delete the variable.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || matrix.os }}
+    # On GitHub's runners Linux takes 15 to 32 minutes (32 on 2026-11-17).
+    # A self-hosted runner may be several times slower (3 to 6.5 times on
+    # 2026-11-17), so 240 leaves room for that and a queue. When macOS ran it
+    # took about 15 (hook-sync-mains alone took over 8). The unit-file checks
+    # that need systemd-analyze skip on a runner that lacks it.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A self-hosted runner's image may lack shellcheck, which GitHub's image has and the tests use when it is there (they
+      # skip in silence without it). It is fetched into the job's temp folder, pinned by version and by the sha256 of the
+      # release tarball (koalaman/shellcheck v0.11.0, the version on GitHub's ubuntu-latest), with no sudo and nothing
+      # installed on the machine.
+      - name: shellcheck, pinned (self-hosted runner only)
+        if: runner.environment == 'self-hosted'
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          if command -v shellcheck >/dev/null 2>&1; then shellcheck --version | sed -n 2p; exit 0; fi
+          f="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/$f"
+          echo "$SHELLCHECK_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          mv "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$RUNNER_TEMP/bin/shellcheck"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/shellcheck" --version | sed -n 2p
+      # /bin/bash: on macOS that is bash 3.2, the version the installer must run under.
+      - name: install tests
+        run: /bin/bash install/test/run.sh

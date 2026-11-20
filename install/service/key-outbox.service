@@ -1,0 +1,58 @@
+# One run of the key service's copy step (gp-key-<name>-outbox.service) for
+# the Ghost Protocol instance @NAME@, started by its path unit of the same name
+# when the outbox changes. install/keyservice/setup makes it from
+# install/service/key-outbox.service for GHOST Protocol commit @COMMIT@.
+#
+# It moves each regular file at the top of @SRV@/outbox into @SRV@/files,
+# where buzz-mcp can send it by path (install/keyservice/outbox-copy says
+# which files it takes). It runs as the key's user, but it is never given the
+# key: no OpenFile=, no credential, and no network.
+#   journalctl -u gp-key-@NAME@-outbox
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: move the outbox's files where buzz-mcp can send them
+
+[Service]
+Type=oneshot
+User=@KEY_USER@
+Group=@KEY_USER@
+ExecStart=/usr/bin/python3 -I -B @CODE@/install/keyservice/outbox-copy @SRV@/outbox @SRV@/files
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+WorkingDirectory=@SRV@/files
+ReadWritePaths=@SRV@/outbox @SRV@/files
+# What it copies is readable by the instance's group (the folder is setgid).
+UMask=0027
+LimitCORE=0
+TimeoutStartSec=2min
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+KeyringMode=private
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# No network at all.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

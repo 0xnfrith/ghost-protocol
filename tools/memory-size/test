@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# The test of tools/memory-size/memory-size and of the Stop hook that runs it,
+# hooks/memory-size. Run from anywhere; exits 0 when every check passes.
+#
+#   - no limit set: nothing is read, nothing is written, no note;
+#   - a measure that first passes its limit: one note, with the numbers, the
+#     limit's setting and how to change it or turn it off;
+#   - staying past it: no more notes;
+#   - back to the limit or under it, then past it again: one more note;
+#   - the memory folder is the same byte for byte after every run (names,
+#     modes, sizes, times and contents), and the state is never in it;
+#   - the hook: nothing with all four limits off or outside the instance's own
+#     conversation; one Stop block with the note, then nothing; its wiring in
+#     hooks/hooks.json;
+#   - the defaults, with nothing set: 150 lines, 20000 bytes, 150 notes and
+#     800 KiB, a block past each and silence at each; plugin.json's defaults
+#     equal the hook's; a limit saved empty, off or 0 is off.
+#
+# Then the revert proofs: copies of the tree with one piece of the code put
+# back the way it would be without it, one at a time; this test is run against
+# each copy and must fail on every one.
+#
+# MEMORY_SIZE_TREE=<a copy of the repository's hooks/, install/lib/ and
+# tools/memory-size/> runs the checks once against that copy, with no revert
+# proofs.
+# The checks and the revert proofs are text, run by eval and sed (SC2016).
+# shellcheck disable=SC2016
+set -u
+HERE="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(CDPATH='' cd -- "$HERE/../.." && pwd -P)"
+TREE="${MEMORY_SIZE_TREE:-$REPO}"
+TOOL="$TREE/tools/memory-size/memory-size"
+HOOK="$TREE/hooks/memory-size"
+T="$(mktemp -d "${TMPDIR:-/tmp}/memory-size-test.XXXXXX")"
+trap 'rm -rf "$T"' EXIT
+PASS=0 FAIL=0
+check() {
+    local what="$1"; shift
+    if "$@"; then PASS=$((PASS + 1)); echo "ok    $what"; else FAIL=$((FAIL + 1)); echo "FAIL  $what"; fi
+}
+command -v jq >/dev/null 2>&1 || { echo "jq is needed"; exit 1; }
+
+# A memory folder like Claude Code's: MEMORY.md, notes, a subfolder, a file
+# that is not a note.
+M="$T/projects/-work-agent/memory"
+mk_memory() {
+    rm -rf "$M"; mkdir -p "$M/topics"
+    for i in 1 2 3 4 5 6 7 8 9 10; do echo "- [note $i](n$i.md): one line" >>"$M/MEMORY.md"; done
+    for i in 1 2 3; do printf 'note %s\n' "$i" >"$M/n$i.md"; done
+    printf 'deeper\n' >"$M/topics/t1.md"
+    printf 'not a note\n' >"$M/topics/data.json"
+    touch -t 202611130000 "$M"/*.md "$M"/topics/*
+}
+snapshot() {
+    (cd "$M" && find . -exec stat -c '%n %F %a %s %Y' {} + | sort && find . -type f -exec sha256sum {} + | sort)
+}
+same_memory() { [ "$(snapshot)" = "$SNAP" ]; }
+ST="$T/state"
+mkdir -p "$ST"
+S="$ST/memory-size"
+tool() { "$TOOL" check "$M" "$S" "$@" >"$T/out" 2>"$T/err"; RC=$?; }
+out() { cat "$T/out"; }
+quiet() { [ "$RC" = 0 ] && [ ! -s "$T/out" ]; }
+noted() { [ "$RC" = 0 ] && [ -s "$T/out" ]; }
+has() { grep -qF -- "$1" "$T/out"; }
+
+# --- measure ---
+mk_memory
+printf -- '- last line, no newline' >>"$M/MEMORY.md"
+"$TOOL" measure "$M" >"$T/out"
+check "measure: MEMORY.md's lines, a last line with no newline counted" grep -qx 'index_lines=11' "$T/out"
+check "measure: MEMORY.md's bytes" grep -qx "index_bytes=$(wc -c <"$M/MEMORY.md" | tr -d ' ')" "$T/out"
+check "measure: the notes, in subfolders too, MEMORY.md and other files not counted" grep -qx 'notes=4' "$T/out"
+check "measure: every file's bytes" grep -qx "folder_bytes=$(cat "$M/MEMORY.md" "$M"/n*.md "$M"/topics/* | wc -c | tr -d ' ')" "$T/out"
+"$TOOL" measure "$T/none" >"$T/out"
+check "measure: a missing folder measures 0" [ "$(tr '\n' ' ' <"$T/out")" = "index_lines=0 index_bytes=0 notes=0 folder_bytes=0 " ]
+
+# --- no limit set: nothing read, nothing written, no note ---
+mk_memory; SNAP="$(snapshot)"; rm -f "$S"
+# Stand-ins for the tools that read the folder, which leave a mark when run.
+mkdir -p "$T/spy"
+for c in find awk wc cat; do
+    printf '#!/bin/sh\necho %s >>"%s"\nexec %s "$@"\n' "$c" "$T/spied" "$(command -v "$c")" >"$T/spy/$c"
+    chmod +x "$T/spy/$c"
+done
+rm -f "$T/spied"
+PATH="$T/spy:$PATH" "$TOOL" check "$M" "$S" >"$T/out" 2>&1; RC=$?
+check "no limit: exit 0, no note" quiet
+check "no limit: the memory folder is not read" [ ! -e "$T/spied" ]
+check "no limit: no state written" [ ! -e "$S" ]
+tool --index-lines "" --index-bytes 0 --notes -3 --folder-kib x5
+check "limits that are not whole numbers of at least 1 are unset: no note, no state" eval 'quiet && [ ! -e "$S" ]'
+check "no limit: the memory is unchanged byte for byte" same_memory
+
+# --- one measure at a time: first past its limit, one note ---
+mk_memory; SNAP="$(snapshot)"; rm -f "$S"
+tool --index-lines 10
+check "lines at the limit (10 of 10) are not past it: no note" quiet
+printf -- '- eleventh\n' >>"$M/MEMORY.md"; SNAP="$(snapshot)"
+tool --index-lines 10
+check "lines first past the limit: a note" noted
+check "the note gives the measure and its limit" has "MEMORY.md has 11 lines (limit 10)"
+check "the note gives all four numbers" has "MEMORY.md 11 lines and $(wc -c <"$M/MEMORY.md" | tr -d ' ') bytes; 4 notes; 1 KiB in all"
+check "the note asks for one DM to the operator on Buzz" has "Tell your operator once, in your DM with them on Buzz"
+check "the note says the limit is the default or the operator's" has "passed its memory limit (the default, or one your operator set): MEMORY.md has 11"
+check "the note does not say the operator set the limit" eval '! has "passed a limit your operator set"'
+check "the note names the limit's setting, and how to change it or turn it off" has "how to change it: set memory_limit_index_lines to another number, or to off."
+check "the note is one line, and starts with [GHOST Protocol]" eval '[ "$(wc -l <"$T/out" | tr -d " ")" = 0 ] && head -c 16 "$T/out" | grep -qF "[GHOST Protocol]"'
+check "the state says which measure is past its limit" [ "$(cat "$S")" = "index_lines over" ]
+tool --index-lines 10
+check "staying past the limit: no note" quiet
+printf -- '- twelfth\n' >>"$M/MEMORY.md"; SNAP="$(snapshot)"
+tool --index-lines 10
+check "growing further past the limit: no note" quiet
+head -n 9 "$M/MEMORY.md" >"$T/short"; cat "$T/short" >"$M/MEMORY.md"; SNAP="$(snapshot)"
+tool --index-lines 10
+check "back under the limit: no note" quiet
+check "back under the limit: the state forgets it" [ ! -e "$S" ]
+for i in 10 11; do echo "- again $i" >>"$M/MEMORY.md"; done; SNAP="$(snapshot)"
+tool --index-lines 10
+check "past the limit again: one more note" eval 'noted && has "MEMORY.md has 11 lines (limit 10)"'
+tool --index-lines 10
+check "and then no more" quiet
+# Back to exactly the limit re-arms too.
+head -n 10 "$M/MEMORY.md" >"$T/short"; cat "$T/short" >"$M/MEMORY.md"
+tool --index-lines 10
+echo "- eleven" >>"$M/MEMORY.md"; SNAP="$(snapshot)"
+tool --index-lines 10
+check "back to the limit itself, then past it: a note" noted
+check "the memory is unchanged byte for byte after these runs" same_memory
+
+mk_memory; SNAP="$(snapshot)"; rm -f "$S"
+b=$(wc -c <"$M/MEMORY.md" | tr -d ' ')
+tool --index-bytes "$b"
+check "bytes at the limit: no note" quiet
+tool --index-bytes $((b - 1))
+check "bytes past the limit: a note with them" eval "noted && has 'MEMORY.md has $b bytes (limit $((b - 1)))'"
+check "bytes: the note names memory_limit_index_bytes" has "set memory_limit_index_bytes to another number, or to off."
+tool --index-bytes $((b - 1))
+check "bytes: staying past, no note" quiet
+
+rm -f "$S"
+tool --notes 4
+check "notes at the limit (4): no note" quiet
+tool --notes 3
+check "notes past the limit: a note with them" eval 'noted && has "the folder has 4 notes (limit 3)"'
+check "notes: the note names memory_limit_notes" has "set memory_limit_notes to another number, or to off."
+tool --notes 3
+check "notes: staying past, no note" quiet
+
+rm -f "$S"
+head -c 3000 /dev/zero | tr '\0' x >"$M/topics/big.json"; SNAP="$(snapshot)"
+tool --folder-kib 4
+check "folder size at or under its limit (4 KiB): no note" quiet
+tool --folder-kib 3
+check "folder size past the limit: a note in KiB" eval 'noted && has "the folder holds 4 KiB (limit 3 KiB)"'
+check "folder size: the note names memory_limit_folder_kib" has "set memory_limit_folder_kib to another number, or to off."
+tool --folder-kib 3
+check "folder size: staying past, no note" quiet
+
+# Two limits: each is said once, on its own.
+mk_memory; SNAP="$(snapshot)"; rm -f "$S"
+tool --index-lines 5 --notes 10
+check "two limits, one past: a note for it alone" eval 'noted && has "10 lines (limit 5)" && ! has "notes (limit"'
+for i in 4 5 6 7 8 9 10 11; do echo n >"$M/n$i.md"; done; SNAP="$(snapshot)"
+tool --index-lines 5 --notes 10
+check "the other then passes: a note for it alone" eval 'noted && has "12 notes (limit 10)" && ! has "lines (limit"'
+tool --index-lines 5 --notes 10
+check "both past: no note" quiet
+check "the state holds both" [ "$(sort "$S" | tr '\n' ' ')" = "index_lines over notes over " ]
+tool --notes 10
+check "a limit unset: its state is forgotten" [ "$(cat "$S")" = "notes over" ]
+# Two limits passed at once: one note with both, and both settings.
+rm -f "$S"
+tool --index-lines 5 --notes 10
+check "two limits passed at once: one note with both" \
+    has "passed its memory limits (the defaults, or ones your operator set): MEMORY.md has 10 lines (limit 5) and the folder has 12 notes (limit 10)."
+check "two limits passed at once: the note names both settings" \
+    has "how to change them: set memory_limit_index_lines and memory_limit_notes to other numbers, or to off."
+tool --index-lines 5 --notes 10 --index-bytes 1
+check "a third passed later: the note names it alone" \
+    eval 'has "passed its memory limit (the default" && has "set memory_limit_index_bytes to another" && ! has "memory_limit_notes"'
+
+# The state file: a symlink is not read or written, and no note goes out
+# without a state to keep (it could never stop repeating).
+mk_memory; SNAP="$(snapshot)"; rm -f "$S"
+ln -s "$T/elsewhere" "$S"
+tool --index-lines 5
+check "a state file that is a symlink: no note, not written through" eval 'quiet && [ ! -e "$T/elsewhere" ]'
+rm -f "$S"
+"$TOOL" check "$M" "$T/no-such-folder/state" --index-lines 5 >"$T/out" 2>&1; RC=$?
+check "no folder for the state: no note" quiet
+check "the memory is unchanged byte for byte after every tool run" same_memory
+check "nothing of the tool's own was left in the memory folder" [ -z "$(find "$M" -name '*memory-size*')" ]
+
+# --- the hook ---
+SID=0b1c2d3e-4f50-4612-8a7b-9c0d1e2f3a4b
+H="$T/home"
+HST="$H/.local/state/ghost-protocol/inst"
+mk_memory; SNAP="$(snapshot)"
+world() { rm -rf "$H"; mkdir -p "$HST"; echo "$SID" >"$HST/session-id"; echo "$$" >"$HST/pane-pid"; }
+event() { # [SESSION] [AGENT] [EVENT]
+    local agent=""
+    [ -n "${2:-}" ] && agent=",\"agent_id\":\"$2\""
+    printf '{"hook_event_name":"%s","session_id":"%s","transcript_path":"%s/%s.jsonl","stop_hook_active":false%s}' \
+        "${3:-Stop}" "${1:-$SID}" "$(dirname "$M")" "${1:-$SID}" "$agent" >"$T/in"
+}
+# hook [VAR=value ...]: the hook, run by this shell (the pid in pane-pid), with those variables only.
+hook() { env -i PATH="$PATH" HOME="$H" LANG=C "$@" "$HOOK" <"$T/in" >"$T/out" 2>"$T/err"; RC=$?; }
+LIM=CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_INDEX_LINES=5
+
+world; event
+hook GP_INSTANCE_NAME=inst
+check "hook, nothing set, the memory under the defaults: exit 0, nothing printed" quiet
+check "hook, nothing set, the memory under the defaults: no state" [ ! -e "$HST/memory-size" ]
+OFF4="CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_INDEX_LINES=off CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_INDEX_BYTES= CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_NOTES=0 CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_FOLDER_KIB=OFF"
+rm -f "$T/spied"
+# shellcheck disable=SC2086  # OFF4 is four words
+hook PATH="$T/spy:$PATH" GP_INSTANCE_NAME=inst $OFF4
+check "hook, all four limits off (off, empty, 0, OFF): exit 0, nothing printed" quiet
+check "hook, all four limits off: no state" [ ! -e "$HST/memory-size" ]
+check "hook, all four limits off: neither the memory nor the hook's input is read" [ ! -e "$T/spied" ]
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, first past a limit: exit 0, a Stop block" eval '[ "$RC" = 0 ] && [ "$(jq -r .decision "$T/out")" = block ]'
+check "hook: the block's reason is the note, with the numbers" eval 'jq -r .reason "$T/out" | grep -qF "MEMORY.md has 10 lines (limit 5)"'
+check "hook: the state is in the instance's own state folder" [ "$(cat "$HST/memory-size")" = "index_lines over" ]
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, staying past the limit: nothing printed" quiet
+head -n 4 "$M/MEMORY.md" >"$T/short"; cat "$T/short" >"$M/MEMORY.md"
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, back under: nothing printed" quiet
+mk_memory; SNAP="$(snapshot)"
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, past it again: one more block" eval '[ "$(jq -r .decision "$T/out")" = block ]'
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook: and then nothing" quiet
+
+# Outside the instance's own conversation: nothing, and no state.
+world; event
+hook "$LIM"
+check "hook, no GP_INSTANCE_NAME: nothing, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+event 1c2d3e4f-5061-4723-9b8c-0d1e2f3a4b5c
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, another session id: nothing, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+event "$SID" sub-1
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, a subagent: nothing, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+event "$SID" "" UserPromptSubmit
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, another event: nothing, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+event; echo 1 >"$HST/pane-pid"
+hook GP_INSTANCE_NAME=inst "$LIM"
+check "hook, run by a claude that is not the pane's: nothing, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+check "hook: the memory is unchanged byte for byte after every hook run" same_memory
+check "hook: nothing of its own was left in the memory folder" [ -z "$(find "$M" -name '*memory-size*')" ]
+
+# --- the defaults: nothing set ---
+# mem_lines N, mem_bytes N, mem_notes N, mem_folder BYTES: a memory at N of that measure and well under the other three.
+mem_lines() { rm -rf "$M"; mkdir -p "$M"; local i=0; while [ "$i" -lt "$1" ]; do echo '- x'; i=$((i + 1)); done >"$M/MEMORY.md"; }
+mem_bytes() { rm -rf "$M"; mkdir -p "$M"; { head -c $(($1 - 1)) /dev/zero | tr '\0' x; echo; } >"$M/MEMORY.md"; }
+mem_notes() { rm -rf "$M"; mkdir -p "$M/topics"; echo '- x' >"$M/MEMORY.md"; local i=0
+    while [ "$i" -lt "$1" ]; do echo n >"$M/topics/n$i.md"; i=$((i + 1)); done; }
+mem_folder() { rm -rf "$M"; mkdir -p "$M"; echo '- x' >"$M/MEMORY.md"; head -c $(($1 - 4)) /dev/zero >"$M/data.bin"; }
+# default MEASURE AT PAST KEY TEXT: nothing set; at AT, silence; at PAST, one block naming TEXT and the state KEY over.
+default() {
+    world; event
+    "mem_$1" "$2"
+    hook GP_INSTANCE_NAME=inst
+    check "defaults, nothing set: $1 at the limit ($2): nothing printed, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+    "mem_$1" "$3"
+    hook GP_INSTANCE_NAME=inst
+    # shellcheck disable=SC2034  # read by the eval below
+    D_TEXT="$5"
+    check "defaults, nothing set: $1 past the limit ($3): a block naming it" \
+        eval '[ "$(jq -r .decision "$T/out")" = block ] && jq -r .reason "$T/out" | grep -qF "$D_TEXT"'
+    check "defaults, nothing set: $1 past the limit: the state has it alone" [ "$(cat "$HST/memory-size" 2>/dev/null)" = "$4 over" ]
+    # shellcheck disable=SC2034  # read by the eval below
+    D_SET="set memory_limit_$4 to another number, or to off."
+    check "defaults, nothing set: $1 past the limit: the block names memory_limit_$4 and off" \
+        eval 'jq -r .reason "$T/out" | grep -qF "(the default, or one your operator set)" && jq -r .reason "$T/out" | grep -qF "$D_SET"'
+}
+default lines 150 151 index_lines "MEMORY.md has 151 lines (limit 150)"
+default bytes 20000 20001 index_bytes "MEMORY.md has 20,001 bytes (limit 20,000)"
+default notes 150 151 notes "the folder has 151 notes (limit 150)"
+default folder 819200 819201 folder_kib "the folder holds 801 KiB (limit 800 KiB)"
+
+# Off, one measure at a time: the memory past that measure's default alone, its limit saved empty, off or 0, the other
+# three not set.
+# off MEASURE PAST VAR
+off() {
+    local v
+    for v in "" off 0; do
+        world; event
+        "mem_$1" "$2"
+        hook GP_INSTANCE_NAME=inst "CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_$3=$v"
+        check "off: $1 past its default, its limit saved as [$v]: nothing printed, no state" eval 'quiet && [ ! -e "$HST/memory-size" ]'
+    done
+}
+off lines 151 INDEX_LINES
+off bytes 20001 INDEX_BYTES
+off notes 151 NOTES
+off folder 819201 FOLDER_KIB
+# A saved limit still counts, over its default.
+world; event; mem_lines 151
+hook GP_INSTANCE_NAME=inst CLAUDE_PLUGIN_OPTION_MEMORY_LIMIT_INDEX_LINES=" 200 "
+check "a saved limit is used, trimmed, not the default" quiet
+mk_memory
+
+# The wiring and the settings.
+# shellcheck disable=SC2016  # the command is text, as hooks.json holds it
+check "hooks.json runs the hook at Stop, and only there" \
+    [ "$(jq -r '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command == "\"${CLAUDE_PLUGIN_ROOT}/hooks/memory-size\"")) | .key] | join(",")' "$REPO/hooks/hooks.json")" = Stop ]
+PLUGIN_DEFAULTS=$(jq -r '[.userConfig | (.memory_limit_index_lines, .memory_limit_index_bytes, .memory_limit_notes, .memory_limit_folder_kib) | "[\(.default)]\(has("options"))"] | join(" ")' "$REPO/.claude-plugin/plugin.json")
+check "plugin.json: the four limits are free text, 150, 20000, 150 and 800 by default" \
+    [ "$PLUGIN_DEFAULTS" = "[150]false [20000]false [150]false [800]false" ]
+# The hook's one copy of the numbers, read from the tree under test.
+hook_default() { sed -n "s/^DEFAULT_$1=\([0-9][0-9]*\)\$/\1/p" "$HOOK"; }
+check "plugin.json's defaults equal the hook's constants" \
+    [ "$PLUGIN_DEFAULTS" = "[$(hook_default INDEX_LINES)]false [$(hook_default INDEX_BYTES)]false [$(hook_default NOTES)]false [$(hook_default FOLDER_KIB)]false" ]
+check "hooks/README.md lists the four settings with those defaults" \
+    eval '[ "$(grep -cE "^\| \`memory_limit_(index_lines\` \| \`150|index_bytes\` \| \`20000|notes\` \| \`150|folder_kib\` \| \`800)\` \|" "$REPO/hooks/README.md")" = 4 ]'
+
+# The lint, where shellcheck is installed (tool-tests has it; install/test/run.sh's list does not name these files). Only in
+# the outer run, so that a revert proof fails on its own check and never on the lint.
+if [ -z "${MEMORY_SIZE_TREE:-}" ]; then
+    if command -v shellcheck >/dev/null 2>&1; then
+        check "shellcheck: the tool, the hook and this test are clean" shellcheck -x -P SCRIPTDIR "$TOOL" "$HOOK" "$HERE/test"
+    else
+        echo "SKIP  shellcheck (not installed here)"
+    fi
+fi
+
+# --- the revert proofs ---
+if [ -z "${MEMORY_SIZE_TREE:-}" ]; then
+    # mutant FILE SED WHAT: a copy of the tree with SED applied to FILE (which
+    # must change it); this test must fail against it.
+    mutant() {
+        local copy="$T/mutant" f="$1" prog="$2" what="$3"
+        rm -rf "$copy"; mkdir -p "$copy/tools" "$copy/install"
+        cp -R "$REPO/hooks" "$copy/hooks"; cp -R "$REPO/install/lib" "$copy/install/lib"
+        cp -R "$REPO/tools/memory-size" "$copy/tools/memory-size"
+        sed -e "$prog" "$REPO/$f" >"$copy/$f.new" && mv "$copy/$f.new" "$copy/$f" && chmod +x "$copy/$f"
+        if cmp -s "$REPO/$f" "$copy/$f"; then check "revert proof ($what): the change applies" false; return; fi
+        MEMORY_SIZE_TREE="$copy" "$0" >"$T/mutant.log" 2>&1
+        check "revert proof: without $what, this test fails" [ $? != 0 ]
+        grep '^FAIL' "$T/mutant.log" | head -n 3 | sed 's/^/        /'
+    }
+    mutant tools/memory-size/memory-size 's/^\[ -n "\$L_INDEX_LINES\$L_INDEX_BYTES\$L_NOTES\$L_FOLDER_KIB" \] || exit 0$/:/' \
+        "the tool's stop when no limit is set"
+    mutant tools/memory-size/memory-size 's/^    had "\$1" \&\& return 0$/:/' \
+        "the state of a measure already past its limit"
+    mutant tools/memory-size/memory-size 's/^    settings+=("memory_limit_\$1")$/:/' \
+        "the setting of each limit that passed, in the note"
+    mutant tools/memory-size/memory-size 's/^if \[ \${#passed\[@\]} -eq 1 \]; then$/if true; then/' \
+        "the note's wording for several limits at once"
+    mutant tools/memory-size/memory-size 's/passed \$limits: /passed a limit your operator set: /' \
+        "the note's \"the default, or one your operator set\""
+    mutant tools/memory-size/memory-size 's/^now=""     # the state after this check$/now="$was${was:+\
+}"/' "forgetting a measure that came back under its limit"
+    mutant tools/memory-size/memory-size 's/\[ "\$2" -gt "\$3" \]/[ "$2" -ge "$3" ]/' \
+        "\"past\" meaning more than the limit"
+    mutant hooks/memory-size 's#"\$state/memory-size"#"$(dirname -- "$transcript")/memory/.memory-size"#' \
+        "the state kept out of the memory folder"
+    mutant hooks/memory-size 's/^own_claude "\$state" || exit 0$/:/' \
+        "the hook's own-claude guard"
+    mutant hooks/memory-size 's/^jq -cn --arg reason "\$note".*$/printf "%s" "$note"/' \
+        "the hook's Stop block"
+    for d in INDEX_LINES:index_lines INDEX_BYTES:index_bytes NOTES:notes FOLDER_KIB:folder_kib; do
+        mutant hooks/memory-size "s/^\\(.*=\$(limit memory_limit_${d#*:} \\)\"\\\$DEFAULT_${d%%:*}\")\$/\\1\"\")/" \
+            "the default for an unset memory_limit_${d#*:}"
+    done
+    mutant hooks/memory-size 's/eval "saved=\\\${\$var+set}"/eval "saved=\\${$var:+set}"/' \
+        "a saved empty limit told apart from an unset one"
+    mutant hooks/memory-size "s/^        '' | off | 0) return 0 ;;\$/        '') return 0 ;;/" \
+        "off and 0 as off in the hook itself"
+fi
+
+echo "$PASS passed, $FAIL failed"
+[ "$FAIL" = 0 ]

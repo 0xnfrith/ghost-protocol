@@ -1,0 +1,54 @@
+// The data volume's layout. Everything an agent keeps lives in /data, its HOME:
+//   .gp/agent.key          the agent's relay secret key (0600; never printed)
+//   .gp/config.json        name, slug, relay_url, owner: what init was given
+//   .gp/auth-tag           the owner's NIP-OA tag, one line of JSON (public)
+//   .gp/claude-token       a Claude setup token, when signed in with one (0600)
+//   .gp/persona.md         the persona, made from the image's persona/agent.md
+//   .gp/agent-state        what the entrypoint is doing: needs-claude, starting, running, error
+//   .gp/buzz/              the Buzz channel's state and log (BUZZ_STATE_DIR)
+//   .gp/relay-check.json   gp status's own relay login, at most once a minute
+//   .gp/update-available.json  {version}: a newer version is out (gp update offer)
+//   .gp/update-request.json    {action, from, to, at}: an update or way back asked for
+//   .gp/update-state.json      {state: updating, action, from, to, at}: under way
+//   .gp/previous-version       the version before the last update (the way back)
+//   .gp/updater-seen           when the update helper last polled (ISO time)
+//   .gp/handoff.json           how the last update or way back went, for the agent
+//   .gp/update-asked.json      the versions the agent was asked about (once each)
+//   .gp/profile.json           the agent's profile the relay last took (gp profile)
+//   work/agent/            the instance's home, a git checkout with its manifest
+//   .config/ghost-protocol/agent.json   the instance's settings file (start's GP_SETTINGS)
+//   .local/state/ghost-protocol/agent/  start's own state (session id, turn, pane)
+import { join } from "node:path";
+
+export const DATA = process.env.GP_DATA || "/data";
+export const GPDIR = join(DATA, ".gp");
+export const NAME = "agent";
+export const ROOT = join(DATA, "work");
+export const L = {
+  key: join(GPDIR, "agent.key"),
+  config: join(GPDIR, "config.json"),
+  tag: join(GPDIR, "auth-tag"),
+  token: join(GPDIR, "claude-token"),
+  persona: join(GPDIR, "persona.md"),
+  agentState: join(GPDIR, "agent-state"),
+  buzz: join(GPDIR, "buzz"),
+  channelLog: join(GPDIR, "buzz", "channel.log"),
+  relayCheck: join(GPDIR, "relay-check.json"),
+  updateAvailable: join(GPDIR, "update-available.json"),
+  releaseImages: join(GPDIR, "release-images.json"),
+  updateState: join(GPDIR, "update-state.json"),
+  updateRequest: join(GPDIR, "update-request.json"),
+  updaterSeen: join(GPDIR, "updater-seen"),
+  handoff: join(GPDIR, "handoff.json"),
+  updateAsked: join(GPDIR, "update-asked.json"),
+  previousVersion: join(GPDIR, "previous-version"),
+  profile: join(GPDIR, "profile.json"),
+  home: join(ROOT, NAME),
+  manifest: join(ROOT, NAME, ".ghost-protocol", "instance.toml"),
+  settings: join(DATA, ".config", "ghost-protocol", `${NAME}.json`),
+  startState: join(DATA, ".local", "state", "ghost-protocol", NAME),
+  claudeJson: join(DATA, ".claude.json"),
+  claudeSettings: join(DATA, ".claude", "settings.json"),
+  claudeCredentials: join(DATA, ".claude", ".credentials.json"),
+};
+export const PLUGIN_ID = "ghost-protocol@ghost-protocol";

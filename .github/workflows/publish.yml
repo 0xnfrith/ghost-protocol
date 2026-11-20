@@ -1,0 +1,88 @@
+# The publish step, a skeleton: on every push to main it runs tools/publish/ci/run, which copies the allowlisted paths into the
+# public repository as one new commit, after the scan. Until that script is in the tree, or where the push credential is not set
+# (the public copy itself, a staging copy without it), this workflow passes with a notice and sends nothing anywhere.
+#
+# tools/publish/ci/run runs from the root of a full clone of the pushed commit, with node 22, python3, jq and git on the PATH, and
+# these in its environment:
+#   GP_PUBLISH_TOKEN  (secret of the publish environment, which deploys from main only) a push credential for the target
+#                     repository, and for nothing else
+#   GP_PUBLISH_REPO   (repository variable) the target, owner/name
+# The checkout keeps no credential, so the script pushes with GP_PUBLISH_TOKEN only. Runs never overlap: a push waits for the
+# publish in progress, and the script publishes every commit since the last one it published, so a run that GitHub drops from the
+# queue loses nothing.
+#
+# Two targets, one after the other, from the same checkout of the same pushed commit, each step with its own credential only:
+#   the staging copy        GP_PUBLISH_TOKEN and GP_PUBLISH_REPO, as above
+#   the public repository   GP_PUBLISH_TOKEN_PUBLIC (secret of the publish environment, a push credential for that repository and
+#                           for nothing else) and GP_PUBLISH_REPO_PUBLIC (repository variable, owner/name)
+# A target whose credential or name is not set is skipped with a notice. Each target is published on its own: the public step runs
+# even when the staging step failed (not when the checkout did), a failed step makes the run red, and nothing else waits on it.
+# tools/publish/publish finds each target's last published commit from the target's own head, so the next run brings a target that
+# fell behind up to date, and the first publish into an empty target is the one commit with no history that holds LICENSE.
+name: publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: publish
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: tools/publish/ci/run, the staging copy
+        id: staging
+        env:
+          GP_PUBLISH_TOKEN: ${{ secrets.GP_PUBLISH_TOKEN }}
+          GP_PUBLISH_REPO: ${{ vars.GP_PUBLISH_REPO }}
+        run: |
+          set -euo pipefail
+          if [ ! -e tools/publish/ci/run ]; then
+            echo "::notice title=Nothing published::No tools/publish/ci/run in this tree."
+            exit 0
+          fi
+          if [ -z "${GP_PUBLISH_TOKEN:-}" ] || [ -z "${GP_PUBLISH_REPO:-}" ]; then
+            echo "::notice title=Nothing published::GP_PUBLISH_TOKEN or GP_PUBLISH_REPO is not set in this repository."
+            exit 0
+          fi
+          if [ ! -x tools/publish/ci/run ]; then
+            echo "::error file=tools/publish/ci/run::tools/publish/ci/run is not executable (chmod +x, and commit the mode)"
+            exit 1
+          fi
+          exec ./tools/publish/ci/run
+      - name: tools/publish/ci/run, the public repository
+        if: ${{ !cancelled() && (success() || steps.staging.outcome == 'failure') }}
+        env:
+          GP_PUBLISH_TOKEN: ${{ secrets.GP_PUBLISH_TOKEN_PUBLIC }}
+          GP_PUBLISH_REPO: ${{ vars.GP_PUBLISH_REPO_PUBLIC }}
+        run: |
+          set -euo pipefail
+          if [ ! -e tools/publish/ci/run ]; then
+            echo "::notice title=Nothing published to the public repository::No tools/publish/ci/run in this tree."
+            exit 0
+          fi
+          if [ -z "${GP_PUBLISH_TOKEN:-}" ] || [ -z "${GP_PUBLISH_REPO:-}" ]; then
+            echo "::notice title=Nothing published to the public repository::GP_PUBLISH_TOKEN_PUBLIC (in the publish environment) or GP_PUBLISH_REPO_PUBLIC is not set."
+            exit 0
+          fi
+          if [ ! -x tools/publish/ci/run ]; then
+            echo "::error file=tools/publish/ci/run::tools/publish/ci/run is not executable (chmod +x, and commit the mode)"
+            exit 1
+          fi
+          exec ./tools/publish/ci/run

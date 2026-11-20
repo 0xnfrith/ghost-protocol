@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# setup: install, update or roll back an instance's key service, so that its
+# relay private key lives with a separate OS user and the instance's own
+# processes (Claude Code, its tools and subagents) can never read it.
+# install/lib/keyservice.sh says what it installs and what it refuses.
+#
+# Usage:
+#   install/keyservice/setup --name <name> --agent-user <user> [options]                dry run (the default)
+#   install/keyservice/setup --name <name> --agent-user <user> --settings <file> --key-from-stdin --apply
+#   install/keyservice/setup --name <name> --agent-user <user> --update [--commit <id>] --apply
+#   install/keyservice/setup --name <name> --agent-user <user> --rollback --apply
+#   install/keyservice/setup --name <name> --agent-user <user> --github-settings <file> --github-public-text <file> --github-app-key-from-stdin --apply
+#   install/keyservice/setup --name <name> --agent-user <user> --update --github-settings <file> --github-public-text <file> --apply   (an instance with the slot from before its limits)
+#
+# Run it as the machine's admin user, the one with sudo, never as the agent
+# user (it refuses): each root step goes through sudo, and the code it copies
+# comes from this checkout, which the agent user must not be able to change.
+#
+# Options:
+#   --name <name>          the instance's name, as in its manifest (required)
+#   --agent-user <user>    the OS user that runs the instance's Claude Code (required)
+#   --settings <file>      the Buzz settings, KEY=value lines (# comments, no
+#                          quotes): BUZZ_RELAY_URL and BUZZ_CHANNELS, and any of
+#                          BUZZ_CHANNEL, BUZZ_WATCH_PUBKEY, BUZZ_DM_MESSAGES,
+#                          BUZZ_TRUSTED_PUBKEYS, BUZZ_ALLOWED_PUBKEYS,
+#                          BUZZ_ALLOWLIST_FILE, BUZZ_CATCHUP_MAX_AGE, and the DM
+#                          task roots' BUZZ_TASK_ROOTS, BUZZ_TASK_OPEN_EMOJI,
+#                          BUZZ_TASK_DONE_EMOJI and their _URL settings. Needed
+#                          the first time; afterwards the installed buzz.env is kept
+#                          unless this is given again
+#   --key-from-stdin       the relay private key on stdin (64 hex or nsec1), for
+#                          a key that already exists:  op read <ref> | setup ...
+#                          It goes from stdin straight to the root-owned
+#                          keyfile.mjs, which writes it; it is never printed.
+#                          A pipe or a file, never a terminal: refused there
+#   --key-generate         a new key, made on this machine; only its public key
+#                          is printed (for the owner's attestation)
+#                          (either one, the first time only: a key file that is
+#                          there is never replaced)
+#   --tag <file>           the owner's NIP-OA auth tag, one JSON array; replaces
+#                          the installed one
+#   --github-app-key-from-stdin
+#                          the GitHub App slot: a GitHub App's private key on
+#                          stdin (the PEM GitHub hands out: an RSA key of 2048
+#                          bits or more), for its one fixed review action
+#                          (gp-github-review). Like the relay key it goes from
+#                          stdin straight to the root-owned code that writes it
+#                          (github-app.pem, 0400 root); only its fingerprint is
+#                          printed, as GitHub shows it. A pipe or a file, never
+#                          a terminal. Not with --key-from-stdin in the same run
+#                          (one key on stdin per run), nor with --update or
+#                          --rollback. A key file that is there is replaced only
+#                          with --replace-github-app-key. The slot's unit runs
+#                          as a user of its own, gp-gh-<name> (made here),
+#                          never as the key's user that runs buzz-mcp
+#   --replace-github-app-key
+#                          with --github-app-key-from-stdin: swap the key that is
+#                          there for the one on stdin, in one step (rotation:
+#                          make the new key on GitHub, swap it in, then delete
+#                          the old one there; the setup prints both fingerprints)
+#   --github-settings <file>
+#                          the GitHub App slot's settings, KEY=value lines (#
+#                          comments, no quotes): GITHUB_APP_CLIENT_ID (the App's
+#                          client ID) and GITHUB_REVIEW_REPOS (the repos it may
+#                          review, each with the installation that holds it:
+#                          <installation id>:<owner>/<repo>, comma-separated);
+#                          GITHUB_REVIEW_OWN_LOGINS (the App's bot login,
+#                          <name>[bot], comma-separated) and GITHUB_REVIEW_OWN_EMAILS
+#                          (its bot noreply address, <id>+<name>[bot]@users.noreply.github.com),
+#                          the reviewer's own identities, which the key service's
+#                          own-pull-request and own-commit limits compare with (only
+#                          an App's bot can be written: a person's address, the
+#                          builders' shared noreply author above all, is refused);
+#                          and, optionally, GITHUB_REVIEW_ALLOW_COMMENT (0 or 1,
+#                          0 when absent: whether the key service may post a COMMENT).
+#                          Needed the first time; afterwards the installed
+#                          github.conf is kept unless this is given again
+#   --github-public-text <file>
+#                          the GitHub App slot's public-text rules: a JSON list of
+#                          {"name": "<slug>", "pattern": "<regular expression>",
+#                          "ignore_case": true} (ignore_case optional), the rules a
+#                          review's body must pass in a repo that is not private.
+#                          The root-owned copy's code checks the file before the
+#                          setup installs it (public-text.json, 0644 root); one it
+#                          refuses never replaces the one there. Needed the first
+#                          time; afterwards the installed one is kept unless this
+#                          is given again
+#   --skip-github-check    leave out the last check's call to GitHub (GET /app
+#                          with a JWT, made on the key's side), with a SKIP line:
+#                          for a test key GitHub does not know. The socket is
+#                          still asked for the key's fingerprint
+#   --commit <id>          the GHOST Protocol commit the key service runs, a full
+#                          id in this checkout (default: this checkout's HEAD)
+#   --node <path>          the node to run (default: node on PATH). A root-owned
+#                          node is run where it is; any other is copied in
+#   --buzz-mcp <file>      the buzz-mcp build (default: the build script's cache,
+#                          ~/.cache/ghost-protocol/buzz/buzz-mcp.mjs); it must be
+#                          built from the commit's pin
+#   --agent-sudo none|password
+#                          none (the default): the agent user may run no sudo at
+#                          all. password: it may keep sudo that needs a password
+#                          only a person knows (a personal agent on its own
+#                          machine). That is still root-equivalent, and the setup
+#                          says so: the password must never be typed in any
+#                          session of the agent user (a ticket cached there, a
+#                          shadowed sudo or a debugger on its shell is root),
+#                          and sudo must cache no ticket for it
+#                          (Defaults:<user> timestamp_timeout=0), or the setup
+#                          refuses. Passwordless sudo is refused either way. The
+#                          safer shape gives the agent user no sudo at all
+#   --no-sender-allowlist  run with no sender allowlist on purpose (anyone who
+#                          mentions the agent in its rooms reaches the session);
+#                          without it, the settings must set BUZZ_ALLOWED_PUBKEYS
+#                          or BUZZ_ALLOWLIST_FILE
+#   --accept-root-equivalent-agent
+#                          go on, with a warning, when the agent user can become
+#                          root: the key is then out of every casual path, but
+#                          anything run as root still reaches it
+#   --update               move an installed key service to --commit, then
+#                          restart it and the instance
+#   --rollback             back to the commit before the last update, then
+#                          restart it and the instance; its copy in /opt is run
+#                          as it is when intact (no npm ci)
+#   --apply                make the changes (without it: a dry run, which
+#                          checks everything, prints every file in full and
+#                          changes nothing). Every --apply ends by checking
+#                          what it installed: the key out of the agent user's
+#                          reach, the units as systemd loads them (no drop-in
+#                          that changes who runs them, what they run or are
+#                          handed, what they reach or where they listen), and
+#                          one real connection to each socket, made as the
+#                          agent user, which must be answered. Run it again,
+#                          unchanged, to check an installed key service
+#   --yes                  never wait for a sudo password (sudo -n only)
+#   -h, --help             this help
+#
+# With the GitHub App slot, the session runs tools/github-review/gp-github-review
+# (keyless) to post a review; adding the slot to an instance that runs starts
+# only the GitHub socket, and never restarts the session.
+#
+# After the first install, the instance's own side changes (as the agent
+# user): in its settings file, the plugin's buzz_key_socket becomes
+# /run/ghost-protocol-key/<name> and its buzz_key_command becomes empty; then
+# install/service/start --dry-run checks it, and the instance is restarted.
+# The setup prints these steps.
+#
+# Exit codes: 0 done (or a dry run found everything ready); 1 a check or a
+# step failed; 2 usage.
+set -uo pipefail
+
+GP_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+LIB="$GP_DIR/install/lib"
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+# shellcheck source=../lib/report.sh
+. "$LIB/report.sh"
+# shellcheck source=../lib/keyservice.sh
+. "$LIB/keyservice.sh"
+
+usage_error() { echo "setup: $*" >&2; echo "Try: install/keyservice/setup --help" >&2; exit 2; }
+
+# The GitHub App slot's last check (ks_github_answers), recorded; status 1
+# on a FAIL. Nothing to do without the slot.
+ks_github_report() {
+    [ "$KS_GH" = 1 ] || return 0
+    heading "the GitHub socket answers (as $KS_AGENT)"
+    if ! ks_github_answers; then
+        record FAIL github "$KS_WHY. The listeners stay on, so a run of this again checks once more"
+        return 1
+    fi
+    if [ "$KS_GH_ANSWERED" = skip ]; then
+        record OK github "the GitHub socket answered as $KS_AGENT with the key's fingerprint, $KS_GH_FP"
+        record SKIP github "GitHub was not asked about the App (--skip-github-check)"
+    else
+        record OK github "the GitHub socket answered as $KS_AGENT, and GitHub knows the key ($KS_GH_FP) as the configured App"
+    fi
+    if [ -n "$KS_GH_FP_PREV" ]; then
+        say "the old GitHub App key is no longer on this machine: delete it on GitHub now (the App's settings, Private keys: the one with fingerprint $KS_GH_FP_PREV)"
+        record DONE github "the GitHub App key swapped: $KS_GH_FP_PREV out, $KS_GH_FP in; delete the old one on GitHub"
+    fi
+    if [ "$KS_GH_CHANGED" = 1 ]; then
+        say "the session posts a review with: tools/github-review/gp-github-review --socket $KS_RUN review <owner/repo> <pr> <head-sha> <APPROVE|REQUEST_CHANGES|COMMENT> [<body> | -]"
+    fi
+    return 0
+}
+
+APPLY=0 YES=0 MODE=install
+KS_KEY_MODE="" KS_SETTINGS_OPT="" KS_AGENT_SUDO=none KS_ACCEPT_ROOT=0 KS_NO_ALLOWLIST=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name)           [ $# -ge 2 ] || usage_error "--name needs a value"; KS_NAME="$2"; shift 2 ;;
+        --agent-user)     [ $# -ge 2 ] || usage_error "--agent-user needs a value"; KS_AGENT="$2"; shift 2 ;;
+        --settings)       [ $# -ge 2 ] || usage_error "--settings needs a value"; KS_SETTINGS_OPT="$2"; shift 2 ;;
+        --key-from-stdin) [ -z "$KS_KEY_MODE" ] || usage_error "--key-from-stdin and --key-generate go one at a time"; KS_KEY_MODE=stdin; shift ;;
+        --key-generate)   [ -z "$KS_KEY_MODE" ] || usage_error "--key-from-stdin and --key-generate go one at a time"; KS_KEY_MODE=generate; shift ;;
+        --tag)            [ $# -ge 2 ] || usage_error "--tag needs a value"; KS_TAG_FILE="$2"; shift 2 ;;
+        --github-app-key-from-stdin) KS_GH_KEY_MODE=stdin; shift ;;
+        --replace-github-app-key) KS_GH_REPLACE=1; shift ;;
+        --github-settings) [ $# -ge 2 ] || usage_error "--github-settings needs a value"; KS_GH_SETTINGS_OPT="$2"; shift 2 ;;
+        --github-public-text) [ $# -ge 2 ] || usage_error "--github-public-text needs a value"; KS_GH_RULES_OPT="$2"; shift 2 ;;
+        --skip-github-check) KS_GH_SKIP_CHECK=1; shift ;;
+        --commit)         [ $# -ge 2 ] || usage_error "--commit needs a value"; KS_COMMIT="$2"; shift 2 ;;
+        --node)           [ $# -ge 2 ] || usage_error "--node needs a value"; KS_NODE_OPT="$2"; shift 2 ;;
+        --buzz-mcp)       [ $# -ge 2 ] || usage_error "--buzz-mcp needs a value"; KS_BUZZ_MCP_OPT="$2"; shift 2 ;;
+        --agent-sudo)     [ $# -ge 2 ] || usage_error "--agent-sudo needs a value"; KS_AGENT_SUDO="$2"; shift 2 ;;
+        --accept-root-equivalent-agent) KS_ACCEPT_ROOT=1; shift ;;
+        --no-sender-allowlist) KS_NO_ALLOWLIST=1; shift ;;
+        --update)         [ "$MODE" = install ] || usage_error "--update and --rollback go one at a time"; MODE=update; shift ;;
+        --rollback)       [ "$MODE" = install ] || usage_error "--update and --rollback go one at a time"; MODE=rollback; shift ;;
+        --apply)          APPLY=1; shift ;;
+        --dry-run)        APPLY=0; shift ;;
+        --yes|-y)         YES=1; shift ;;
+        -h|--help)        sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)                usage_error "unknown option: $1" ;;
+    esac
+done
+[ -n "$KS_NAME" ] || usage_error "--name <name> is required"
+[ -n "$KS_AGENT" ] || usage_error "--agent-user <user> is required"
+[[ $KS_NAME =~ $KS_RE_NAME ]] || usage_error "--name must be lower-case letters, digits and dashes"
+[[ $KS_AGENT =~ $KS_RE_USER ]] || usage_error "--agent-user must be a plain user name"
+KS_KEY_USER="gp-key-$KS_NAME"
+# The GitHub App slot's own user (keyservice.sh: never the key's user). No
+# instance name gives a key's user (gp-key-<name>) this name. Each user's
+# comment names its role and instance; one that is there must carry it.
+KS_GH_USER="gp-gh-$KS_NAME"
+KS_KEY_COMMENT="Ghost Protocol key service for $KS_NAME"
+KS_GH_COMMENT="Ghost Protocol GitHub App key for $KS_NAME"
+[ "${#KS_KEY_USER}" -le 32 ] || usage_error "--name is too long: the key's user, $KS_KEY_USER, must be at most 32 characters"
+case "$KS_AGENT_SUDO" in none|password) ;; *) usage_error "--agent-sudo must be none or password" ;; esac
+if [ "$MODE" = rollback ] && [ -n "$KS_COMMIT" ]; then usage_error "--rollback goes back to the recorded commit; it takes no --commit"; fi
+if [ "$MODE" != install ] && [ -n "$KS_KEY_MODE" ]; then usage_error "--key-from-stdin and --key-generate are for the first install only"; fi
+if [ "$KS_KEY_MODE" = stdin ] && [ -t 0 ]; then
+    usage_error "--key-from-stdin reads the key from a pipe or a file, never from a terminal (a key typed there shows on the screen, and stays in its scrollback): op read <ref> | install/keyservice/setup ... --key-from-stdin"
+fi
+if [ "$KS_GH_KEY_MODE" = stdin ]; then
+    [ "$KS_KEY_MODE" != stdin ] || usage_error "--key-from-stdin and --github-app-key-from-stdin both read stdin: one key on stdin per run (install the relay key first, then run again for the GitHub App key)"
+    [ "$MODE" = install ] || usage_error "--github-app-key-from-stdin goes without --update or --rollback (add or swap the key at the commit the key service runs)"
+    [ ! -t 0 ] || usage_error "--github-app-key-from-stdin reads the key from a pipe or a file, never from a terminal (a key typed there shows on the screen, and stays in its scrollback)"
+fi
+[ "$KS_GH_REPLACE" = 0 ] || [ "$KS_GH_KEY_MODE" = stdin ] || usage_error "--replace-github-app-key goes with --github-app-key-from-stdin (the new key)"
+for f in "$KS_SETTINGS_OPT" "$KS_TAG_FILE" "${KS_NODE_OPT:-}" "${KS_BUZZ_MCP_OPT:-}" "$KS_GH_SETTINGS_OPT" "$KS_GH_RULES_OPT"; do
+    [ -z "$f" ] || case "$f" in /*) ;; *) usage_error "file options take absolute paths ($f)" ;; esac
+done
+DRY_RUN=$((1 - APPLY))
+HAVE_TTY=0
+( : </dev/tty ) 2>/dev/null && HAVE_TTY=1
+# shellcheck disable=SC2034  # read by root_prepare and the report
+true "$YES" "$HAVE_TTY" "$DRY_RUN"
+detect_platform || true
+trap cleanup_work EXIT
+
+printf 'Ghost Protocol key service (%s, instance %s, agent user %s)%s\n' "$MODE" "$KS_NAME" "$KS_AGENT" \
+    "$([ "$APPLY" = 0 ] && echo ', DRY RUN: nothing is changed')"
+
+# ---------------------------------------------------------------- checks
+
+heading "checks"
+ks_paths; rc=$?
+if [ "$rc" = 2 ]; then
+    record FAIL keyservice "test mode (GP_TEST=1) with a real folder: nothing is checked or written"
+    report_print; exit 1
+elif [ "$rc" != 0 ]; then
+    say "TEST MODE (GP_TEST=1) without GP_ETC, GP_OPT and GP_SRV: nothing is checked or written"
+    if [ "$APPLY" = 1 ]; then
+        record FAIL keyservice "test mode without GP_ETC, GP_OPT and GP_SRV: --apply changed nothing"
+        report_print; exit 1
+    fi
+    record SKIP keyservice "test mode without GP_ETC, GP_OPT and GP_SRV"
+    report_print; exit 0
+fi
+ks_github_state
+if ! root_prepare "The key service's checks and steps"; then
+    say "root is needed even for a dry run: the checks ask, as root, what the agent user may run, and test as that user what it can read"
+    record FAIL root "$ROOT_PROBLEM"; report_print; exit 1
+fi
+ks_check_machine
+ks_check_tops
+ks_check_agent
+ks_check_key_user
+[ "$KS_GH" = 0 ] || ks_check_gh_user
+ks_check_instance_creds
+# The inputs are copied into this run's private work folder as they are checked.
+if ! make_work; then record FAIL work "could not make a private temporary folder"; report_print; exit 1; fi
+ks_check_work
+case "$MODE" in
+    install)
+        if [ -n "$KS_CUR" ]; then
+            [ -n "$KS_COMMIT" ] || KS_COMMIT="$(ks_git rev-parse HEAD 2>/dev/null)"
+            if [ "$KS_COMMIT" != "$KS_CUR" ]; then
+                ks_problem "the key service of $KS_NAME runs $KS_CUR; moving it to $KS_COMMIT is an update: add --update"
+            fi
+        fi ;;
+    update)
+        [ -n "$KS_CUR" ] || ks_problem "instance $KS_NAME has no key service yet ($KS_ETC/commit); the first install runs without --update" ;;
+    rollback)
+        if [ -z "$KS_CUR" ]; then ks_problem "instance $KS_NAME has no key service yet; nothing to roll back"
+        elif [ -z "$KS_PREV" ]; then ks_problem "nothing to roll back to: $KS_ETC has no previous-commit (an update records the commit it moves from)"
+        elif [ ! -f "$KS_OPT/$KS_PREV/COMMIT" ]; then ks_problem "the copy of $KS_PREV is gone from $KS_OPT; go back with --update --commit $KS_PREV instead"
+        else KS_COMMIT="$KS_PREV"; fi ;;
+esac
+ks_check_source
+[ "$KS_GH" = 0 ] || ks_check_github
+# A rollback runs its old copy as it is, when that copy is intact.
+[ "$MODE" = rollback ] && [ -n "$KS_PIN" ] && ks_check_reuse
+if [ "$KS_REUSE" = 1 ] && [ -x "$KS_OPT/$KS_COMMIT/bin/node" ]; then
+    KS_NODE_COPY=1; KS_NODE="$KS_OPT/$KS_COMMIT/bin/node"; KS_NODE_SRC="$KS_NODE"
+else
+    ks_check_node
+    # Its copy has no node of its own, and the node given is not root's: put it together again.
+    [ "$KS_NODE_COPY" = 1 ] && KS_REUSE=0
+fi
+if [ "$KS_REUSE" = 1 ]; then KS_BUZZ_MCP_SRC="$KS_OPT/$KS_COMMIT/buzz-mcp/buzz-mcp.mjs"
+else ks_check_buzz_mcp; fi
+if [ -n "$KS_SETTINGS_OPT" ]; then ks_read_settings "$KS_SETTINGS_OPT"
+elif [ -f "$KS_ETC/buzz.env" ]; then ks_read_settings "$KS_ETC/buzz.env"
+else ks_problem "no settings: the first install needs --settings <file>"; fi
+ks_check_allowlist
+if [ -n "$KS_TAG_FILE" ]; then
+    if ks_take "$KS_TAG_FILE" "the tag file" 8192 644; then KS_TAG_FILE="$KS_COPY"; ks_check_tag "$KS_TAG_FILE"
+    else ks_problem "$KS_WHY"; fi
+fi
+if [ -e "$KS_ETC/buzz-key" ] || [ -L "$KS_ETC/buzz-key" ]; then
+    [ -z "$KS_KEY_MODE" ] || ks_problem "$KS_ETC/buzz-key is already there, and a key file is never replaced (replacing an agent's key is a deliberate act: remove the file by hand first). If an earlier run wrote it and then stopped at its last check, run this again without --key-from-stdin or --key-generate"
+else
+    [ -n "$KS_KEY_MODE" ] || ks_problem "no key file at $KS_ETC/buzz-key: give the key with --key-from-stdin, or make one with --key-generate"
+fi
+
+if [ -n "$KS_ROOTEQ" ]; then
+    printf '%s' "$KS_ROOTEQ" | while IFS= read -r l; do [ -n "$l" ] && warn "$l"; done
+    warn "--accept-root-equivalent-agent: going on. The key is out of every casual path (the session's environment, its key command, its processes' /proc), but anything the agent user runs as root still reaches it."
+fi
+[ -z "$KS_SUDO_WARN" ] || warn "$KS_SUDO_WARN"
+if [ "$KS_NO_ALLOWLIST_USED" = 1 ]; then
+    warn "--no-sender-allowlist: no sender allowlist. Anyone who mentions the agent in its rooms reaches the session, and can ask it to add someone to a room (buzz-mcp's members tool)."
+fi
+if [ -n "$KS_PROBLEMS" ]; then
+    say "refused, before changing anything:"
+    printf '%s' "$KS_PROBLEMS" | while IFS= read -r l; do [ -n "$l" ] && say "  - $l"; done
+    record FAIL checks "$(printf '%s' "$KS_PROBLEMS" | grep -c .) problem(s); nothing was changed"
+    report_print
+    exit 1
+fi
+if [ -n "$KS_ROOTEQ" ]; then say "the agent user $KS_AGENT (group $KS_AGENT_GROUP) CAN become root: accepted with --accept-root-equivalent-agent"
+elif [ -n "$KS_SUDO_WARN" ]; then say "the agent user $KS_AGENT (group $KS_AGENT_GROUP) CAN become root with its password (--agent-sudo password): root-equivalent, see the warning"
+else say "the agent user $KS_AGENT (group $KS_AGENT_GROUP) cannot become root"; fi
+say "the key's user: $KS_KEY_USER ($([ "$KS_KEY_EXISTS" = 1 ] && echo 'there' || echo 'to be made'))"
+[ "$KS_GH" = 0 ] || say "the GitHub App key's user: $KS_GH_USER ($([ "$KS_GH_EXISTS" = 1 ] && echo 'there' || echo 'to be made'))"
+say "commit: $KS_COMMIT$([ -n "$KS_CUR" ] && [ "$KS_CUR" != "$KS_COMMIT" ] && echo " (it runs $KS_CUR now)")"
+say "node: $KS_NODE_SRC$([ "$KS_NODE_COPY" = 1 ] && echo ", copied to $KS_NODE (it is not root-owned)" || echo ' (root-owned, run where it is)')"
+say "buzz-mcp: $KS_BUZZ_MCP_SRC (pin $KS_PIN)"
+[ "$KS_REUSE" = 0 ] || say "the copy at $KS_OPT/$KS_COMMIT is intact: it is run as it is"
+[ "$KS_GH" = 0 ] || say "the GitHub App slot: on ($(printf '%s' "$KS_GH_LINES" | sed -n 's/^GITHUB_REVIEW_REPOS=//p' | tr ',' '\n' | grep -c .) repo(s) on its allowlist)"
+record OK checks "the machine, the agent user, the key's user, the code and the settings$([ "$KS_GH" = 1 ] && echo ', and the GitHub App slot')"
+
+# ---------------------------------------------------------------- the plan
+
+heading "the code, put together (as $(id -un))"
+if [ "$KS_REUSE" = 1 ]; then
+    say "nothing to put together: the copy at $KS_OPT/$KS_COMMIT is intact (root's alone, the commit's files, buzz-mcp of its pin, its dependencies)"
+else
+    if ! ks_stage; then record FAIL code "$KS_WHY"; report_print; exit 1; fi
+    say "put together from commit $KS_COMMIT (fetched from git into a fresh repository, every object checked; never the working tree): the adapter with its dependencies, buzz-mcp$([ "$KS_NODE_COPY" = 1 ] && echo ', node') and the copy step"
+fi
+if ! ks_render_units; then record FAIL units "could not fill in the unit templates in $KS_TEMPLATES"; report_print; exit 1; fi
+if ! ks_render_env "$GP_WORK/buzz.env"; then record FAIL files "could not write the settings to $GP_WORK/buzz.env"; report_print; exit 1; fi
+if [ "$KS_GH" = 1 ] && ! ks_render_github_conf "$GP_WORK/github.conf"; then record FAIL files "could not write the GitHub settings to $GP_WORK/github.conf"; report_print; exit 1; fi
+
+if [ "$APPLY" = 0 ]; then
+    heading "the key's user"
+    if [ "$KS_KEY_EXISTS" = 1 ]; then say "$KS_KEY_USER is there"; else
+        show_cmd useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --comment "$KS_KEY_COMMENT" "$KS_KEY_USER"
+    fi
+    if [ "$KS_GH" = 1 ]; then
+        if [ "$KS_GH_EXISTS" = 1 ]; then say "$KS_GH_USER is there"; else
+            show_cmd useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --comment "$KS_GH_COMMENT" "$KS_GH_USER"
+        fi
+    fi
+    heading "the code, in place (as root)"
+    if [ "$KS_REUSE" = 1 ]; then
+        say "$KS_OPT/$KS_COMMIT is run as it is"
+    elif [ -f "$KS_OPT/$KS_COMMIT/COMMIT" ] && diff -rq "$KS_STAGE" "$KS_OPT/$KS_COMMIT" >/dev/null 2>&1; then
+        say "$KS_OPT/$KS_COMMIT is already this copy"
+    else
+        say "would copy it to $KS_OPT/$KS_COMMIT (root-owned, nothing writable by group or others)"
+    fi
+    heading "the files"
+    say "$KS_ETC/ (root, 0755):"
+    case "$KS_KEY_MODE" in
+        stdin)    say "  buzz-key       0400 root: the key, read from stdin by the copy's keyfile.mjs (never printed)" ;;
+        generate) say "  buzz-key       0400 root: a new key, made by the copy's keyfile.mjs; its public key is printed" ;;
+        *)        say "  buzz-key       0400 root: already there, kept" ;;
+    esac
+    if cmp -s "$GP_WORK/buzz.env" "$KS_ETC/buzz.env"; then say "  buzz.env       0644 root: already this file"
+    else say "  buzz.env       0644 root, this file in full:"; sed 's/^/      | /' "$GP_WORK/buzz.env"; fi
+    if [ -n "$KS_TAG_FILE" ]; then say "  auth-tag.json  0644 root: from $KS_TAG_FILE"
+    elif [ -f "$KS_ETC/auth-tag.json" ]; then say "  auth-tag.json  0644 root: already there, kept"
+    else say "  auth-tag.json: none (a key that is a relay member itself needs none)"; fi
+    say "  commit         0644 root: $KS_COMMIT$([ "$MODE" != install ] && echo "; previous-commit: $KS_CUR")"
+    if [ "$KS_GH" = 1 ]; then
+        case "$KS_GH_KEY_MODE:$KS_GH_REPLACE" in
+            stdin:0) say "  github-app.pem 0400 root: the GitHub App key, read from stdin by the copy's github-review.mjs (never printed; its fingerprint is)" ;;
+            stdin:1) say "  github-app.pem 0400 root: swapped, in one step, for the GitHub App key on stdin (both fingerprints are printed)" ;;
+            *)       say "  github-app.pem 0400 root: already there, kept" ;;
+        esac
+        if cmp -s "$GP_WORK/github.conf" "$KS_ETC/github.conf"; then say "  github.conf    0644 root: already this file"
+        else say "  github.conf    0644 root, this file in full:"; sed 's/^/      | /' "$GP_WORK/github.conf"; fi
+        if [ -n "$KS_GH_RULES_COPY" ]; then
+            if cmp -s "$KS_GH_RULES_COPY" "$KS_ETC/public-text.json"; then say "  public-text.json 0644 root: already this file"
+            else say "  public-text.json 0644 root: from $KS_GH_RULES_OPT, checked by the root-owned copy's github-review.mjs before it is installed (the rules are not printed)"; fi
+        else say "  public-text.json 0644 root: already there, kept (checked again by this commit's code)"; fi
+    fi
+    say "$KS_SRV/ (root, 0711):"
+    say "  outbox/  $KS_AGENT:$KS_KEY_USER 2770  the session puts files to send here"
+    say "  files/   $KS_KEY_USER:$KS_AGENT_GROUP 2750  buzz-mcp's BUZZ_MCP_ROOT: the outbox's copy step puts the session's files here, so nothing in it is trusted (never an allowlist)"
+    say "  media/   $KS_KEY_USER:$KS_AGENT_GROUP 2750  where media_get saves"
+    heading "the units"
+    for f in "$KS_UNITS_WORK"/*; do
+        n="${f##*/}"
+        if cmp -s "$f" "$KS_UNITDIR/$n"; then say "$KS_UNITDIR/$n is already this file"; continue; fi
+        if [ -f "$KS_UNITDIR/$n" ]; then
+            say "would replace $KS_UNITDIR/$n (as root); the differences:"
+            diff -u "$KS_UNITDIR/$n" "$f" | sed 's/^/    /' || true
+        else
+            say "would write $KS_UNITDIR/$n (as root), this file in full:"
+            sed 's/^/    | /' "$f"
+        fi
+    done
+    show_cmd systemctl daemon-reload
+    if [ "$MODE" = install ] && [ -z "$KS_CUR" ]; then
+        # shellcheck disable=SC2046  # three unit names
+        show_cmd systemctl enable --now $(ks_listeners)
+    else
+        say "would restart the key service (its listeners and open connections), then $KS_NAME.service if it runs"
+    fi
+    say "then it would check, as $KS_AGENT and as $KS_KEY_USER, that neither can read the key file, that $KS_AGENT can write none of the code, the settings, the tag or the allowlist, that everything installed is root's alone, and that systemd loads each unit as written, with no drop-in that changes it; only then would it record the commit and leave the listeners enabled"
+    say "and last, with the listeners on, it would make one real connection to each socket as $KS_AGENT, which must be answered"
+    if [ "$KS_GH" = 1 ]; then
+        say "and ask the GitHub socket, as $KS_AGENT, for the key's fingerprint$([ "$KS_GH_SKIP_CHECK" = 1 ] && echo ' (not GitHub: --skip-github-check)' || echo ', then GitHub for the App (GET /app with a JWT, made on the key'"'"'s side)')"
+    fi
+    record PLAN keyservice "would $MODE the key service of $KS_NAME at $KS_COMMIT"
+    report_print
+    echo "READY"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- apply
+
+if ! ks_lock; then record FAIL lock "$KS_WHY"; report_print; exit 1; fi
+
+heading "the key's user"
+if [ "$KS_KEY_EXISTS" = 0 ]; then
+    say "making $KS_KEY_USER (a system user with no home and no shell)"
+    if ! ks_root useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
+            --comment "$KS_KEY_COMMENT" "$KS_KEY_USER"; then
+        record FAIL user "could not make $KS_KEY_USER"; report_print; exit 1
+    fi
+    record DONE user "made $KS_KEY_USER"
+else
+    record OK user "$KS_KEY_USER is there"
+fi
+if [ "$KS_GH" = 1 ] && [ "$KS_GH_EXISTS" = 0 ]; then
+    say "making $KS_GH_USER (the GitHub App key's own user: a system user with no home and no shell)"
+    if ! ks_root useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
+            --comment "$KS_GH_COMMENT" "$KS_GH_USER"; then
+        record FAIL user "could not make $KS_GH_USER"; report_print; exit 1
+    fi
+    record DONE user "made $KS_GH_USER"
+elif [ "$KS_GH" = 1 ]; then
+    record OK user "$KS_GH_USER is there"
+fi
+
+heading "the code, in place (as root)"
+before=$KS_CHANGED; KS_CHANGED=0
+if [ "$KS_REUSE" = 1 ]; then say "$KS_OPT/$KS_COMMIT is intact: run as it is"
+elif ! ks_install_code; then record FAIL code "could not put the code in $KS_OPT/$KS_COMMIT: $KS_WHY"; report_print; exit 1; fi
+if [ "$KS_NODE_COPY" = 1 ] && ! ks_root "$KS_NODE" --version >/dev/null 2>&1; then
+    record FAIL node "the copy of node at $KS_NODE does not run on its own (a node that needs libraries beside it: give a root-owned node with --node)"
+    report_print; exit 1
+fi
+if [ "$KS_CHANGED" = 1 ]; then record DONE code "$KS_OPT/$KS_COMMIT, root-owned"
+else record OK code "$KS_OPT/$KS_COMMIT, root-owned, already there"; fi
+[ "$before" = 0 ] || KS_CHANGED=1
+
+heading "the files"
+before=$KS_CHANGED; KS_CHANGED=0
+if ! ks_write_files; then record FAIL files "$KS_WHY"; report_print; exit 1; fi
+say "the agent's public key: $KS_PUBKEY"
+st=OK; [ "$KS_CHANGED" = 1 ] && st=DONE
+[ "$before" = 0 ] || KS_CHANGED=1
+record "$st" files "$KS_ETC (the key 0400 root), $KS_SRV (outbox, files, media)"
+if [ "$KS_GH" = 1 ]; then
+    if ! ks_write_github; then record FAIL github "$KS_WHY"; report_print; exit 1; fi
+    say "the GitHub App key's fingerprint: $KS_GH_FP"
+    st=OK; [ "$KS_GH_CHANGED" = 1 ] && st=DONE
+    record "$st" github "$KS_ETC/github-app.pem (0400 root), $KS_ETC/github.conf, $KS_ETC/public-text.json"
+fi
+
+heading "the units"
+if ! ks_write_units; then record FAIL units "$KS_WHY"; report_print; exit 1; fi
+MOVED=0
+[ "$MODE" != install ] && [ "$KS_COMMIT" != "$KS_CUR" ] && MOVED=1
+
+if ! ks_verify; then
+    record FAIL verify "the agent user can reach the key or the code, something installed is not root's alone, or systemd loads a unit otherwise than written (the warnings above). The key service is not started, and the commit is not recorded: fix it, then run this again (without --key-from-stdin or --key-generate: the key file is written)"
+    # shellcheck disable=SC2046
+    ks_root systemctl disable --now $(ks_listeners) >/dev/null 2>&1 || true
+    report_print; exit 1
+fi
+record OK verify "as $KS_AGENT and $KS_KEY_USER$([ "$KS_GH" = 1 ] && echo " and $KS_GH_USER"): none reads a key file; $KS_AGENT writes none of the code, settings, tag or allowlist; everything installed is root's alone; systemd loads each unit as written, with no drop-in that changes it"
+
+# Only now, with the check passed: the commit it runs, and the one it moved from.
+if [ "$MOVED" = 1 ]; then
+    if ! printf '%s\n' "$KS_CUR" >"$GP_WORK/previous-commit" 2>/dev/null; then record FAIL commit "could not write $GP_WORK/previous-commit"; report_print; exit 1; fi
+    ks_root install -m 0644 "$GP_WORK/previous-commit" "$KS_ETC/previous-commit" || { record FAIL commit "could not record $KS_CUR"; report_print; exit 1; }
+fi
+if ! printf '%s\n' "$KS_COMMIT" >"$GP_WORK/commit" 2>/dev/null; then record FAIL commit "could not write $GP_WORK/commit"; report_print; exit 1; fi
+ks_root install -m 0644 "$GP_WORK/commit" "$KS_ETC/commit" || { record FAIL commit "could not record $KS_COMMIT"; report_print; exit 1; }
+
+if [ "$MODE" = install ] && [ -z "$KS_CUR" ]; then
+    # shellcheck disable=SC2046
+    if ! ks_root systemctl enable --now $(ks_listeners); then
+        record FAIL start "systemctl enable --now $(ks_listeners)failed (see journalctl)"; report_print; exit 1
+    fi
+    heading "the sockets answer (as $KS_AGENT)"
+    if ! ks_answers; then
+        record FAIL answers "$KS_WHY. The listeners stay on, so a run of this again checks once more"
+        report_print; exit 1
+    fi
+    record OK answers "each socket answered a real connection, made as $KS_AGENT"
+    ks_github_report || { report_print; exit 1; }
+    record DONE keyservice "installed and listening at $KS_RUN"
+    heading "next, on the instance's side (as $KS_AGENT)"
+    say "1. In the instance's settings file (~/.config/ghost-protocol/$KS_NAME.json, the one its service passes with --settings),"
+    say "   under pluginConfigs -> \"ghost-protocol@ghost-protocol\" -> options, set:"
+    say "     \"buzz_key_socket\": \"$KS_RUN\","
+    say "     \"buzz_key_command\": \"\""
+    say "   The relay, channels and people are now the key service's ($KS_ETC/buzz.env)."
+    say "2. Remove any copy of the key on $KS_AGENT's side, and any key or Buzz credential in $KS_NAME.service's drop-in."
+    say "3. install/service/start --root <root> --name $KS_NAME --dry-run: it checks the sockets, and that no key command is left."
+    say "4. Restart the instance: systemctl restart $KS_NAME.service (as the admin)."
+else
+    if [ "$KS_CHANGED" = 1 ] || [ "$MOVED" = 1 ]; then
+        heading "the key service started again, its sockets answer (as $KS_AGENT), then the instance"
+        if ! ks_restart; then record FAIL restart "$KS_WHY"; report_print; exit 1; fi
+        record DONE restart "the key service and the instance started again at $KS_COMMIT"
+    elif [ "$KS_GH_CHANGED" = 1 ]; then
+        heading "the GitHub socket started again (the session is not restarted)"
+        if ! ks_restart_github; then record FAIL restart "$KS_WHY"; report_print; exit 1; fi
+        record DONE restart "the GitHub socket started again at $KS_COMMIT; the session runs on"
+    fi
+    # The listeners on and enabled, whatever an earlier run left.
+    ks_listening; rc=$?
+    case "$rc" in
+        0) [ "$KS_CHANGED" = 1 ] || [ "$MOVED" = 1 ] || [ "$KS_GH_CHANGED" = 1 ] || record OK keyservice "nothing changed" ;;
+        2) record DONE listen "the listeners were off (an earlier run stopped at its last check, or they were stopped by hand): enabled and started" ;;
+        *) record FAIL listen "$KS_WHY"; report_print; exit 1 ;;
+    esac
+    # One real connection to each socket, unless the restart above made it
+    # (before the instance came back).
+    if [ -z "$KS_ANSWERED" ]; then
+        heading "the sockets answer (as $KS_AGENT)"
+        ks_answers || true
+    fi
+    if [ "$KS_ANSWERED" != ok ]; then
+        record FAIL answers "$KS_WHY$([ "$MOVED" = 1 ] && printf '. To go back: install/keyservice/setup --name %s --agent-user %s --rollback --apply' "$KS_NAME" "$KS_AGENT")"
+        report_print; exit 1
+    fi
+    record OK answers "each socket answered a real connection, made as $KS_AGENT"
+    ks_github_report || { report_print; exit 1; }
+
+    if [ "$MODE" != install ] && [ "$MOVED" = 0 ]; then
+        say "the key service of $KS_NAME already runs $KS_COMMIT"
+        record OK "$MODE" "already at $KS_COMMIT"
+    elif [ "$MODE" != install ]; then
+        ks_prune
+        say "to go back: install/keyservice/setup --name $KS_NAME --agent-user $KS_AGENT --rollback --apply"
+        record DONE "$MODE" "the key service of $KS_NAME runs $KS_COMMIT (it ran $KS_CUR)"
+    fi
+fi
+report_print
+[ "$REPORT_FAILS" -eq 0 ]

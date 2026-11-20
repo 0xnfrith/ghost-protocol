@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// rollout-check: names every agent that is not yet running the current rule files (README.md here). Report only; the logic is in
+// lib.mjs. Exit codes: 0 done, 2 the run failed or the usage is wrong.
+import { main } from "./lib.mjs";
+
+process.exitCode = await main(process.argv.slice(2));

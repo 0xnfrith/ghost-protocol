@@ -1,0 +1,22 @@
+#!/bin/sh
+# Test stand-in for npm, for the update's dependency install. It records the
+# call and the argument count, and whether it ran inside the adapter's install
+# lock ("npm ci locked" or "npm ci unlocked"). For ci it does what npm ci does
+# to the folder it runs in: node_modules is replaced by the lockfile's
+# packages, here the adapter's two (empty package.json files). npm.fail in
+# $STUB_STATE makes it fail part-way, leaving a part-made node_modules;
+# npm.hook is a sh script it runs first.
+S="${STUB_STATE:?}"
+echo "npm ${1:-} $#" >>"$S/calls"
+# npm.hook in $STUB_STATE: a sh script run first, for what changes while a
+# caller waits on npm ci.
+if [ -f "$S/npm.hook" ]; then sh "$S/npm.hook"; fi
+[ "${1:-}" = ci ] || { echo "npm stub: unexpected call" >&2; exit 64; }
+if [ -d .install-lock ]; then echo "npm ci locked" >>"$S/calls"; else echo "npm ci unlocked" >>"$S/calls"; fi
+rm -rf node_modules
+mkdir -p node_modules/nostr-tools
+if [ -f "$S/npm.fail" ]; then echo "npm stub: ci fails" >&2; exit 1; fi
+mkdir -p node_modules/@modelcontextprotocol/sdk
+printf '{}\n' >node_modules/nostr-tools/package.json
+printf '{}\n' >node_modules/@modelcontextprotocol/sdk/package.json
+exit 0

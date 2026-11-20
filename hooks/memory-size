@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# memory-size: a Claude Code Stop hook. At the end of each turn of the
+# instance's own conversation it measures the session's auto-memory folder
+# with tools/memory-size/memory-size: MEMORY.md's lines and bytes (Claude Code
+# loads only the start of MEMORY.md), the number of notes and the folder's
+# size. When a measure first passes the limit set for it, the hook stops the
+# end of the turn once, with a note that asks the agent to tell its operator,
+# with the numbers, in its DM with them on Buzz. So the agent sends it as it
+# sends every other DM to its operator (the update ask among them): with its
+# own Buzz tools, and no other key or connection. A measure that stays past its
+# limit is not said again; once it comes back to its limit or under it,
+# passing it again is said again.
+#
+# The limits are plugin options: memory_limit_index_lines,
+# memory_limit_index_bytes, memory_limit_notes and memory_limit_folder_kib (KiB),
+# 150, 20000, 150 and 800 by default, under Claude Code's own cut (200 lines,
+# 25KB). Claude Code passes a hook only the options someone saved, so the
+# defaults are here too, below, for an option not set at all; plugin.json gives
+# the same numbers (tools/memory-size/test checks they agree). A saved value of
+# empty, off or 0 turns its limit off, as does any value that is not a whole
+# number of at least 1. With all four off the hook does nothing at all: it
+# reads no memory and writes no state.
+#
+# The folder: <the session's project folder>/memory, the project folder being
+# the one that holds the session's transcript (transcript_path), which is
+# where Claude Code keeps the auto memory of a session started at the top of
+# its repository, as start starts the instance's own claude. It only reads the
+# folder: it never writes, moves or deletes anything in it. The state (which
+# measures are past their limits) is the file memory-size in the instance's
+# own state folder, ~/.local/state/ghost-protocol/<name>/.
+#
+# Which sessions: as turn-state, only the instance's own conversation:
+# GP_INSTANCE_NAME is set, the hook was run by the claude whose pid start wrote
+# to pane-pid (hooks/lib/own-claude.sh), not a subagent, and the session id is
+# the one in start's file.
+#
+# It always exits 0, printing nothing or the Stop hook's block. Needs jq.
+# Test: tools/memory-size/test
+set -uo pipefail
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+# The defaults, for an option not set at all. The one copy in the hook: plugin.json's defaults must equal them.
+DEFAULT_INDEX_LINES=150
+DEFAULT_INDEX_BYTES=20000
+DEFAULT_NOTES=150
+DEFAULT_FOLDER_KIB=800
+# limit NAME DEFAULT: the limit option NAME as saved, trimmed; DEFAULT when it is not set at all (an unset variable, not an
+# empty one); empty (off) when it is saved empty, off or 0.
+limit() {
+    local var saved=""
+    var="CLAUDE_PLUGIN_OPTION_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+    eval "saved=\${$var+set}"
+    [ -n "$saved" ] || { printf '%s' "$2"; return 0; }
+    case "$(hook_option "$1" | tr '[:upper:]' '[:lower:]')" in
+        '' | off | 0) return 0 ;;
+    esac
+    hook_option "$1"
+}
+lines=$(limit memory_limit_index_lines "$DEFAULT_INDEX_LINES")
+bytes=$(limit memory_limit_index_bytes "$DEFAULT_INDEX_BYTES")
+notes=$(limit memory_limit_notes "$DEFAULT_NOTES")
+kib=$(limit memory_limit_folder_kib "$DEFAULT_FOLDER_KIB")
+[ -n "$lines$bytes$notes$kib" ] || exit 0
+
+name="${GP_INSTANCE_NAME:-}"
+case "$name" in '' | -* | *[!a-z0-9-]*) exit 0 ;; esac
+command -v jq >/dev/null 2>&1 || exit 0
+# shellcheck source=lib/own-claude.sh
+. "$HOOKS_DIR/lib/own-claude.sh" || exit 0
+input=$(cat)
+[ -n "$input" ] || exit 0
+fields=$(printf '%s' "$input" | jq -r '[(.hook_event_name // ""), (.session_id // ""), (.agent_id // ""), (.transcript_path // "")]
+    | map(tostring) | join("\u001f")' 2>/dev/null) || exit 0
+IFS=$'\037' read -r event sid agent transcript <<<"$fields"
+[ "$event" = Stop ] && [ -z "$agent" ] && [ -n "$sid" ] || exit 0
+case "$transcript" in /?*) ;; *) exit 0 ;; esac
+state="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol/$name"
+[ -f "$state/session-id" ] || exit 0
+[ "$(tr -d '[:space:]' <"$state/session-id")" = "$sid" ] || exit 0
+own_claude "$state" || exit 0
+
+note=$("$GP_DIR/tools/memory-size/memory-size" check "$(dirname -- "$transcript")/memory" "$state/memory-size" \
+    --index-lines "$lines" --index-bytes "$bytes" --notes "$notes" --folder-kib "$kib" 2>/dev/null) || exit 0
+[ -n "$note" ] || exit 0
+jq -cn --arg reason "$note" '{decision: "block", reason: $reason}' 2>/dev/null
+exit 0

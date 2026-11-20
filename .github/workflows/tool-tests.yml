@@ -1,0 +1,90 @@
+# The tests that live beside what they test, found by name, so that a new one needs no change under .github/:
+#   - every tools/<name>/test that is a file (a tools/<name>/test/ folder has a workflow of its own and is left alone);
+#   - docker/test.
+# Each one runs from the root of the repository, on Linux, with node 22, python3, jq, shellcheck, git and Docker on the PATH, and
+# passes by exiting 0. A test that is there but not executable fails. No secrets, and no network unless the test fetches what it
+# builds from (docker/test builds the image). None found is a pass, with a notice.
+name: tool-tests
+
+on:
+  # Called by tests.yml, which runs on every pull request to main, every push
+  # to main and every merge group, and calls this workflow when a path in its
+  # row of .github/tests-to-run.sh changes (or anything under .github/). Its
+  # `all-tests` check is the one that is required. Run by hand from the
+  # Actions tab with workflow_dispatch.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tool-tests:
+    # GitHub's runner, unless the repository variable GP_CI_RUNS_ON names other runner labels as JSON (see install-test.yml).
+    # The way back is to delete the variable.
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    # About 6 minutes on GitHub's runners (2026-11-17); a self-hosted runner may be several times slower, so 60. On a runner
+    # without pwsh, docker/test skips its parse check of docker/get.ps1.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A self-hosted runner's image may lack shellcheck, which GitHub's image has and the tests use when it is there (they
+      # skip in silence without it). It is fetched into the job's temp folder, pinned by version and by the sha256 of the
+      # release tarball (koalaman/shellcheck v0.11.0, the version on GitHub's ubuntu-latest), with no sudo and nothing
+      # installed on the machine.
+      - name: shellcheck, pinned (self-hosted runner only)
+        if: runner.environment == 'self-hosted'
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          if command -v shellcheck >/dev/null 2>&1; then shellcheck --version | sed -n 2p; exit 0; fi
+          f="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/$f"
+          echo "$SHELLCHECK_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          mv "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$RUNNER_TEMP/bin/shellcheck"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/shellcheck" --version | sed -n 2p
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: the tools on the runner
+        run: |
+          node --version; python3 --version; jq --version; git --version; docker --version
+          shellcheck --version | sed -n 2p
+      - name: every tools/*/test and docker/test
+        run: |
+          set -euo pipefail
+          ran=() failed=()
+          for t in tools/*/test docker/test; do
+            [ -f "$t" ] || continue
+            ran+=("$t")
+            if [ ! -x "$t" ]; then
+              echo "::error file=$t::$t is not executable (chmod +x, and commit the mode)"
+              failed+=("$t")
+              continue
+            fi
+            echo "::group::$t"
+            rc=0
+            "./$t" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 0 ]; then echo "PASS  $t"; else echo "::error file=$t::$t failed (exit $rc)"; failed+=("$t"); fi
+          done
+          {
+            echo "### tool-tests"
+            echo
+            if [ ${#ran[@]} -eq 0 ]; then echo "No tools/*/test or docker/test in this tree: nothing to run."; fi
+            for t in "${ran[@]}"; do
+              case " ${failed[*]} " in *" $t "*) echo "- $t: failed" ;; *) echo "- $t: passed" ;; esac
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ ${#ran[@]} -eq 0 ]; then
+            echo "::notice::No tools/*/test or docker/test in this tree: nothing to run."
+            exit 0
+          fi
+          [ ${#failed[@]} -eq 0 ]

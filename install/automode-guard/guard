@@ -1,0 +1,1353 @@
+#!/bin/bash
+# guard: the auto-mode guard, one run. Run by <name>-automode-guard.service
+# every 15 minutes (its timer), as the instance's user, outside Claude Code,
+# so no Claude Code setting can switch it off, and so the agent's own session
+# never edits its settings file. It watches Claude Code's auto-mode rules
+# (~/.claude/settings.json: autoMode.allow, soft_deny, hard_deny) for the
+# instance's owner, and asks the owner in plain words, on Buzz, about three
+# kinds of change:
+#   - rules not on record ("unmade"): in the live settings, not in the
+#     snapshot (as committed on the instance repo's main), and not signed in
+#     the ledger;
+#   - rules on record that are gone: in the snapshot, or signed in the ledger
+#     and in force, and missing from the live settings, unless the ledger has
+#     a remove line for them;
+#   - rules that expired but are still live: in the live settings, not in the
+#     snapshot, and the latest ledger line for them an add whose expiry has
+#     passed, or does not parse (an invalid expiry, never "never").
+# A change signed in the ledger and in force (an add with no expiry or one
+# still to come, or a remove) is not reported at all. "$defaults" (Claude
+# Code's own default rules) is never asked about as added, and no ledger
+# line counts for it; its removal from a list that had it, in the snapshot or
+# in the live settings as the guard saw them before (the state keeps those
+# list names), is always asked about as gone, and Put back puts it back.
+#
+# The three messages ("them" for one rule is "it"). The first is the owner's
+# approved words. The other two quote each rule (cut to fit) and say where it
+# is on record, never who made it: the snapshot and the ledger are files the
+# instance's user can write (see read_ledger).
+#   I found 2 rules you didn't make. Another agent may have added them; I'm
+#   not sure. What would you like to do?
+#   • Show me them  • Keep them  • Remove them
+# and
+#   2 rules on record are gone. I'm not sure what removed them.
+#   1. Blocks unless you ask: `<rule>`, on record in the saved copy of your
+#      rules (`<snapshot>` on main)
+#   2. Allows: `<rule>`, on record in line 12 of `<ledger file>`
+#   What would you like to do?
+#   • Show me them  • Put them back  • Leave them out
+# and
+#   I found 1 rule that expired but is still live.
+#   1. Allows: `<rule>`, line 7 of `<ledger file>` gave it until
+#      2026-11-02 03:00 +07
+#   What would you like to do?
+#   • Show me  • Keep it  • Remove it
+# Each tags the owner and stays open until the owner answers it in its
+# thread. Without an owner set (GP_GUARD_OWNER) the messages carry no
+# options, and no reply is read.
+#
+# The owner's answer: each run reads the replies in the thread of each open
+# message through the Buzz adapter's one-shot thread read (`launch.mjs
+# thread`, which checks every signature), and acts only on a reply whose
+# author is the owner's key (checked again here, on the signed event's
+# pubkey, never on its text) and whose text is one of the options, with an
+# optional leading mention or bullet, "it" or "them", any case. The first
+# such answer counts; a later one, or anything else, is ignored. "Show me
+# them" posts the rules in the thread (and may be asked again). The others:
+#   Keep them      the settings stay; each rule gets an "add" ledger line
+#                  (an expired one too: it then has no time limit).
+#   Remove them    each rule is taken out of the live settings; "remove" line.
+#   Put them back  each rule goes back into its list (a missing list is made
+#                  as ["$defaults", <rule>], as the sign script does); "add".
+#   Leave them out the settings stay; each rule gets a "remove" ledger line.
+# Each acts only on that message's rules that are still in its kind now (so
+# an answer applied twice changes nothing more), then the guard says what it
+# did in the thread. A rule with an invisible or control character is never
+# signed into the ledger by a reply: Keep and Leave out leave it as it is
+# (it comes up again); Remove and Put back change the settings without a
+# ledger line for it. "$defaults" gets no ledger line either: Put back puts
+# it first in its list; Leave out forgets that the list had it, but while
+# the snapshot holds it, it comes up again. No answer leaves everything as
+# it is, however long.
+# When more rules of the same kind turn up while a message is open, a new
+# message asks about all of them, and the old thread is no longer read.
+# When an open message's rules are all fixed some other way, it is closed
+# quietly.
+#
+# The guard also sends one message when the check itself cannot run (the
+# settings file, the snapshot or the ledger unreadable or not what it should
+# be), and one more when it runs again.
+#
+# With BUZZ_TASK_OPEN_EMOJI set, each question and each message that the
+# check can't run is a task root: once it is sent and on record, the guard
+# puts the open state on it through the adapter's one-shot task (`launch.mjs
+# task set`). Best effort: a failure is logged, and the message still counts
+# as sent. The all-clear and the guard's replies in a thread get no state.
+#
+# The installer (install/lib/service.sh, step 14) copies this script and the
+# Buzz adapter into a root-owned folder,
+# /usr/local/lib/ghost-protocol/<name>/automode-guard/, so the instance's user
+# can't change what the timer runs. From a checkout, it finds the adapter in
+# the repo.
+#
+# What it reads, keeps, writes and sends:
+#   - The snapshot: read with /usr/bin/git from the instance repo's .git
+#     (bound read-only into the unit) as committed on the branch main
+#     (refs/heads/main, so a tag named main can't stand in for it), never from
+#     the working tree an agent edits, and never fetched from a remote. The
+#     tree entry must be a plain file: a committed symlink, or a path through
+#     a committed folder symlink, is a broken check.
+#   - The settings file: read whole, but only the three autoMode lists are
+#     used; nothing else in it (its env block may hold live keys) reaches a
+#     message, the log or the state. It is written only to apply the owner's
+#     Remove or Put back: in place (the unit binds this one file, so a rename
+#     can't replace it), only after the file reads back unchanged since it
+#     was read and is still the file in place (a link count above 0), then
+#     read back once more. A shorter text is padded with spaces to the old
+#     size before the file is cut, so it is valid JSON at every step of a
+#     write that runs to the end. A write that fails is undone from the copy
+#     in memory. Text UTF-8 can't hold elsewhere in the file (a lone
+#     surrogate from a \ud800 escape) is written as escapes, the same JSON;
+#     in a rule, it is a broken check. Before each write, the three lists before and after go to
+#     $STATE_DIRECTORY/backups/ (0600, the newest 20 kept), never the rest.
+#   - The ledger (GP_GUARD_LEDGER, default $STATE_DIRECTORY/ledger.md): the
+#     signing record, one line per signed change, as an instance's sign
+#     script writes it:
+#       - <add|remove> | autoMode.<list> | expires <never|YYYY-MM-DD HH:MM +HH> | <source> | entry sha256 <16 hex> | <rule>
+#     The latest line for a rule (its list and exact text) decides; a line
+#     whose entry sha256 does not match its rule is ignored. The guard
+#     appends one line per rule it acts on, with "reply <event id>" as the
+#     source, opened for appending (never renamed). Its expiry is "never",
+#     but a rule put back keeps the expiry of the line that signed it.
+#     A line is a record, not a proof: the guard does not check who wrote
+#     it, and the instance's user can (see read_ledger).
+#     A ledger the manifest names must be there: a missing one is a broken
+#     check (the installer makes it). Without a named ledger, the guard keeps
+#     its own, so a rule signed only by an instance's sign script elsewhere is
+#     asked about as a rule the owner didn't make.
+#   - State: $STATE_DIRECTORY/state.json: whether the check was last broken
+#     (a sha256 of the reason), each open message's event id, its rules as
+#     sha256 digests, and the replies already handled, and the names of the
+#     lists the guard has seen "$defaults" in. Never a rule. It is
+#     written (a temp file, then a rename) after each step that changes it.
+#   - Credentials: systemd hands them over in $CREDENTIALS_DIRECTORY (the
+#     unit's drop-in names them). The guard reads them only for the adapter,
+#     and gives them to the adapter's process alone, each as an environment
+#     variable, by the same rule as install/service/start: the name
+#     upper-cased, with - and . as _ (api-token becomes API_TOKEN), and names
+#     such as PATH, LD_*, NODE_* or BUZZ_* refused. One BUZZ_ name is let
+#     through: BUZZ_AUTH_TAG, the owner's NIP-OA attestation, which the
+#     adapter adds to its relay login.
+#   - The adapter runs with the unit's environment plus those variables, and
+#     its own empty XDG config, cache, data and state folders in the unit's
+#     private /tmp, so a key command that keeps a config folder works under
+#     the read-only home.
+#   - The log (journalctl) gets counts, event ids and outcomes, never a rule
+#     and never a reply's text.
+#
+# Settings (the unit sets them): GP_GUARD_NAME, GP_GUARD_REPO (the instance
+# repo), GP_GUARD_SNAPSHOT (the snapshot's path in it), GP_GUARD_SETTINGS
+# (default ~/.claude/settings.json), GP_GUARD_LEDGER (an absolute path, or
+# empty for the state folder's), GP_GUARD_OWNER (the owner's public key, 64
+# hex, or empty), GP_GUARD_NODE (node 22 or later), GP_GUARD_CHANNEL (the
+# Buzz channel), GP_GUARD_MENTIONS (public keys, space-separated; the owner
+# is always one), GP_GUARD_SEND_PATH (the adapter's PATH, for the key
+# command; default /usr/local/bin:/usr/bin:/bin), and the adapter's own
+# BUZZ_RELAY_URL and BUZZ_KEY_COMMAND, and BUZZ_TASK_OPEN_EMOJI with its
+# BUZZ_TASK_OPEN_EMOJI_URL (empty: no state). The guard itself runs /bin/bash,
+# /usr/bin/python3 and /usr/bin/git, with PATH=/usr/bin:/bin; only the
+# adapter's process gets GP_GUARD_SEND_PATH.
+#
+# Size: a message is kept under 30,000 bytes of UTF-8 (the send takes 32 KB).
+# "Show me them" splits the rules over as many messages as that needs, and
+# cuts a rule too long for one.
+#
+# Usage:
+#   guard             one run (what the unit runs)
+#   guard --dry-run   what a run would do now, and the messages it would
+#                     send, printed here: no credential read, no reply read,
+#                     nothing sent, nothing written. Without $STATE_DIRECTORY
+#                     it reads the state from
+#                     /var/lib/ghost-protocol/<name>-automode-guard/.
+#
+# Exit: 0 = the check ran and nothing failed; 1 = the check is broken, or a
+#       message, a reply read or an answer did not go through (tried again
+#       next run); 2 = usage or setup. Anything else that goes wrong is a
+#       broken check too, reported once: the guard never ends a run silently
+#       on an error it did not plan for (the log names its type only).
+#
+# Tests only (GP_TEST=1): GP_GUARD_SEND (a command that stands in for
+# `node launch.mjs`: it gets `send …`, `thread …` or `task …`), GP_GUARD_RETRY_SECS
+# (default 5), GP_GUARD_STATE (the dry run's state folder), GP_GUARD_NOW (the
+# time, for expiry dates), GP_GUARD_FAULT (one fault point: classify raises;
+# settings-changed and settings-replaced change the settings file between its
+# read and its write; write-fails fails the write halfway; ledger-fails fails
+# the ledger lines; reload-fails fails the read after an answer). Without
+# GP_TEST=1 they are ignored.
+#
+# Limits: this is a drift detector, not a security boundary against a
+# malicious agent. It catches what changes the rules by accident or in
+# passing: a tool that rewrites the settings file, a sync, a hand edit, a
+# save from a stale copy. A process running as the instance's user can change
+# the settings file, the snapshot (the local branch main too), the ledger,
+# this guard's state and the key command's files; on a host where that user
+# has passwordless sudo, it can change the guard itself. The snapshot and the
+# ledger decide what stays quiet; what acts is only a reply the owner's key
+# signed. When the agent's user no longer has passwordless sudo, this is to
+# be looked at again, with silence resting on owner-signed records alone.
+# If Claude Code replaces the settings file (a rename) after the unit
+# started, the guard's write is refused (link count 0); one that lands in the
+# instant between its last check and its write goes to the replaced file and
+# is lost, and the next run asks again. A reply is acted on at the next run,
+# up to 15 minutes later. The guard can't report a send that never works (the
+# relay or the key command down for good): it logs each failure and tries
+# again every run.
+set -euo pipefail
+
+DRY=0
+case "${1:-}" in
+    "") ;;
+    --dry-run) DRY=1 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "usage: guard [--dry-run]" >&2; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: guard [--dry-run]" >&2; exit 2; }
+
+HERE="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if [ -f "$HERE/buzz/src/launch.mjs" ]; then
+    BUZZ_DIR="$HERE/buzz"                   # the installed copy
+else
+    BUZZ_DIR="$HERE/../../adapters/buzz"    # a checkout
+fi
+PYTHON=/usr/bin/python3
+[ -x "$PYTHON" ] || { echo "guard: $PYTHON is needed" >&2; exit 2; }
+GP_GUARD_DRY="$DRY" GP_GUARD_BUZZ="$BUZZ_DIR" exec "$PYTHON" -I - <<'PY'
+import hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, unicodedata
+from datetime import datetime
+
+E = os.environ
+TEST = E.get("GP_TEST") == "1"
+DRY = E["GP_GUARD_DRY"] == "1"
+BUZZ = E["GP_GUARD_BUZZ"]
+NAME = E.get("GP_GUARD_NAME", "")
+REPO = E.get("GP_GUARD_REPO", "")
+SNAPSHOT = E.get("GP_GUARD_SNAPSHOT", "")   # a path in REPO, read as committed on main
+GIT = "/usr/bin/git"
+SEND_PATH = E.get("GP_GUARD_SEND_PATH") or "/usr/local/bin:/usr/bin:/bin"
+SETTINGS = E.get("GP_GUARD_SETTINGS") or os.path.join(E.get("HOME", "/nonexistent"), ".claude", "settings.json")
+LEDGER_SET = E.get("GP_GUARD_LEDGER", "")
+OWNER = E.get("GP_GUARD_OWNER", "")
+NODE = E.get("GP_GUARD_NODE", "")
+CHANNEL = E.get("GP_GUARD_CHANNEL", "")
+MENTIONS = E.get("GP_GUARD_MENTIONS", "").split()
+ADAPTER_STUB = E.get("GP_GUARD_SEND", "") if TEST else ""
+# The reaction that marks an alert open (a task root), from the unit (the
+# manifest's buzz_task_open_emoji); empty: alerts get no state.
+TASK_EMOJI = E.get("BUZZ_TASK_OPEN_EMOJI", "")
+RETRY_SECS = float(E.get("GP_GUARD_RETRY_SECS", "5")) if TEST else 5.0
+NOW = int(E["GP_GUARD_NOW"]) if TEST and re.fullmatch(r"[0-9]{1,12}", E.get("GP_GUARD_NOW", "")) else int(time.time())
+FAULT = E.get("GP_GUARD_FAULT", "") if TEST else ""   # a test's fault point (see the head)
+UNIT = f"{NAME}-automode-guard"
+KEYS = ("allow", "soft_deny", "hard_deny")
+DEFAULTS = "$defaults"
+KINDS = ("unmade", "gone", "expired")
+MAX_BYTES = 30000   # a message's UTF-8 size; the send takes 32 KB
+ITEM_BYTES = 4000   # one rule's line in a question; Show me them shows it whole
+BACKUPS_KEPT = 20
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+# Names a credential may not take in the adapter's environment: start's list,
+# plus what would steer node, python or the adapter.
+RESERVED = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|BASH_ENV|PS4|TERM|TMUX|TMPDIR|"
+                      r"CREDENTIALS_DIRECTORY|STATE_DIRECTORY|LD_.*|DYLD_.*|BASH_FUNC_.*|GP_.*|"
+                      r"NODE_.*|NPM_.*|PYTHON.*|BUZZ_.*|XDG_.*)$")
+# The one reserved name a credential may take: the owner's attestation, which
+# the adapter puts in its relay login (a buzz-auth-tag credential, as for start).
+PASSED = frozenset({"BUZZ_AUTH_TAG"})
+
+
+def log(msg):
+    print("guard: " + msg, flush=True)
+
+
+def die(msg):
+    print("guard: ERROR: " + msg, file=sys.stderr, flush=True)
+    sys.exit(2)
+
+
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", NAME):
+    die("GP_GUARD_NAME is not an instance name (the unit sets it)")
+PLAIN = r"/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*"
+if not re.fullmatch(PLAIN, REPO):
+    die("GP_GUARD_REPO is not a plain path (the unit sets it)")
+if (not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*", SNAPSHOT)
+        or any(part in (".", "..") for part in SNAPSHOT.split("/"))):
+    die("GP_GUARD_SNAPSHOT is not a path in the instance repo (the unit sets it)")
+if not re.fullmatch(f"{PLAIN}(:{PLAIN})*", SEND_PATH):
+    die("GP_GUARD_SEND_PATH is not a list of plain paths (the unit sets it)")
+if LEDGER_SET and (not re.fullmatch(PLAIN, LEDGER_SET) or any(p in (".", "..") for p in LEDGER_SET.split("/"))):
+    die("GP_GUARD_LEDGER is not a plain absolute path (the unit sets it)")
+if OWNER and not HEX64.match(OWNER):
+    die("GP_GUARD_OWNER is not a public key of 64 lower-case hex characters (the unit sets it)")
+if OWNER and OWNER not in MENTIONS:
+    MENTIONS.append(OWNER)
+if E.get("STATE_DIRECTORY"):
+    STATE_DIR = E["STATE_DIRECTORY"].split(":")[0]
+elif DRY:
+    STATE_DIR = (E.get("GP_GUARD_STATE") if TEST else "") or f"/var/lib/ghost-protocol/{UNIT}"
+else:
+    die("no $STATE_DIRECTORY: run it through its unit, or with --dry-run")
+STATE = os.path.join(STATE_DIR, "state.json")
+OLD_STATE = os.path.join(STATE_DIR, "last-alert")   # the state file before state.json
+LEDGER = LEDGER_SET or os.path.join(STATE_DIR, "ledger.md")
+if os.path.realpath(LEDGER) == os.path.realpath(SETTINGS):
+    die("GP_GUARD_LEDGER is the settings file")
+
+
+class ApplyError(Exception):
+    """Why an answer could not be applied, in fixed words (never file content)."""
+
+
+# ---------------------------------------------------------------- text
+
+def escape_invisible(text):
+    out = []
+    for c in text:
+        if unicodedata.category(c) in ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp"):
+            o = ord(c)
+            out.append(f"\\u{o:04x}" if o <= 0xFFFF else f"\\U{o:08x}")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def hidden(rule):
+    """True when a rule holds a character a ledger line can't carry as seen."""
+    return any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in rule)
+
+
+def cut(s, n):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def code(s):
+    """s as a Markdown code span, its fence longer than any backtick run in it."""
+    s = escape_invisible(s)
+    run = max((len(m) for m in re.findall(r"`+", s)), default=0)
+    fence = "`" * (run + 1)
+    pad = " " if s.startswith("`") or s.endswith("`") else ""
+    return f"{fence}{pad}{s}{pad}{fence}"
+
+
+def sha(s):
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def rule_id(k, rule):
+    return sha(f"{k}\0{rule}")
+
+
+def rules_word(n):
+    return "1 rule" if n == 1 else f"{n} rules"
+
+
+def the_rules(n):
+    return "the rule" if n == 1 else f"the {n} rules"
+
+
+# The owner's words, as approved for the first kind; "them" is "it" for one
+# rule. The other two never say who made a rule: the snapshot and the ledger
+# that put a rule on record are files the instance's user can write (see
+# read_ledger), so a question about them quotes each rule and says where it
+# is on record, and claims nothing more.
+def ask_text(kind, rules, view):
+    """The question about rules ([(list, rule)], in order) of one kind."""
+    n = len(rules)
+    it = "it" if n == 1 else "them"
+    show = "Show me" if n == 1 else "Show me them"
+    if kind == "unmade":
+        head = f"I found {rules_word(n)} you didn't make. Another agent may have added {it}; I'm not sure."
+        if not OWNER:
+            return head
+        return "\n".join([f"{head} What would you like to do?", f"• {show}", f"• Keep {it}", f"• Remove {it}"])
+    if kind == "gone":
+        head = f"{rules_word(n)} on record {'is' if n == 1 else 'are'} gone. I'm not sure what removed {it}."
+        options = [f"• {show}", f"• Put {it} back", f"• Leave {it} out"]
+    else:   # expired
+        head = f"I found {rules_word(n)} that expired but {'is' if n == 1 else 'are'} still live."
+        options = [f"• {show}", f"• Keep {it}", f"• Remove {it}"]
+    tail = ["What would you like to do?"] + options if OWNER else []
+    if OWNER and kind == "expired":
+        tail = [f"If you keep {it}, {'it' if n == 1 else 'they'} won't have a time limit any more."] + tail
+    lines, items = [head], rule_items(rules, note_for(kind, view), ITEM_BYTES)
+    budget = MAX_BYTES - 200
+    for j, item in enumerate(items):
+        if len("\n".join(lines + [item] + tail).encode("utf-8")) > budget - 100:
+            lines.append(f"…and {len(items) - j} more" + (": say Show me them to see them all." if OWNER else "."))
+            break
+        lines.append(item)
+    return "\n".join(lines + tail)
+
+
+BROKEN_TEXT = "I can't check your rules right now, so I won't notice if they change. I'll tell you when I can again."
+CLEAR_TEXT = "I can check your rules again."
+FAILED_TEXT = "I couldn't change the rules just now. I'll try again in a few minutes."
+NOTHING_TEXT = "Nothing to do: those rules changed since I asked."
+LABEL = {"allow": "Allows", "soft_deny": "Blocks unless you ask", "hard_deny": "Always blocks"}
+DONE = {"keep": "I kept {}.", "remove": "I removed {}.", "put": "I put {} back.", "leave": "I left {} out."}
+
+
+def note_for(kind, view):
+    """Where each rule of a kind is on record, as a function of (list, rule); None for none."""
+    ledger_name = code(os.path.basename(LEDGER))
+
+    def gone(k, rule):
+        if rule in view["snap"][k]:
+            return f"on record in the saved copy of your rules ({code(SNAPSHOT)} on main)"
+        if rule == DEFAULTS:
+            return "it was in your settings when I looked before"
+        return f"on record in line {view['ledger'][(k, rule)][3]} of {ledger_name}"
+
+    def expired(k, rule):
+        last = view["ledger"][(k, rule)]
+        if last[1] is None:   # not "never" (that is signed): a time limit that can't be read
+            return f"line {last[3]} of {ledger_name} gives it a time limit I can't read ({code(last[2])}), so I count it as passed"
+        return f"line {last[3]} of {ledger_name} gave it until {last[2]}"
+
+    return {"gone": gone, "expired": expired}.get(kind)
+
+
+def rule_item(i, k, rule, note=""):
+    gloss = " (Claude Code's built-in rules)" if rule == DEFAULTS else ""
+    return f"{i}. {LABEL[k]}: {code(rule)}{gloss}" + (f", {note}" if note else "")
+
+
+def rule_items(rules, note, budget):
+    """Each rule as a numbered line of at most budget bytes, its text cut to fit."""
+    items = []
+    for i, (k, rule) in enumerate(rules, 1):
+        n = note(k, rule) if note else ""
+        item, width = rule_item(i, k, rule, n), len(rule)
+        while len(item.encode("utf-8")) > budget and width > 1:   # never a loop with no end
+            width = width // 2
+            item = rule_item(i, k, cut(rule, width), n)
+        items.append(item)
+    return items
+
+
+def done_text(kind, choice, done, skipped):
+    parts = []
+    if done:
+        what = DONE[choice].format(the_rules(len(done)))
+        if kind == "expired" and choice == "keep":
+            what = what[:-1] + ", with no time limit now."
+        parts.append("Done: " + what)
+    hid = [t for t in skipped if t[1] != DEFAULTS]
+    if hid:
+        parts.append(f"I left {rules_word(len(hid))} as {'it is' if len(hid) == 1 else 'they are'}: "
+                     f"{'it has' if len(hid) == 1 else 'they have'} hidden characters, so I'll ask again.")
+    if any(r == DEFAULTS for _, r in skipped):
+        parts.append("Claude Code's built-in rules are in the saved copy of your rules on main, "
+                     "so I'll ask about them again until that copy changes.")
+    return " ".join(parts) or NOTHING_TEXT
+
+
+def show_texts(rules, note=None):
+    """The rules, numbered, over as few messages of MAX_BYTES as they fit in."""
+    if not rules:
+        return [NOTHING_TEXT]
+    head = "Here it is:" if len(rules) == 1 else f"Here they are ({len(rules)}):"
+    budget = MAX_BYTES - 200
+    items = rule_items(rules, note, budget)
+    out, cur = [], [head]
+    for item in items:
+        if len("\n".join(cur + [item]).encode("utf-8")) > budget:
+            out.append("\n".join(cur))
+            cur = []
+        cur.append(item)
+    out.append("\n".join(cur))
+    return out
+
+
+# The options. A reply counts when, after a leading mention or bullet is taken
+# off and the case is folded, it is exactly one of these.
+OPTIONS = {
+    "show": {"show", "show me", "show me them", "show me it", "show them", "show it",
+             "show them to me", "show it to me"},
+    "keep": {"keep", "keep them", "keep it"},
+    "remove": {"remove", "remove them", "remove it"},
+    "put": {"put them back", "put it back", "put back"},
+    "leave": {"leave them out", "leave it out", "leave out"},
+}
+VALID = {"unmade": {"show", "keep", "remove"}, "gone": {"show", "put", "leave"},
+         "expired": {"show", "keep", "remove"}}
+
+
+def parse_reply(content):
+    t = content.replace("’", "'").strip().lower()
+    t = re.sub(r"^(?:(?:@\S+|nostr:npub1[0-9a-z]+),?\s+)+", "", t)
+    t = t.lstrip("•*-–— ").strip()
+    t = re.sub(r"\s+", " ", t).rstrip(".! ").strip()
+    for choice, words in OPTIONS.items():
+        if t in words:
+            return choice
+    return None
+
+
+# ---------------------------------------------------------------- reading
+
+def lists_of(obj, where):
+    """The allow / soft_deny / hard_deny lists of obj ((lists, None)), a missing key or null as []."""
+    if obj is None:
+        obj = {}
+    if not isinstance(obj, dict):
+        return None, f"{where} is not a JSON object"
+    out = {}
+    for k in KEYS:
+        v = obj.get(k)
+        if v is None:
+            v = []
+        if not isinstance(v, list) or not all(isinstance(s, str) for s in v):
+            return None, f"{where}.{k} is not a list of strings"
+        for i, rule in enumerate(v, 1):
+            try:
+                rule.encode("utf-8")
+            except UnicodeEncodeError:   # a lone surrogate, from a \ud800 escape
+                return None, f"{where}.{k} rule {i} is not valid Unicode text"
+        out[k] = list(v)
+    return out, None
+
+
+def no_constant(word):
+    """NaN, Infinity and -Infinity: Python reads them, JSON (and Claude Code) does not."""
+    raise ValueError(word)
+
+
+def parse_json(raw, what, shown):
+    """(object, None) or (None, reason): the reason names the path and a position, never content."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, f"{what} is not UTF-8 text: {shown}"
+    try:
+        return json.loads(text, parse_constant=no_constant), None
+    except json.JSONDecodeError as e:
+        return None, f"{what} is not valid JSON: {shown} (line {e.lineno}, column {e.colno})"
+    except ValueError:
+        return None, f"{what} is not valid JSON: {shown} (NaN or Infinity, which JSON does not allow)"
+    except RecursionError:
+        return None, f"{what} is nested too deeply: {shown}"
+
+
+def git(*args):
+    """git on the instance repo's own objects, reading only: (result, None) or (None, reason)."""
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": E.get("HOME", "/nonexistent"),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
+           # A partial clone must not fetch a missing object from its remote (git 2.44+).
+           "GIT_NO_LAZY_FETCH": "1"}
+    try:
+        r = subprocess.run([GIT, "--git-dir", os.path.join(REPO, ".git"), "-c", "core.fsmonitor=false", *args],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30, env=env, cwd="/")
+    except FileNotFoundError:
+        return None, f"git is missing: {GIT}"
+    except subprocess.TimeoutExpired:
+        return None, "git did not finish within 30 seconds"
+    except OSError as e:
+        return None, f"git could not start ({e.strerror})"
+    return r, None
+
+
+def snapshot_content():
+    """The snapshot as committed on main: (bytes, None), else (None, reason)."""
+    gd = os.path.join(REPO, ".git")
+    if os.path.islink(gd) or not os.path.isdir(gd):
+        return None, f"the instance repo {REPO} has no .git folder of its own"
+    # The full ref: a tag named main would outrank a bare "main".
+    r, why = git("ls-tree", "refs/heads/main", "--", SNAPSHOT)
+    if r is None:
+        return None, why
+    if r.returncode != 0:
+        return None, f"could not read branch main in {REPO} (git exited {r.returncode})"
+    line = r.stdout.decode("utf-8", "replace").rstrip("\n")
+    m = re.fullmatch(r"(?:100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t" + re.escape(SNAPSHOT), line)
+    if not m:
+        if not line:
+            return None, (f"the snapshot {SNAPSHOT} is not on main in {REPO} "
+                          "(a path through a symlinked folder is not followed)")
+        if line.startswith("120000 "):
+            return None, f"the snapshot {SNAPSHOT} is a symlink on main in {REPO}; it must be a plain file"
+        return None, f"the snapshot {SNAPSHOT} is not a plain file on main in {REPO}"
+    r, why = git("cat-file", "blob", m.group(1))
+    if r is None:
+        return None, why
+    if r.returncode != 0:
+        return None, f"could not read the snapshot from main in {REPO} (git exited {r.returncode})"
+    return r.stdout, None
+
+
+def read_settings():
+    """The settings file's three lists: (lists, None) or (None, reason)."""
+    try:
+        with open(SETTINGS, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, f"settings file not found: {SETTINGS}"
+    except OSError as e:
+        return None, f"cannot read the settings file {SETTINGS} ({e.strerror})"
+    data, why = parse_json(raw, "settings file", SETTINGS)
+    if why:
+        return None, why
+    if not isinstance(data, dict):
+        return None, f"settings file is not a JSON object: {SETTINGS}"
+    return lists_of(data.get("autoMode"), "autoMode")
+
+
+# A ledger line, as an instance's sign script writes it (and this guard does).
+LEDGER_LINE = re.compile(
+    r"^- (add|remove) \| autoMode\.(allow|soft_deny|hard_deny) \| expires "
+    r"(never|[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [+-][0-9]{2}) \| ([^|\n]+?) "
+    r"\| entry sha256 ([0-9a-f]{16}) \| (.+)$")
+
+
+def expiry(exp):
+    """An expiry as a unix time; None for never, and None for a date that does
+    not parse: signed() tells the two apart by the text, so a date that does
+    not parse is never taken as never."""
+    if exp == "never":
+        return None
+    try:
+        return int(datetime.strptime(exp + "00", "%Y-%m-%d %H:%M %z").timestamp())
+    except ValueError:
+        return None
+
+
+def signed(last):
+    """True when a rule's latest ledger line is an add still in force: one that
+    never expires, or whose expiry is still to come. An expired add is not,
+    and nor is one whose expiry does not parse (invalid, never "never")."""
+    return bool(last) and last[0] == "add" and (last[2] == "never" or (last[1] is not None and last[1] > NOW))
+
+
+def read_ledger():
+    """{(list, rule): (latest action, expiry or None, expiry as written, line number)}:
+    (ledger, None), or (None, reason). The guard's own ledger (in its state
+    folder) that is not there yet is empty; a ledger the manifest names must
+    be there (the installer makes it), or every rule signed in it would look
+    unsigned.
+
+    A ledger line is a record, not a proof of who made a rule. The installer
+    makes the ledger 0600, owned by the instance's user, the user the agent
+    runs as, and nothing here checks the file's owner or mode (no check of
+    them could tell a line the agent wrote from one the owner's sign script
+    wrote). The same user can commit to the snapshot's branch main. So a
+    question never says the owner made a rule: it quotes the rule and says
+    where it is on record (ask_text)."""
+    try:
+        with open(LEDGER, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        if LEDGER_SET and not DRY:
+            return None, f"the ledger {LEDGER} is not there (rerun the installer to make it)"
+        if LEDGER_SET:
+            log(f"(dry run) the ledger {LEDGER} is not there yet (the installer makes it); read as empty")
+        return {}, None
+    except OSError as e:
+        return None, f"cannot read the ledger {LEDGER} ({e.strerror})"
+    last, bad = {}, 0
+    for n, line in enumerate(raw.decode("utf-8", "replace").split("\n"), 1):
+        m = LEDGER_LINE.match(line)
+        if not m:
+            continue
+        action, k, exp, _source, entry, rule = m.groups()
+        if sha(rule)[:16] != entry:
+            bad += 1
+            continue
+        last[(k, rule)] = (action, expiry(exp), exp, n)
+    if bad:
+        log(f"the ledger has {bad} line(s) whose entry sha256 does not match their rule; ignored")
+    return last, None
+
+
+def classify(live, snap, ledger, seen):
+    """The rules to ask about: {"unmade": {digest: (list, rule)}, "gone": {...},
+    "expired": {...}}. seen: the lists the guard has seen "$defaults" in, live."""
+    if FAULT == "classify":
+        raise RuntimeError("a test's fault")
+    out = {kind: {} for kind in KINDS}
+    for k in KEYS:
+        lv, sv = set(live[k]), set(snap[k])
+        for rule in live[k]:
+            if rule == DEFAULTS or rule in sv:
+                continue
+            last = ledger.get((k, rule))
+            if signed(last):
+                continue
+            # A grant that expired, or whose expiry does not parse, is live
+            # but no longer signed.
+            out["expired" if last and last[0] == "add" else "unmade"].setdefault(rule_id(k, rule), (k, rule))
+        # "$defaults" (Claude Code's own default rules) gone from a list that
+        # had it, in the snapshot or in the live settings as the guard saw
+        # them before: always asked about. No ledger line counts for it either
+        # way, so a line can't sign it away; it is never asked about as added.
+        if DEFAULTS not in lv and (DEFAULTS in sv or k in seen):
+            out["gone"].setdefault(rule_id(k, DEFAULTS), (k, DEFAULTS))
+        owned = list(snap[k]) + [r for (kk, r), last in ledger.items() if kk == k and signed(last)]
+        for rule in owned:
+            if rule == DEFAULTS or rule in lv:
+                continue
+            last = ledger.get((k, rule))
+            if last and last[0] == "remove":   # taken out, on record
+                continue
+            if last and last[0] == "add" and last[1] is not None and last[1] <= NOW:   # an expired grant
+                continue
+            out["gone"].setdefault(rule_id(k, rule), (k, rule))
+    return out
+
+
+def load(seen):
+    """Everything a run needs: (view, None), or (None, reason) when the check can't run."""
+    content, why = snapshot_content()
+    if content is None:
+        return None, why
+    obj, why = parse_json(content, "snapshot", f"main:{SNAPSHOT}")
+    if why:
+        return None, why
+    snap, why = lists_of(obj, "snapshot")
+    if why:
+        return None, why
+    live, why = read_settings()
+    if why:
+        return None, why
+    ledger, why = read_ledger()
+    if why:
+        return None, why
+    return {"live": live, "snap": snap, "ledger": ledger, "classes": classify(live, snap, ledger, seen)}, None
+
+
+def check(seen):
+    view, reason = load(seen)
+    if view is None:
+        # Once more after a pause: a run that caught a file half written is
+        # not a broken check.
+        time.sleep(RETRY_SECS)
+        view, reason = load(seen)
+    return view, reason
+
+
+# ---------------------------------------------------------------- state
+
+def fresh_state():
+    return {"version": 2, "check": "ok", "alerts": {}, "defaults": []}
+
+
+def valid_alert(a):
+    return (isinstance(a, dict) and set(a) <= {"id", "rules", "handled", "posted", "failed"}
+            and isinstance(a.get("id"), str) and HEX64.match(a["id"])
+            and isinstance(a.get("rules"), list) and 0 < len(a["rules"]) <= 100000
+            and all(isinstance(d, str) and HEX64.match(d) for d in a["rules"])
+            and isinstance(a.get("handled"), list) and len(a["handled"]) <= 1000
+            and all(isinstance(d, str) and HEX64.match(d) for d in a["handled"])
+            and isinstance(a.get("posted"), int) and not isinstance(a["posted"], bool)
+            and isinstance(a.get("failed", False), bool))
+
+
+def read_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        st = fresh_state()
+        # The first run after an update: a broken check stays reported.
+        try:
+            with open(OLD_STATE, encoding="utf-8") as f:
+                old = f.read().strip()
+            if re.fullmatch(r"broken:[0-9a-f]{64}", old):
+                st["check"] = old
+        except OSError:
+            pass
+        return st
+    except OSError as e:
+        if DRY:
+            log(f"(dry run) cannot read {STATE} ({e.strerror}); taking it as empty")
+            return fresh_state()
+        raise
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        obj = None
+    # "defaults" (the lists the guard has seen "$defaults" in, live) came
+    # after the first state.json, so a state without it is read as none.
+    if (isinstance(obj, dict) and obj.get("version") == 2
+            and {"version", "check", "alerts"} <= set(obj) <= {"version", "check", "alerts", "defaults"}
+            and isinstance(obj["check"], str) and re.fullmatch(r"ok|broken:[0-9a-f]{64}", obj["check"])
+            and isinstance(obj["alerts"], dict) and set(obj["alerts"]) <= set(KINDS)
+            and all(valid_alert(a) for a in obj["alerts"].values())
+            and isinstance(obj.get("defaults", []), list)
+            and all(isinstance(d, str) and d in KEYS for d in obj.get("defaults", []))):
+        obj["defaults"] = sorted(set(obj.get("defaults", [])))
+        return obj
+    log("the state file holds nothing usable; starting from nothing on record")
+    return fresh_state()
+
+
+def write_state(st):
+    if DRY:
+        return
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".state.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------- the adapter
+
+def credentials():
+    """Each credential as (variable, value), by start's naming rule; none on any doubt."""
+    out, d = [], E.get("CREDENTIALS_DIRECTORY", "")
+    if not d or not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not os.path.isfile(path):
+            continue
+        var = name.upper().replace("-", "_").replace(".", "_")
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", var):
+            log("skipped a credential: its name is not a variable name")
+            continue
+        if RESERVED.match(var) and var not in PASSED:
+            log(f"skipped credential {var}: that name is reserved")
+            continue
+        with open(path, encoding="utf-8") as f:
+            out.append((var, f.read().rstrip("\n")))
+    return out
+
+
+def adapter(args, text=None, timeout=150):
+    """Runs `node launch.mjs <args>`: (exit code, stdout), -1 when it could not run.
+    Logs the outcome in fixed words, never the text, a reply or a credential."""
+    if ADAPTER_STUB:
+        argv = [ADAPTER_STUB]
+    else:
+        launch = os.path.join(BUZZ, "src", "launch.mjs")
+        if not NODE or not os.path.isfile(NODE):
+            log(f"the adapter can't run: node is missing ({NODE or 'GP_GUARD_NODE is not set'}); rerun the installer")
+            return -1, ""
+        if not os.path.isfile(launch):
+            log(f"the adapter can't run: the Buzz adapter's launcher is missing: {launch}")
+            return -1, ""
+        argv = [NODE, launch]
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", CHANNEL):
+        log("the adapter can't run: GP_GUARD_CHANNEL is not a channel id")
+        return -1, ""
+    argv += args
+    scratch = tempfile.mkdtemp(prefix="guard-adapter.")   # 0700, in the unit's private /tmp
+    env = dict(E)
+    for k in ("GP_GUARD_DRY", "GP_GUARD_BUZZ"):
+        env.pop(k, None)
+    # The guard's own PATH is /usr/bin:/bin; the adapter (its key command) gets the unit's wider one.
+    env["PATH"] = SEND_PATH
+    for sub in ("config", "cache", "data", "state"):
+        p = os.path.join(scratch, sub)
+        os.mkdir(p, 0o700)
+        env[f"XDG_{sub.upper()}_HOME"] = p
+    try:
+        for var, value in credentials():
+            env[var] = value
+        r = subprocess.run(argv, input=text if text is not None else "", capture_output=True, text=True,
+                           timeout=timeout, env=env, cwd="/")
+    except subprocess.TimeoutExpired:
+        log(f"the adapter ({args[0]}) did not finish within {timeout} seconds")
+        return -1, ""
+    except OSError as e:
+        log(f"the adapter ({args[0]}) could not start ({e.strerror})")
+        return -1, ""
+    finally:
+        env.clear()
+        shutil.rmtree(scratch, ignore_errors=True)
+    if r.returncode != 0:
+        # The adapter's own lines are fixed words or the relay's reason, never the key or the text.
+        last = next((ln for ln in reversed((r.stderr or "").splitlines()) if ln.strip()), "")
+        log(f"the adapter ({args[0]}) exited {r.returncode}" + (f" ({escape_invisible(cut(last, 200))})" if last else ""))
+    return r.returncode, r.stdout or ""
+
+
+def send(text, reply=None, mention=True):
+    """The event id when the relay took the message, else None. A send that
+    prints no event id counts as not sent: a message whose thread can't be
+    read would be a dead end, so it is sent again next run."""
+    if DRY:
+        log(f"(dry run) would send to Buzz channel {CHANNEL}" + (f", in the thread of {reply}" if reply else "") + ":")
+        print(text, flush=True)
+        return "0" * 64
+    args = ["send", "--channel", CHANNEL]
+    if mention:
+        for m in MENTIONS:
+            args += ["--mention", m]
+    if reply:
+        args += ["--reply", reply]
+    rc, out = adapter(args, text)
+    if rc != 0:
+        log("message NOT sent")
+        return None
+    m = re.search(r"^sent ([0-9a-f]{64})$", out, re.M)
+    if not m:
+        log("message sent, but no event id came back; it counts as NOT sent")
+        return None
+    log(f"message sent (event {m.group(1)})")
+    return m.group(1)
+
+
+def mark_open(event_id):
+    """Best effort, once an alert went out and its state is written: the open
+    state on it, so the alert is a task root (the Buzz adapter's one-shot
+    task, src/task.mjs). Only with BUZZ_TASK_OPEN_EMOJI set, and never on a
+    dry run. It never raises, and can't change whether the alert counts as
+    sent (that is already written): a failure is logged, never retried."""
+    if not TASK_EMOJI or DRY:
+        return
+    if not event_id:
+        log("alert NOT marked open: the send printed no event id")
+        return
+    try:
+        rc, _ = adapter(["task", "set", "--channel", CHANNEL, "--id", event_id, "--state", "open"], timeout=60)
+    except Exception as e:   # anything: the alert went out, and must not be sent again
+        log(f"alert NOT marked open: {type(e).__name__}")
+        return
+    if rc == 0:
+        log("alert marked open (a task root)")
+    else:
+        log("alert NOT marked open: " + (f"the task tool exited {rc}" if rc != -1 else "the task tool did not run"))
+
+
+def read_replies(alerts):
+    """The replies in the open messages' threads: {root: [reply, ...]}, or None when the read failed."""
+    roots = sorted({a["id"] for a in alerts.values()})
+    if not roots:
+        return {}
+    since = max(0, min(a["posted"] for a in alerts.values()) - 600)
+    args = ["thread", "--channel", CHANNEL, "--author", OWNER, "--since", str(since)]
+    for root in roots:
+        args += ["--root", root]
+    rc, out = adapter(args, timeout=90)
+    if rc != 0:
+        log("the replies were NOT read; trying again next run")
+        return None
+    by_root = {}
+    for line in out.splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(r, dict) and isinstance(r.get("id"), str) and HEX64.match(r["id"])
+                and isinstance(r.get("pubkey"), str) and isinstance(r.get("root"), str) and r["root"] in roots
+                and isinstance(r.get("created_at"), int) and isinstance(r.get("content"), str)):
+            by_root.setdefault(r["root"], []).append(r)
+    return by_root
+
+
+# ---------------------------------------------------------------- applying an answer
+
+def read_all(fd):
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        b = os.read(fd, 1 << 16)
+        if not b:
+            return b"".join(chunks)
+        chunks.append(b)
+
+
+def write_all(fd, data, old_size=0):
+    """data from the start of the file, then the file cut to it. A shorter
+    text is padded with spaces to the old size first (JSON allows trailing
+    space), so between the write and the cut the file is still valid JSON."""
+    if len(data) < old_size:
+        data_padded = data + b" " * (old_size - len(data))
+    else:
+        data_padded = data
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data_padded)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+    os.ftruncate(fd, len(data))
+    os.fsync(fd)
+
+
+def backup(before, after, reply):
+    """The three lists before and after, never the rest of the file; the newest BACKUPS_KEPT kept."""
+    d = os.path.join(STATE_DIR, "backups")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    name = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{reply[:16]}.json"
+    fd = os.open(os.path.join(d, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"reply": reply, "before": before, "after": after}, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    for old in sorted(n for n in os.listdir(d) if n.endswith(".json"))[:-BACKUPS_KEPT]:
+        try:
+            os.unlink(os.path.join(d, old))
+        except OSError:
+            pass
+
+
+def fault_before_write(fd):
+    """A test's fault point: the settings file changes after the guard read it."""
+    if FAULT == "settings-changed":
+        os.pwrite(fd, b" ", os.fstat(fd).st_size)
+    elif FAULT == "settings-replaced":
+        tmp = SETTINGS + ".replaced"
+        with open(tmp, "wb") as f:
+            f.write(read_all(fd))
+        os.replace(tmp, SETTINGS)
+
+
+def change_settings(change, reply):
+    """Applies change(autoMode) to the settings file in place (see the head of this file)."""
+    try:
+        fd = os.open(SETTINGS, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        raise ApplyError(f"could not open the settings file to write ({e.strerror})")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ApplyError("the settings file is not a plain file")
+        if st.st_nlink == 0:
+            raise ApplyError("the settings file was replaced while the guard ran")
+        raw = read_all(fd)
+        data, why = parse_json(raw, "settings file", SETTINGS)
+        if why:
+            raise ApplyError(why)
+        if not isinstance(data, dict):
+            raise ApplyError("the settings file is not a JSON object")
+        if data.get("autoMode") is None:
+            data["autoMode"] = {}
+        am = data["autoMode"]
+        before, why = lists_of(am, "autoMode")
+        if why:
+            raise ApplyError(why)
+        change(am)
+        after, why = lists_of(am, "autoMode")
+        if why:
+            raise ApplyError(why)
+        try:
+            try:
+                new = (json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+            except UnicodeEncodeError:
+                # Text UTF-8 can't hold elsewhere in the file (a lone surrogate
+                # from a \ud800 escape): written as escapes, the same JSON.
+                new = (json.dumps(data, indent=2, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+        except ValueError:
+            # A number too large for a float (1e400) reads as infinity, and
+            # would be written back as Infinity, which JSON does not allow.
+            raise ApplyError("the settings file holds a number the guard can't write back exactly; nothing was written")
+        fault_before_write(fd)
+        if read_all(fd) != raw or os.fstat(fd).st_nlink == 0:
+            raise ApplyError("the settings file changed while the guard ran")
+        try:
+            backup(before, after, reply)
+        except OSError as e:
+            raise ApplyError(f"could not keep the backup in the state folder ({e.strerror}); nothing was written")
+        try:
+            if FAULT == "write-fails":
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"#" * (len(new) // 2))   # a write that stops halfway, garbled
+                raise OSError(5, "a test's fault")
+            write_all(fd, new, len(raw))
+            if read_all(fd) != new:
+                raise OSError(0, "it did not read back as written")
+        except OSError as e:
+            try:
+                write_all(fd, raw)
+            except OSError:
+                raise ApplyError("the settings write failed, and putting the file back failed too")
+            raise ApplyError(f"the settings write failed ({e.strerror}); the file was put back")
+        if os.fstat(fd).st_nlink == 0:
+            raise ApplyError("the settings file was replaced while the guard wrote it")
+    except OSError as e:
+        raise ApplyError(f"could not read or write the settings file ({e.strerror})")
+    finally:
+        os.close(fd)
+
+
+def ledger_append(rules, action, reply):
+    """One ledger line per (list, rule, expiry), appended (never renamed: the unit may bind this one file)."""
+    if FAULT == "ledger-fails":
+        raise ApplyError("a test's fault")
+    lines = "".join(f"- {action} | autoMode.{k} | expires {exp} | reply {reply} | entry sha256 {sha(r)[:16]} | {r}\n"
+                    for k, r, exp in rules)
+    try:
+        fd = os.open(LEDGER, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        raise ApplyError(f"could not open the ledger {LEDGER} ({e.strerror})")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink == 0:
+            raise ApplyError("the ledger is not a plain file in place")
+        prefix = b""
+        if st.st_size > 0 and os.pread(fd, 1, st.st_size - 1) != b"\n":
+            prefix = b"\n"
+        data = prefix + lines.encode("utf-8")
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    except OSError as e:
+        raise ApplyError(f"could not write the ledger {LEDGER} ({e.strerror})")
+    finally:
+        os.close(fd)
+
+
+def apply(choice, targets, reply, view):
+    """Applies one answer to its rules: (done, skipped). Raises ApplyError.
+    A rule put back keeps the expiry of the ledger line that signed it, while
+    that line is in force. "$defaults" never gets a ledger line: Put back puts
+    it first in its list; Leave out leaves it out (the caller forgets the list
+    had it), but while the snapshot holds it, it is asked about again."""
+    ledger, snap = view["ledger"], view["snap"]
+
+    def expires(k, rule):
+        last = ledger.get((k, rule))
+        return last[2] if choice == "put" and signed(last) else "never"
+    clean = [(k, r, expires(k, r)) for k, r in targets if not hidden(r) and r != DEFAULTS]
+    if choice in ("keep", "leave"):
+        if clean:
+            ledger_append(clean, "add" if choice == "keep" else "remove", reply)
+        defaults = [t for t in targets if t[1] == DEFAULTS]
+        return ([(k, r) for k, r, _ in clean] + [t for t in defaults if DEFAULTS not in snap[t[0]]],
+                [t for t in targets if hidden(t[1])] + [t for t in defaults if DEFAULTS in snap[t[0]]])
+
+    def change(am):
+        for k, rule in targets:
+            if choice == "remove":
+                if isinstance(am.get(k), list):
+                    am[k] = [r for r in am[k] if r != rule]
+            elif am.get(k) is None:
+                am[k] = [DEFAULTS] if rule == DEFAULTS else [DEFAULTS, rule]
+            elif rule == DEFAULTS and rule not in am[k]:
+                am[k].insert(0, rule)
+            elif rule not in am[k]:
+                am[k].append(rule)
+
+    if targets:
+        change_settings(change, reply)
+    if clean:
+        try:
+            ledger_append(clean, "remove" if choice == "remove" else "add", reply)
+        except ApplyError as e:
+            log(f"the settings changed, but the ledger lines were NOT written: {e}")
+    return targets, []
+
+
+# ---------------------------------------------------------------- one run
+
+def answer(state, view):
+    """Reads and acts on the owner's answers. Returns (view, everything went
+    through); view is None when the rules could not be read again after an
+    answer, so this run asks nothing from a view that is out of date."""
+    alerts = state["alerts"]
+    if not OWNER or not alerts:
+        return view, True
+    if DRY:
+        log(f"(dry run) {len(alerts)} open message(s); replies are read on a real run only")
+        return view, True
+    by_root = read_replies(alerts)
+    if by_root is None:
+        return view, False
+    ok = True
+    for kind in KINDS:
+        a = alerts.get(kind)
+        if not a:
+            continue
+        for r in sorted(by_root.get(a["id"], []), key=lambda r: (r["created_at"], r["id"])):
+            if r["id"] in a["handled"]:
+                continue
+            # Only the owner's key: the signed event's author, never the text.
+            if r["pubkey"] != OWNER:
+                log(f"ignored a reply from another key ({r['id']})")
+                continue
+            choice = parse_reply(r["content"])
+            if choice is None or choice not in VALID[kind]:
+                a["handled"].append(r["id"])
+                write_state(state)
+                continue
+            current = view["classes"][kind]
+            asked = set(a["rules"])
+            targets = [rule for d, rule in current.items() if d in asked]   # in the settings' own order
+            if choice == "show":
+                if not all(send(t, reply=a["id"]) is not None for t in show_texts(targets, note_for(kind, view))):
+                    ok = False
+                    break
+                log(f"showed {len(targets)} rule(s) for {a['id']} (reply {r['id']})")
+                a["handled"].append(r["id"])
+                write_state(state)
+                continue
+            try:
+                done, skipped = apply(choice, targets, r["id"], view)
+            except ApplyError as e:
+                log(f"the owner's answer {choice} ({r['id']}) was NOT applied: {e}; trying again next run")
+                ok = False
+                if not a.get("failed") and send(FAILED_TEXT, reply=a["id"]) is not None:
+                    a["failed"] = True
+                    write_state(state)
+                break
+            log(f"applied the owner's answer {choice} ({r['id']}) to {len(done)} rule(s); {len(skipped)} left as they are")
+            # The answer is spent: its message is closed in the guard's state.
+            # Any open state set on it once it was saved stays; no done state
+            # is set yet.
+            del alerts[kind]
+            if choice == "leave":   # the owner's signed answer: "$defaults" out of those lists is fine now
+                state["defaults"] = sorted(set(state["defaults"]) - {k for k, rule in targets if rule == DEFAULTS})
+            write_state(state)
+            if send(done_text(kind, choice, done, skipped), reply=a["id"], mention=False) is None:
+                log("the answer is applied; the note saying so did not go out")
+            fresh, why = load(set(state["defaults"])) if FAULT != "reload-fails" else (None, "a test's fault")
+            if fresh is None:
+                log(f"could not read the rules again after the answer: {escape_invisible(why)}; nothing more is asked this run")
+                return None, False
+            view = fresh
+            break
+    return view, ok
+
+
+def ask(state, view):
+    """Posts a message for each kind with rules nobody has asked about. Returns
+    (messages posted, everything went through)."""
+    posted, ok = 0, True
+    for kind in KINDS:
+        current = view["classes"][kind]
+        a = state["alerts"].get(kind)
+        if not current:
+            if a:
+                # Fixed some other way: closed quietly in the guard's state.
+                # Any open state set on it once it was saved stays; no done
+                # state is set yet.
+                log(f"the {kind} message {a['id']} has nothing left to ask; closed")
+                del state["alerts"][kind]
+                write_state(state)
+            continue
+        if a and set(current) <= set(a["rules"]):
+            log(f"{kind}: {len(current)} rule(s), already asked ({a['id']})")
+            continue
+        log(f"{kind}: {len(current)} rule(s) to ask about" + (f" (more than {a['id']} asked)" if a else ""))
+        eid = send(ask_text(kind, list(current.values()), view))
+        if eid is None:
+            ok = False
+            continue
+        posted += 1
+        # A new message replaces the old one, whose thread is no longer read.
+        state["alerts"][kind] = {"id": eid, "rules": sorted(current), "handled": [], "posted": NOW}
+        write_state(state)
+        # Only now, with the question on record: its open state.
+        mark_open(eid)   # guard:markopen
+    return posted, ok
+
+
+def writable():
+    """The state must be writable before anything goes out: a message whose
+    state can't be kept would go out again on every run."""
+    if DRY:
+        return True
+    try:
+        fd, probe = tempfile.mkstemp(dir=STATE_DIR, prefix=".probe.")
+        try:
+            os.write(fd, b"x" * 4096)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+            os.unlink(probe)
+        return True
+    except OSError as e:
+        log(f"nothing sent: the state folder {STATE_DIR} is not writable ({e.strerror})")
+        return False
+
+
+def main():
+    state = read_state()
+    view, reason = check(set(state["defaults"]))
+    if view is None:
+        now = "broken:" + sha(reason)
+        log(f"the check could not run: {escape_invisible(reason)}")
+        if state["check"] == now:
+            log("the check is broken; already reported, nothing sent")
+            return 1
+        if not writable():
+            return 1
+        eid = send(BROKEN_TEXT)
+        if eid is None:
+            log("the check is broken; will try again next run")
+            return 1
+        state["check"] = now
+        write_state(state)
+        log("the check is broken; reported")
+        mark_open(eid)   # guard:markopen
+        return 1
+    c = view["classes"]
+    log(f"rules not on record: {len(c['unmade'])}; rules on record that are gone: {len(c['gone'])}; "
+        f"expired but still live: {len(c['expired'])}")
+    if not writable():
+        return 1
+    # The lists "$defaults" is live in now, kept (as list names only) so its
+    # removal is asked about even where the snapshot never held it.
+    seen = {k for k in KEYS if DEFAULTS in view["live"][k]}
+    if not seen <= set(state["defaults"]):
+        state["defaults"] = sorted(set(state["defaults"]) | seen)
+        write_state(state)
+    view, answered = answer(state, view)
+    if view is None:
+        return 1
+    posted, asked = ask(state, view)
+    if state["check"] != "ok":
+        if posted or send(CLEAR_TEXT) is not None:
+            state["check"] = "ok"
+            write_state(state)
+            log("the check runs again")
+        else:
+            asked = False
+    if not posted and not state["alerts"]:
+        log("nothing to ask about")
+    return 0 if answered and asked else 1
+
+
+def report_failure(e):
+    """Anything the guard did not plan for is a broken check, reported once,
+    never a run that ends silently. The log names the error's type only: its
+    text could carry what the guard read."""
+    reason = f"the guard failed ({type(e).__name__})"
+    log(f"the check could not run: {reason}")
+    try:
+        try:
+            state = read_state()
+        except Exception:   # the state itself may be what failed: report from nothing on record
+            state = fresh_state()
+        now = "broken:" + sha(reason)
+        if state["check"] == now:
+            log("the check is broken; already reported, nothing sent")
+        elif writable():
+            eid = send(BROKEN_TEXT)
+            if eid is not None:
+                state["check"] = now
+                write_state(state)
+                log("the check is broken; reported")
+                mark_open(eid)   # guard:markopen
+    except Exception as e2:
+        log(f"the failure could not be reported either ({type(e2).__name__})")
+    return 1
+
+
+try:
+    code_ = main()
+except Exception as e:
+    code_ = report_failure(e)
+sys.exit(code_)
+PY

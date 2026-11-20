@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# setup: install, check or remove an instance's memory backup on its own,
+# without the rest of the installer. It runs the installer's own step
+# (memory_backup in install/lib/memory-backup.sh), so the two never differ.
+#
+# Usage:
+#   install/memory-backup/setup --home <instance home>                     dry run (the default)
+#   install/memory-backup/setup --home <instance home> --apply             install it, or update it
+#   install/memory-backup/setup --home <instance home> --uninstall         what removing it would do
+#   install/memory-backup/setup --home <instance home> --uninstall --apply remove it
+#   install/memory-backup/setup --home <instance home> --manifest <file>   PREVIEW dry run with
+#        another manifest (one not on the instance's main yet); --apply refuses it
+#
+# <instance home> is the instance's checkout on main; its manifest is
+# .ghost-protocol/instance.toml there, and the [memory_backup] section says
+# what to set up (install/schema/instance-v1.md). Run it as the home's owner,
+# never as root (it refuses): the units run as that user, and root steps go
+# through the installer's root helpers. With a terminal, sudo asks for the
+# password once; with --yes or without a terminal, it never waits for one. A
+# dry run makes every check, prints every action, the settings and the five
+# units in full, and what the first backup would commit (read-only), and
+# changes nothing.
+#
+# --uninstall removes the timers, the path unit, the services and the
+# root-owned copy in /usr/local/lib/ghost-protocol/<name>/memory-backup/. The
+# state folder (/var/lib/ghost-protocol/<name>-memory-backup/, whose repo may
+# hold commits that never reached the remote) stays, and so do the instance's
+# drop-ins (/etc/systemd/system/<name>-memory-*.service.d/).
+#
+# Exit codes: 0 ok; 1 a step failed, or an --apply installed nothing, or its
+# first backup or verify failed (a FAIL line says which); 2 usage. A dry run's
+# SKIP is a warning, not a failure.
+set -uo pipefail
+
+GP_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+LIB="$GP_DIR/install/lib"
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+# shellcheck source=../lib/report.sh
+. "$LIB/report.sh"
+# shellcheck source=../lib/instance.sh
+. "$LIB/instance.sh"
+# shellcheck source=../lib/service.sh
+. "$LIB/service.sh"
+# shellcheck source=../lib/memory-backup.sh
+. "$LIB/memory-backup.sh"
+
+usage_error() { echo "setup: $*" >&2; echo "Try: install/memory-backup/setup --help" >&2; exit 2; }
+
+HOME_IN="" MANIFEST_IN="" APPLY=0 UNINSTALL=0 YES=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --home)      [ $# -ge 2 ] || usage_error "--home needs a value"; HOME_IN="$2"; shift 2 ;;
+        --manifest)  [ $# -ge 2 ] || usage_error "--manifest needs a value"; MANIFEST_IN="$2"; shift 2 ;;
+        --apply)     APPLY=1; shift ;;
+        --dry-run)   APPLY=0; shift ;;
+        --uninstall) UNINSTALL=1; shift ;;
+        --yes|-y)    YES=1; shift ;;
+        -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)           usage_error "unknown option: $1" ;;
+    esac
+done
+[ -n "$HOME_IN" ] || usage_error "--home <instance home> is required"
+[ -d "$HOME_IN" ] || usage_error "--home: $HOME_IN is not a folder"
+if [ -n "$MANIFEST_IN" ] && [ "$APPLY" = 1 ]; then
+    usage_error "--manifest is for a preview dry run only; --apply reads the manifest in the instance home"
+fi
+# shellcheck disable=SC2034  # read by the sourced steps
+DRY_RUN=$((1 - APPLY))
+# An --apply that installs nothing, or whose first backup or verify fails,
+# exits non-zero (install/lib/memory-backup.sh, mb_record_skip).
+# shellcheck disable=SC2034  # read by the sourced step
+MB_STRICT=$((APPLY * (1 - UNINSTALL)))
+INSTANCE_DIR="$(phys "$HOME_IN")"
+MANIFEST="${MANIFEST_IN:-$INSTANCE_DIR/$MANIFEST_REL}"
+# shellcheck disable=SC2034  # read by root_prepare
+HAVE_TTY=0
+( : </dev/tty ) 2>/dev/null && HAVE_TTY=1
+detect_platform || true
+trap cleanup_work EXIT
+
+what=install; [ "$UNINSTALL" = 1 ] && what=uninstall
+printf 'Ghost Protocol memory backup (%s, %s)%s\n' "$what" "$INSTANCE_DIR" \
+    "$([ "$APPLY" = 0 ] && echo ', DRY RUN: nothing is changed')"
+[ -z "$MANIFEST_IN" ] || say "PREVIEW: the manifest comes from $MANIFEST_IN, not the instance home"
+
+heading "manifest"
+if ! manifest_load "$MANIFEST"; then
+    say "the manifest $MANIFEST is not usable:"
+    printf '%s' "$MANIFEST_ERRORS" | sed 's/^/    /'
+    record FAIL manifest "$MANIFEST is not usable"
+    report_print
+    exit 1
+fi
+say "instance $M_NAME"
+record OK manifest "$M_NAME, from $MANIFEST"
+
+heading "the memory backup"
+if [ "$UNINSTALL" = 1 ]; then
+    memory_backup_uninstall
+else
+    memory_backup
+fi
+report_print
+[ "$REPORT_FAILS" -eq 0 ]

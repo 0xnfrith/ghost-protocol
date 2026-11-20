@@ -1,0 +1,6 @@
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "ghost-protocol", "plugin": "ghost-protocol" }
+  ]
+}

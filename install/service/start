@@ -1,0 +1,1913 @@
+#!/bin/bash
+# start: run a Ghost Protocol instance: Claude Code in the instance's home,
+# <root>/<name>, inside tmux on the instance's own tmux socket, then watch it.
+# It is the ExecStart of the instance's service (install/service/instance.service).
+# The first line is /bin/bash, not env bash, so the watchdog's process name is
+# "start" (with env it would be "bash"), and the memory guard's list can spare
+# it by name (install/memory-guard/earlyoom.conf).
+#
+# Usage:
+#   install/service/start --root <root> --name <name>               start, then watch
+#   install/service/start --root <root> --name <name> --dry-run     the checks and the command; starts nothing
+#   install/service/start --root <root> --name <name> --test        the channel test (below)
+#   install/service/start --root <root> --name <name> --fresh       a new session once the instance is idle (below)
+#   install/service/start --root <root> --name <name> --idle        exit 0 when the instance is idle (as --fresh
+#                                                                   reads it, at once), else 1 with what was busy
+#   install/service/start --root <root> --name <name> --print-unit  print the instance's systemd unit
+#
+# What a start does:
+#   1. The checks below. A start refuses when one fails.
+#   2. Exports each credential systemd handed over ($CREDENTIALS_DIRECTORY,
+#      from the LoadCredential= or LoadCredentialEncrypted= lines in the
+#      instance's drop-in) as an environment variable: the credential's name
+#      upper-cased, with - and . as _ (api-token becomes API_TOKEN). It never
+#      prints a value, and refuses names such as PATH or LD_PRELOAD. It also
+#      refuses every BUZZ_* and NOSTR_* name, so a relay key put in the
+#      drop-in by mistake never reaches Claude Code; one is let through,
+#      BUZZ_AUTH_TAG (the owner's public tag), and only for an instance
+#      without a key service, which gives the tag to its key units instead.
+#   3. Takes the plugin's MCP servers off Claude Code's needs-login list
+#      (below), so claude starts them.
+#   4. Starts tmux session <name> on socket <name> (tmux -L <name>), in
+#      <root>/<name>, running claude with, in this order:
+#        --settings ~/.config/ghost-protocol/<name>.json   when that file exists
+#      (in unattended mode, a copy of it with that mode's settings, below; also
+#      exported as GP_CLAUDE_SETTINGS, for the status line)
+#        --append-system-prompt "<the persona>"            when the persona file exists
+#        --permission-mode <mode>                          GP_PERMISSION_MODE, or auto in unattended mode
+#        --resume <id>, or --session-id <id> -n <name> for a new session
+#        "<the start prompt>"                              when GP_START_PROMPT names a file
+#        --channels plugin:ghost-protocol@ghost-protocol
+#      The credentials reach claude through the tmux server's environment,
+#      never through its arguments. GP_INSTANCE_NAME=<name> (and, in
+#      unattended mode, GP_UNATTENDED=1) reach claude alone: the pane runs
+#      env GP_INSTANCE_NAME=<name> claude ..., so another window of the same
+#      tmux server never gets them. Then it writes the pane's pid, which is
+#      claude's, to ~/.local/state/ghost-protocol/<name>/pane-pid. Together
+#      they tell the plugin's session-id and turn-state hooks that this is the
+#      instance's own claude (a --test session gets neither). The pane's id
+#      goes to pane-id in that folder, for the watchdog and --fresh.
+#   5. Watches the instance's own claude: its pane (pane-id), and the session,
+#      every GP_WATCH_SECONDS seconds. The operator may open other windows in
+#      that session (an editor, a shell), and they keep it alive:
+#        - claude's pane ends (/exit, a crash) while the session goes on:
+#          claude starts again, as in 4, in a new window of the same session
+#          (new-window -d, behind the operator's window; no new tmux server),
+#          so the other windows stay as they are. Moving claude's window to
+#          another session of the same tmux server counts as its pane ending.
+#          A pane that tmux's remain-on-exit keeps is closed first. Then what
+#          is left of the old claude, every process in its session or process
+#          group (it leads both in its pane), gets GP_STOP_SECONDS to end on
+#          tmux's hangup, then TERM, then KILL, each only while its start time
+#          (/proc) is the one noted, so a pid another process holds now is
+#          never signalled. If anything is left after KILL, or claude's start
+#          time is unknown (no /proc) while its pid is in use, nothing more is
+#          signalled and start exits 1: systemd's stop (KillMode=control-group)
+#          ends the whole service, so two claudes never answer at once. A
+#          child that called setsid itself left claude's session and group,
+#          and only such a hand-over to systemd catches it.
+#          The new claude runs without the names in tmux's update-environment
+#          (the global list and the session's; env -u) that start itself does
+#          not have: tmux copies them from each attaching client into the
+#          session's environment, which a new window gets, so a restarted
+#          claude never gets an attached operator's SSH_AUTH_SOCK, DISPLAY and
+#          the like, and sees what a first start's claude sees. A name start
+#          has (PATH, HOME, a credential) is never unset, whatever the list
+#          says. The operator's own windows keep them. If claude's pid was
+#          never read, start hands over to systemd instead of restarting.
+#          GP_CLAUDE_SETTINGS is set again in the server's environment.
+#          A third quick exit in a row (below) is left to systemd instead:
+#          exit 1, and the other windows end with the service;
+#        - the whole session ends: exit 1, so systemd starts it again; when it
+#          ended with a fresh start asked for (below), it starts the new
+#          session at once instead.
+#      When claude's pane ends with a fresh start asked for, its new window
+#      begins the new session.
+#
+# Remote Control: an instance whose claude runs with Remote Control (its
+# --remote-control or --rc flag, which a GP_CLAUDE wrapper may add, or
+# GP_REMOTE_CONTROL=on) is reached from the Claude app, so a Remote Control
+# that does not come up leaves it out of reach. Claude Code 2.1.314 shows the
+# failure once in its pane ("/rc failed", "Session creation failed") and does
+# not try again by itself. So after each start of claude the watchdog looks
+# for it, by one signal only. The pane is never read for it: text shown
+# there (a tool's output, a pasted line) must not decide a restart.
+#   - up: claude's session file, ~/.claude/sessions/<claude's pid>.json, holds
+#     a bridgeSessionId (Claude Code's own record of its Remote Control
+#     connection; not a documented interface, so a change in it shows here as
+#     down, never as up); with claude's start time known (/proc), the
+#     file's procStart must be that start time too, so a file left by an
+#     earlier process with the same pid never counts;
+#   - down: GP_RC_WAIT seconds (default 60) pass with no bridgeSessionId
+#     while claude runs with the flag. Without the flag and without
+#     GP_REMOTE_CONTROL=on, nothing is done (off; GP_REMOTE_CONTROL=off turns
+#     the watch off).
+# Both read claude's own process, the pane's: so a GP_CLAUDE wrapper must exec
+# claude (as `exec claude ... "$@"`), with on as with auto. A wrapper that
+# runs claude as its child hides the flag from auto, and its pid is not the
+# one the session file is named by, so it always reads as down.
+# The flag is one whole argument of claude's (--remote-control, --rc, or
+# either with =<name>), each argument read as one (NUL-separated), so a line
+# "--rc" inside another argument (a persona, a prompt) never counts.
+# Down, it tries again by restarting claude, resumed, as when its pane ends,
+# never by typing into the pane: after GP_RC_BACKOFF seconds (default 120),
+# doubled before each later try, and only once the instance is idle (as
+# --fresh reads it) and no tmux client is attached to the session (a person
+# may be at it), so a turn at work is never cut off. Such a restart is not
+# a quick exit. When claude's pane is still there on the next look (the
+# restart did not take), it goes back to waiting for the next try. With
+# claude's pane unknown (tmux did not give its id), it never restarts:
+# the state says failed at once. GP_RC_TRIES (default 3, at most 16) starts
+# in all, counted from the service's start and never reset, then it gives
+# up: claude keeps running, the state says failed, and a /remote-control
+# typed by a person later still turns it to up. Once up, a drop is only
+# reported, never retried: Claude Code reconnects by itself, so the state
+# goes to checking, then to down after GP_RC_WAIT seconds with no bridge
+# session, with one log line, and back to up when it returns. The state goes
+# to the file ~/.local/state/ghost-protocol/<name>/remote-control, one line,
+#   <state> <try>/<tries> <UTC time> <reason>
+# with state checking, up, retrying, failed, down or off, written at every
+# change (each start of claude begins at checking). A dry run, while the
+# instance's tmux session runs, prints it: ok for up, a note for checking and
+# off, and a FAIL line for retrying, failed and down, and then ends NOT READY
+# (exit 1). Only the dry run reads it, so it never stops a start.
+#
+# The needs-login list: Claude Code 2.1.314 keeps the MCP servers it thinks
+# need a login in ~/.claude/mcp-needs-auth-cache.json, one entry per server
+# ("plugin:<plugin>:<server>"), and skips each listed server at every later
+# start. A plugin server that failed once (a key service not answering yet,
+# say) can land there, and then every restart comes up without its channel:
+# deaf, for good. The plugin's servers need no login, so before claude starts
+# (each start and each --test, whose failure can leave entries too) their
+# entries are taken out of that file; every other server's entry stays. The
+# file is replaced in one step, never through a link, and a file that is not
+# a JSON object is left as it is, with a log line. A dry run says what a
+# start would take out. Names only, in the log.
+#
+# The checks (a dry run prints them; a start and a test refuse when one fails):
+#   - claude, tmux, and the instance's home is a git checkout;
+#   - the settings file, when GP_SETTINGS names one;
+#   - python3, which reads Claude Code's JSON files for the checks below;
+#   - GHOST Protocol's plugin, ghost-protocol@ghost-protocol, is installed
+#     (~/.claude/plugins/installed_plugins.json) and enabled where the
+#     instance runs: the first of the managed settings, the settings file,
+#     <home>/.claude/settings.local.json, <home>/.claude/settings.json and
+#     ~/.claude/settings.json that names it decides;
+#   - buzz-mcp is built: the file the plugin's buzz_mcp_path option names, else
+#     buzz-mcp.mjs in the build script's cache (adapters/buzz/scripts/). With
+#     a key service instead (the plugin's buzz_key_socket option names its
+#     socket folder; install/keyservice/setup), which runs its own buzz-mcp:
+#     its two sockets, channel.sock and buzz-mcp.sock, are there, and the
+#     plugin's buzz_key_command is empty, since that side holds no key;
+#   - each plugin channel in GP_CHANNELS is allowed in Claude Code's managed
+#     settings (channelsEnabled, and the plugin in allowedChannelPlugins), so
+#     it registers with no dialog;
+#   - the home is trusted in ~/.claude.json (projects["<home>"].
+#     hasTrustDialogAccepted). An untrusted home is refused: claude would wait
+#     at the trust dialog, and an instance waiting there hears nothing. start
+#     never presses a key to get past a dialog;
+#   - a dry run only, run outside the service: each LoadCredentialEncrypted=
+#     credential in the instance's unit and drop-ins decrypts, through a
+#     throwaway systemd-run unit that reports only whether it arrived (root
+#     through sudo -n; without it, a note says the check was not run).
+#
+# The persona: a file, by default <home>/.claude/persona/<name>.md. When it
+# exists, claude gets --append-system-prompt "<its text>", so Claude Code's
+# built-in prompt loads first and the persona is added on top. It is passed as
+# a string, not with --append-system-prompt-file: Claude Code 2.1.314 counts a
+# -file session as one with a custom system prompt, which refuses /fork and
+# Claude Code's in-session restarts; the string form carries into them. tmux
+# refuses a command over about 16 KB, so a persona over 12,000 bytes falls back
+# to the -file form, with a log line. With no persona file, claude starts
+# without one, and one log line says so. A resumed session keeps the system
+# prompt it recorded until it is compacted, so a persona change reaches a
+# resumed session at its next compaction.
+#
+# The start prompt: when GP_START_PROMPT names a file, its text is the
+# session's first prompt on every start, resumed or new, with these filled in:
+#   {{host}}          the machine's short host name
+#   {{time}}          the time, YYYY-MM-DD HH:MM +ZZZZ, in GP_TIME_ZONE when it
+#                     is set, else in the machine's local zone
+#   {{session_note}}  one sentence: "Resumed session <id>.", "Started a new
+#                     session (the previous one exited twice quickly)." or,
+#                     for any other new session, "Started a new session."
+# GP_START_PROMPT unset, or no such file: no start prompt. Filled in, it may
+# be at most 3,000 bytes, so that with the longest persona the command still
+# fits tmux; a longer one is left out, with a log line.
+#
+# The channel test (--test): starts claude as a start would, then reads its
+# screen until the channel's notice shows, and stops it again. It differs from
+# a start in this:
+#   - its own tmux socket, new for each run (<socket>-test-<pid>-<random>), and
+#     session <session>-test, so a test never touches the running instance or
+#     another test; a new session id, never saved; no start prompt;
+#   - no credentials, and a clean environment: HOME, PATH, the locale, TERM,
+#     TZ, the XDG folders, TMPDIR, TMUX_TMPDIR, BUZZ_MCP_CACHE, and Claude
+#     Code's sign-in (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR), so it starts
+#     signed in. Nothing else of the caller's reaches the test session: not
+#     the CLAUDE_CODE_* names of a Claude Code session it is run from, which
+#     would tie the test to that session;
+#   - a copy of the settings file, in a temporary folder, in which the plugin's
+#     relay is an unreachable local port, its key command prints random bytes
+#     and its buzz_key_socket is empty: the instance's key is never read, its
+#     relay never contacted, and a key service's channel (one connection at a
+#     time, the instance's own) never touched, yet the channel really starts.
+# It reads the screen at once, then every second. It passes when a line holds
+# the channel's notice anywhere on it (a side panel can share the line), in
+# Claude Code 2.1.314's words ("Channels (experimental) messages from
+# plugin:<id> inject directly in this session") or the older ones ("Listening
+# for messages from"). It fails when the channel is rejected, when a dialog
+# waits for a key (workspace trust, development channels or a project's MCP
+# servers), even with the notice on screen too, when claude exits, or after
+# GP_START_TEST_TIMEOUT seconds (default 120). Only the line that decided is
+# printed. On every exit the test's tmux server is stopped, and its socket
+# file (tmux 3.4 leaves it), the temporary folder and what Claude Code kept
+# for the throwaway session (its transcript, its session folders and its
+# temporary folder, each named by the test's new session id) are removed.
+#
+# The session: one id, kept in ~/.local/state/ghost-protocol/<name>/session-id.
+# A later start resumes it while its transcript exists. A claude that ends
+# within 90 seconds of its start is a quick exit, counted in quick-exits there,
+# whether its window or its whole session ended. After two in a row, the next
+# start begins a new session, so a broken transcript cannot keep the instance
+# down; a third in a row, in its window, goes to systemd, whose delay grows. The plugin's session-id hook
+# (hooks/session-id) writes the new id there after a /clear or a /resume in the
+# instance's own claude, so a restart or a crash comes back to the conversation
+# it went on in.
+#
+# A fresh start: while the file fresh is in that folder (a regular file; a
+# link, a folder or anything else of that name is ignored, with a log line, and
+# never followed), the next start begins a new session instead of resuming. It
+# deletes the file before claude starts, and puts it back if claude then
+# cannot start. A file it cannot delete would start a new session at every
+# end, so then it starts without the fresh request (a log line says so, and it
+# resumes as usual), and the watchdog leaves the restarts to systemd.
+# --fresh asks for one without cutting off work. It is meant for an unattended
+# instance (below), one whose work all happens in its turns: it waits until
+# the instance is idle, sets the file and ends the tmux session; the watchdog
+# then starts the new session at once. Idle means all of these:
+#   - the plugin's turn-state hook (hooks/turn-state) marked the last turn
+#     ended: busy at UserPromptSubmit, idle at the Stop (or the StopFailure,
+#     when an API error ended the turn) with that prompt's id (the file turn in
+#     that folder; a start clears it);
+#   - the session's transcript ends with that turn's turn_duration entry, which
+#     Claude Code writes only once the turn is over. A Stop that a hook blocks
+#     is followed by more of the turn, never by turn_duration, so the marker
+#     alone could call a still-running turn idle;
+#   - that turn_duration counts no background Agent run and no workflow still
+#     going (Claude Code 2.1.314's pendingBackgroundAgentCount and
+#     pendingWorkflowCount). They go on after the turn, and one in a long model
+#     call, web fetch or MCP call writes nothing for a while. A count left high
+#     by a crash keeps the instance busy until its next turn writes a new one;
+#   - nothing of the session's own folder (<project>/<session id>/, where its
+#     subagents' transcripts go) and no other conversation's transcript in the
+#     project folder was written in the last GP_FRESH_QUIET seconds (default
+#     60): a background subagent goes on after its turn, and a conversation
+#     the session-id file does not name may be the one at work;
+#   - the instance's claude (the pid of the pane in pane-id, wherever it is
+#     in the session) runs no tool command. Claude
+#     Code 2.1.314 runs each Bash and Monitor command (in the foreground, in
+#     the background, or moved there) as a child that runs its shell snapshot
+#     (~/.claude/shell-snapshots/), most of them reading /dev/null, a Bash one
+#     writing a task file (<tmp>/.../tasks/<id>.output): any child with one of
+#     these signs is one. Its MCP servers show none. Linux only (/proc);
+#     elsewhere a log line says it was not checked.
+# Asked from the instance's own session (GP_INSTANCE_NAME is the instance's
+# name), as the agent does when its work is done, the session's own turn is
+# the busy one: so it goes on in the background (setsid, else nohup), the call
+# returns at once, and the result lands in <state>/fresh.log. The agent ends
+# its turn, and the restart follows (after GP_FRESH_QUIET seconds of quiet).
+# It waits up to GP_FRESH_TIMEOUT seconds (default 300), reading all of them
+# every second. Still busy then, it says the last sign of work it saw, then
+# refuses with the fixed line
+#   start: BUSY: instance <name> was still working after <n>s; it was not restarted, and no fresh start is set
+# and exit 1, and leaves no fresh file. It notes the session id and the pane's
+# pid when it begins: when either changes while it waits (another --fresh, a
+# restart, a /clear), or a fresh file appears that it did not set, the
+# instance has moved on without it, so it ends nothing and exits 0, saying so.
+# It makes the file only where none is (noclobber), so of two calls at once
+# only one makes it and ends the session, and it reads the pane's pid once
+# more just before the kill, which goes by the session's name. A link named
+# fresh is removed, never written through.
+# A session that is not running gets the file, for its next start. A session
+# running without start's watchdog is refused, since nothing would start it
+# again. A fresh file it cannot write is refused before anything is ended.
+#
+# Unattended mode, for an instance nobody watches: the plugin option
+# unattended (on or off, default off), read only from Claude Code's managed
+# settings and the instance's settings file (GP_SETTINGS, the --settings
+# file), the first that sets it deciding. Never from the home's .claude/
+# settings files or the user's ~/.claude/settings.json: a stray value there
+# would turn it on for a session a person runs. When it is on, every dialog
+# that would wait for a key is answered or never shown, so each turn ends and
+# reports on its own:
+#   - --permission-mode auto (GP_PERMISSION_MODE names another): the command
+#     line beats a settings file's defaultMode, and a resumed session would
+#     otherwise come back in the mode it saved;
+#   - the --settings file is a copy of the instance's, written to
+#     <state>/settings.json at every start, with skillOverrides
+#     "auto-mode-setup": "off" (Claude Code offers to teach auto mode about the
+#     environment in a dialog of its own) and switchModelsOnFlag true (a
+#     safeguard flag switches the model without asking first);
+#   - GP_UNATTENDED=1 in claude's environment, which turns on the plugin's
+#     PermissionRequest hook (adapters/buzz/hooks/unattended-deny): every
+#     permission dialog (auto mode's three-blocks confirmation, a read outside
+#     the working folders, AskUserQuestion) is denied, with a message telling
+#     the agent to report in the Buzz thread that the step needs a person.
+# A dry run shows the mode; --test starts in it too (the copy of the settings,
+# the permission mode, GP_UNATTENDED).
+#
+# Settings from the environment (the instance's drop-in can set them):
+#   GP_CLAUDE         the claude to run (default ~/.local/bin/claude)
+#   GP_SETTINGS       the --settings file (default ~/.config/ghost-protocol/<name>.json)
+#   GP_CHANNELS       the --channels value: one line of names separated by
+#                     commas or blanks (trimmed, empty names dropped). Empty, or only
+#                     commas and blanks, means no channel: then the plugin's
+#                     two Buzz MCP servers must be off too, each named in
+#                     deniedMcpServers ({"serverName": "plugin:<plugin>:buzz"},
+#                     and the same for buzz-channel) in the managed settings or
+#                     the --settings file; start refuses otherwise. The Buzz
+#                     build and key service sockets are then not checked
+#   GP_TMUX_SOCKET    the tmux socket name (default <name>)
+#   GP_TMUX_SESSION   the tmux session name (default <name>)
+#   GP_PERSONA        the persona file (default <home>/.claude/persona/<name>.md)
+#   GP_START_PROMPT   the start prompt file (default: none)
+#   GP_TIME_ZONE      the time zone of {{time}} in the start prompt, an IANA
+#                     name such as Region/City (default: the local zone); only
+#                     that time changes, claude's own TZ stays as it is
+#   GP_START_TEST_TIMEOUT  how long --test waits, in seconds (default 120)
+#   GP_PERMISSION_MODE  claude's --permission-mode: acceptEdits, auto, dontAsk,
+#                     manual or plan (default: none, or auto in unattended
+#                     mode). bypassPermissions is refused: it skips every
+#                     check, and Claude Code asks at startup to confirm it
+#   GP_FRESH_TIMEOUT  how long --fresh waits for the instance to be idle, in
+#                     seconds (default 300)
+#   GP_FRESH_QUIET    how long the session's folder and the project's other
+#                     transcripts must be unwritten for --fresh, in seconds
+#                     (default 60)
+#   GP_WATCH_SECONDS  how often the watchdog looks at claude's pane and the
+#                     session, in seconds (default 10)
+#   GP_STOP_SECONDS   how long it waits for an ended claude's processes before
+#                     each signal, in seconds (default 10)
+#   GP_REMOTE_CONTROL on, off or auto (default auto: on when claude runs with
+#                     --remote-control or --rc); see Remote Control above
+#   GP_RC_WAIT        how long a new claude has for Remote Control to come up,
+#                     in seconds (default 60)
+#   GP_RC_BACKOFF     the wait before the first Remote Control retry, in
+#                     seconds (default 120), doubled before each later one
+#   GP_RC_TRIES       claude's starts in all for Remote Control (default 3,
+#                     at most 16)
+#   GP_PROC_DIR       where processes are read, in test mode (GP_TEST=1) only;
+#                     otherwise /proc, and a log line says it was ignored
+# A relative path in GP_PERSONA or GP_START_PROMPT is read from the home.
+# Attach: tmux -L <name> attach -t <name>   (detach: C-b d)
+#
+# Exit codes: 0 a dry run found everything ready, the test passed, the unit
+# was printed, or --fresh restarted the instance (or set the file for its next
+# start); 1 not ready, the test failed, the session ended, or --fresh refused;
+# 2 usage.
+set -uo pipefail
+
+SELF_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SELF="$SELF_DIR/start"
+GP_DIR="$(CDPATH='' cd -- "$SELF_DIR/../.." && pwd -P)"
+# shellcheck source=../lib/common.sh
+. "$GP_DIR/install/lib/common.sh"
+# shellcheck source=../lib/instance.sh
+. "$GP_DIR/install/lib/instance.sh"
+
+log() { printf 'start: %s\n' "$*"; }
+usage_error() { echo "start: $*" >&2; echo "Try: install/service/start --help" >&2; exit 2; }
+# The comment block at the top of this file, without its leading "# ".
+help_text() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"; }
+
+MODE=run ROOT_IN="" NAME=""
+set_mode() { [ "$MODE" = run ] || usage_error "--dry-run, --test, --fresh, --idle and --print-unit go one at a time"; MODE="$1"; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)       [ $# -ge 2 ] || usage_error "--root needs a value"; ROOT_IN="$2"; shift 2 ;;
+        --name)       [ $# -ge 2 ] || usage_error "--name needs a value"; NAME="$2"; shift 2 ;;
+        --dry-run)    set_mode dry; shift ;;
+        --test)       set_mode test; shift ;;
+        --fresh)      set_mode fresh; shift ;;
+        --idle)       set_mode idle; shift ;;
+        --print-unit) set_mode unit; shift ;;
+        -h|--help)    help_text; exit 0 ;;
+        *)            usage_error "unknown option: $1" ;;
+    esac
+done
+[ -n "$ROOT_IN" ] || usage_error "--root <root> is required"
+[ -n "$NAME" ] || usage_error "--name <name> is required"
+re_name='^[a-z0-9][a-z0-9-]*$'
+[[ $NAME =~ $re_name ]] || usage_error "--name must be lower-case letters, digits and dashes"
+case " $LAYOUT_DIRS " in *" $NAME "*) usage_error "--name must not be one of the layout's folders ($LAYOUT_DIRS)" ;; esac
+t="$(root_problem_text "$ROOT_IN")"
+[ -z "$t" ] || usage_error "--root $t"
+
+# A path from a setting: ~/ expanded, a relative one read from the home.
+home_path() {
+    local p
+    p="$(expand_home "$1")"
+    case "$p" in /*) printf '%s' "$p" ;; *) printf '%s/%s' "$HOME_DIR" "$p" ;; esac
+}
+
+ROOT="$(phys "$(expand_home "$ROOT_IN")")"
+HOME_DIR="$ROOT/$NAME"
+CLAUDE_BIN="${GP_CLAUDE:-$HOME/.local/bin/claude}"
+# Where the watchdog reads processes: /proc, or, in test mode only (GP_TEST=1),
+# a folder the tests name.
+PROC_DIR=/proc
+if [ "${GP_TEST:-}" = 1 ]; then PROC_DIR="${GP_PROC_DIR:-/proc}"
+elif [ -n "${GP_PROC_DIR:-}" ]; then log "GP_PROC_DIR is honoured only in test mode (GP_TEST=1); processes are read from /proc"; fi
+SETTINGS="${GP_SETTINGS:-$HOME/.config/ghost-protocol/$NAME.json}"
+CHANNELS="${GP_CHANNELS-plugin:ghost-protocol@ghost-protocol}"
+# One line only: read below takes the first line, so a value with a newline
+# would silently lose the rest.
+case "$CHANNELS" in *$'\n'*) usage_error "GP_CHANNELS must be one line (names separated by commas or blanks)" ;; esac
+# Trimmed once: names split on commas and blanks, empty ones dropped, joined
+# with commas. A value of only blanks and commas means no channel.
+ch_list="" ch_name="" ch_names=()
+IFS=$', \t\n' read -r -a ch_names <<<"$CHANNELS" || true
+for ch_name in ${ch_names[@]+"${ch_names[@]}"}; do [ -n "$ch_name" ] && ch_list="$ch_list${ch_list:+,}$ch_name"; done
+CHANNELS="$ch_list"
+unset ch_list ch_name ch_names
+SOCK="${GP_TMUX_SOCKET:-$NAME}"
+SESSION="${GP_TMUX_SESSION:-$NAME}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/ghost-protocol/$NAME"
+PROJECT_DIR="$HOME/.claude/projects/$(printf '%s' "$HOME_DIR" | sed 's/[^A-Za-z0-9]/-/g')"
+PERSONA="$(home_path "${GP_PERSONA:-$HOME_DIR/.claude/persona/$NAME.md}")"
+PERSONA_MAX=12000        # bytes; tmux 3.4 refuses a command over about 16,300 bytes
+START_PROMPT_FILE=""
+if [ -n "${GP_START_PROMPT:-}" ]; then START_PROMPT_FILE="$(home_path "$GP_START_PROMPT")"; fi
+START_PROMPT_MAX=3000    # bytes, filled in; with the longest persona the command still fits tmux
+GP_PLUGIN_ID="ghost-protocol@ghost-protocol"
+if [ "$MODE" = "test" ]; then
+    # A socket of its own for each run, so two tests never stop each other.
+    SOCK="$SOCK-test-$$-$RANDOM"
+    SESSION="$SESSION-test"
+fi
+TMUX_CMD=(tmux -L "$SOCK")
+
+# ---------------------------------------------------------------- the unit
+
+if [ "$MODE" = "unit" ]; then
+    user="$(id -un)"
+    re_user='^[a-z_][a-z0-9_-]*$'
+    re_path='^/[A-Za-z0-9._/-]+$'
+    [[ $user =~ $re_user ]] || { echo "start: the user name '$user' cannot go into a unit as it is" >&2; exit 1; }
+    for p in "$HOME" "$SELF" "$ROOT"; do
+        [[ $p =~ $re_path ]] || { echo "start: $p holds characters a unit line cannot carry unquoted" >&2; exit 1; }
+    done
+    sed -e "s|@NAME@|$NAME|g" -e "s|@USER@|$user|g" -e "s|@HOME@|$HOME|g" \
+        -e "s|@ROOT@|$ROOT|g" -e "s|@START@|$SELF|g" "$SELF_DIR/instance.service"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- Claude Code's JSON files
+
+# One reader for the checks and the test's settings copy. It prints a value
+# only where a check needs one (a true or false, a path), never anything else
+# from the files.
+#   get <file> <key>...                    the value at that path (a string as
+#                                          it is, anything else as JSON); exit 1
+#                                          when the file or a key is missing
+#   mcp-denied <server> <file>...          exit 0 when any of the files that
+#                                          exists lists the server in
+#                                          deniedMcpServers ({"serverName": ...})
+#   channel-allowed <file> <plugin> <marketplace>
+#                                          exit 0 when channelsEnabled is true and
+#                                          allowedChannelPlugins lists the plugin
+#   test-settings <in or ""> <out> <plugin id> <relay url> <key command> [unattended]
+#                                          <in> (or {}) with that plugin's relay,
+#                                          key command, key socket (emptied) and
+#                                          watched key replaced,
+#                                          and with "1" unattended mode's settings
+#   overlay <in or ""> <out or "">         <in> (or {}) with unattended mode's
+#                                          settings, written to <out> (mode 600,
+#                                          replaced in one step); no <out>: only
+#                                          check that <in> can take them
+#   needs-auth <file> <prefix> [clear]     prints how many entries of Claude Code's
+#                                          needs-login list (a JSON object) start
+#                                          with <prefix>; with clear, takes them
+#                                          out (the file replaced in one step, its
+#                                          mode kept). Exit 0, also when there is
+#                                          no file; 2 when it is a link, 3 when it
+#                                          is not a JSON object (both left alone)
+#   turn-ended <transcript>                exit 0 when the transcript's last entry of
+#                                          the conversation is a turn_duration (the
+#                                          turn is over) or there is none; 3, printing
+#                                          why, when that turn_duration counts
+#                                          background Agent runs or workflows still
+#                                          going (pendingBackgroundAgentCount,
+#                                          pendingWorkflowCount above 0); 1 otherwise
+#   activity <quiet> <project> <session id or ""> <pane pid or "">
+#                                          exit 0, printing the sign, when the session
+#                                          shows work outside its transcript's turn
+#                                          (see --fresh at the top): a file under
+#                                          <project>/<session id>/, or another *.jsonl
+#                                          in <project>, written in the last <quiet>
+#                                          seconds; or a child of the pane's pid (not
+#                                          this check's own process or its ancestors)
+#                                          that is a tool command (see --fresh at the
+#                                          top). 1 otherwise
+PY_JSON='
+import json, os, sys, time
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+def unattended(s):
+    # No dialog offering to teach auto mode; a safeguard flag switches the
+    # model without asking first.
+    o = s.get("skillOverrides")
+    s["skillOverrides"] = dict(o) if isinstance(o, dict) else {}
+    s["skillOverrides"]["auto-mode-setup"] = "off"
+    s["switchModelsOnFlag"] = True
+
+cmd, args = sys.argv[1], sys.argv[2:]
+try:
+    if cmd == "get":
+        v = load(args[0])
+        for k in args[1:]:
+            if not isinstance(v, dict) or k not in v:
+                sys.exit(1)
+            v = v[k]
+        print(v if isinstance(v, str) else json.dumps(v))
+    elif cmd == "mcp-denied":
+        found = False
+        for path in args[1:]:
+            if not os.path.isfile(path):
+                continue
+            s = load(path)
+            denied = s.get("deniedMcpServers") if isinstance(s, dict) else None
+            if isinstance(denied, list) and any(isinstance(e, dict) and e.get("serverName") == args[0] for e in denied):
+                found = True
+        sys.exit(0 if found else 1)
+    elif cmd == "channel-allowed":
+        s = load(args[0])
+        allowed = s.get("allowedChannelPlugins") if isinstance(s, dict) else None
+        ok = (isinstance(s, dict) and s.get("channelsEnabled") is True and isinstance(allowed, list)
+              and any(isinstance(e, dict) and e.get("plugin") == args[1] and e.get("marketplace") == args[2]
+                      for e in allowed))
+        sys.exit(0 if ok else 1)
+    elif cmd == "test-settings":
+        s = load(args[0]) if args[0] else {}
+        if not isinstance(s, dict):
+            sys.exit(1)
+        configs = s.setdefault("pluginConfigs", {})
+        plugin = configs.setdefault(args[2], {})
+        options = plugin.setdefault("options", {})
+        options["buzz_relay_url"] = args[3]
+        options["buzz_key_command"] = args[4]
+        options["buzz_key_socket"] = ""
+        options["buzz_watch_pubkey"] = ""
+        if args[5:6] == ["1"]:
+            unattended(s)
+        fd = os.open(args[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+            f.write("\n")
+    elif cmd == "overlay":
+        s = load(args[0]) if args[0] else {}
+        if not isinstance(s, dict):
+            sys.exit(1)
+        unattended(s)
+        if args[1]:
+            tmp = args[1] + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(s, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, args[1])
+    elif cmd == "needs-auth":
+        path, prefix = args[0], args[1]
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            print(0)
+            sys.exit(0)
+        if not os.path.isfile(path) or os.path.islink(path):
+            sys.exit(2)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, encoding="utf-8") as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            sys.exit(3)
+        if not isinstance(s, dict):
+            sys.exit(3)
+        gone = [k for k in s if isinstance(k, str) and k.startswith(prefix)]
+        print(len(gone))
+        if gone and args[2:3] == ["clear"]:
+            for k in gone:
+                del s[k]
+            tmp = "%s.gp-start.%d" % (path, os.getpid())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, st.st_mode & 0o777)
+            os.fchmod(fd, st.st_mode & 0o777)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(s, f)
+            os.replace(tmp, path)
+    elif cmd == "turn-ended":
+        cap = 4 * 1024 * 1024
+        with open(args[0], "rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - cap))
+            lines = f.read().split(b"\n")
+        if size > cap:
+            lines = lines[1:]
+        for raw in reversed(lines):
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("isSidechain") is True:
+                continue
+            if d.get("type") == "system" and d.get("subtype") == "turn_duration":
+                # Claude Code 2.1.314 counts here the background Agent runs and
+                # workflows the turn left going; they go on after it.
+                def pending(k):
+                    v = d.get(k)
+                    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+                agents, flows = pending("pendingBackgroundAgentCount"), pending("pendingWorkflowCount")
+                if agents or flows:
+                    print("the last turn left %d background Agent run(s) and %d workflow(s) going" % (agents, flows))
+                    sys.exit(3)
+                sys.exit(0)
+            if d.get("type") in ("user", "assistant"):
+                sys.exit(1)
+        sys.exit(0 if size <= cap else 1)
+    elif cmd == "activity":
+        quiet, proj, sid, pane = int(args[0]), args[1], args[2], args[3]
+        since = time.time() - quiet
+        def written(p):
+            try:
+                return os.lstat(p).st_mtime >= since
+            except OSError:
+                return False
+        def ppid(n):
+            try:
+                with open("/proc/%s/stat" % n) as fh:
+                    return fh.read().rsplit(")", 1)[1].split()[1]
+            except (OSError, IndexError):
+                return ""
+        def tool_sign(n):
+            # How Claude Code 2.1.314 runs a Bash or Monitor command (in the
+            # foreground, in the background, or moved there): through its
+            # shell snapshot, most reading /dev/null, a Bash one writing a
+            # task file. Its MCP servers show none of these.
+            try:
+                with open("/proc/%s/cmdline" % n, "rb") as fh:
+                    if b"/shell-snapshots/snapshot-" in fh.read():
+                        return "it runs the shell snapshot"
+            except OSError:
+                pass
+            try:
+                if os.readlink("/proc/%s/fd/0" % n) == "/dev/null":
+                    return "its input /dev/null"
+            except OSError:
+                pass
+            try:
+                out = os.readlink("/proc/%s/fd/1" % n)
+                if out.endswith(".output") and os.path.basename(os.path.dirname(out)) == "tasks":
+                    return "its output a task file"
+            except OSError:
+                pass
+            return ""
+        try:
+            if os.path.isdir(proj):
+                for f in sorted(os.listdir(proj)):
+                    if f.endswith(".jsonl") and f != sid + ".jsonl" and written(os.path.join(proj, f)):
+                        print("another conversation in the project folder, %s, was written in the last %ds" % (f, quiet))
+                        sys.exit(0)
+            if sid:
+                top = os.path.join(proj, sid)
+                for d, _dirs, files in os.walk(top):
+                    for f in files:
+                        if written(os.path.join(d, f)):
+                            print("the session folder %s (its subagents) was written in the last %ds" % (top, quiet))
+                            sys.exit(0)
+            if pane.isdigit() and os.path.isdir("/proc/" + pane):
+                # This check and the --fresh run above it are never the work.
+                mine, p = set(), str(os.getpid())
+                while p and p not in ("0", "1") and p not in mine and len(mine) < 64:
+                    mine.add(p)
+                    p = ppid(p)
+                for n in os.listdir("/proc"):
+                    if not n.isdigit() or n in mine or ppid(n) != pane:
+                        continue
+                    why = tool_sign(n)
+                    if why:
+                        print("claude runs a tool command (process %s: %s)" % (n, why))
+                        sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            # Never cut off work on a check that failed: read as busy.
+            print("the activity check failed (%s)" % type(e).__name__)
+            sys.exit(0)
+        sys.exit(1)
+    else:
+        sys.exit(2)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(1)
+'
+claude_json() { python3 -I -B -c "$PY_JSON" "$@"; }
+
+# ---------------------------------------------------------------- the session
+
+is_uuid() {
+    local re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    [[ $1 =~ $re ]]
+}
+new_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+    else uuidgen | tr 'A-F' 'a-f'; fi
+}
+
+# The fresh file asks for a fresh start only as a regular file, never as a
+# link: the state folder is the agent's to write, and a link would make start
+# delete or write somewhere else.
+fresh_requested() { [ -f "$STATE/fresh" ] && [ ! -L "$STATE/fresh" ]; }
+# fresh_create: makes the fresh file, never through a link (one is removed
+# first), and never over one that is there (noclobber), so two callers cannot
+# both believe they set it. 0 when this call made it, 2 when a regular file
+# was there already, 1 when it cannot be made (a folder of that name, a state
+# folder it cannot write).
+fresh_create() {
+    if [ -L "$STATE/fresh" ]; then rm -f "$STATE/fresh" 2>/dev/null || return 1; fi
+    if ( set -C; : >"$STATE/fresh" ) 2>/dev/null; then return 0; fi
+    if fresh_requested; then return 2; fi
+    return 1
+}
+
+# Resume the instance's session, or start a new one. Sets SID, SESSION_ARGS,
+# SESSION_NOTE (for the log) and SESSION_REASON (resumed, quick, fresh or new).
+# A start (not a dry run) takes the fresh request: it deletes the file here,
+# and launch puts it back if claude then cannot start. A file it cannot delete
+# sets FRESH_STUCK, and the start goes on without the request (see the top).
+FRESH_STUCK=0
+pick_session() {
+    local quick=0 fresh=0
+    SID="" SESSION_REASON=new
+    if [ "$MODE" = "test" ]; then
+        SID="$(new_uuid)"
+        SESSION_ARGS=(--session-id "$SID" -n "$NAME-test")
+        SESSION_NOTE="test session $SID, not saved"
+        return
+    fi
+    [ -s "$STATE/quick-exits" ] && quick="$(tr -cd '0-9' <"$STATE/quick-exits")"
+    [ -s "$STATE/session-id" ] && SID="$(tr -d '[:space:]' <"$STATE/session-id")"
+    is_uuid "$SID" || SID=""
+    if fresh_requested; then
+        fresh=1
+        if [ "$MODE" = run ]; then
+            rm -f "$STATE/fresh" 2>/dev/null
+            if [ -e "$STATE/fresh" ] || [ -L "$STATE/fresh" ]; then
+                log "a fresh start was asked for, but $STATE/fresh cannot be deleted (it would start a new session at every end); starting without it"
+                fresh=0 FRESH_STUCK=1
+            fi
+        fi
+    elif [ -e "$STATE/fresh" ] || [ -L "$STATE/fresh" ]; then
+        log "$STATE/fresh is not a regular file (a folder, a link or another kind); it is not read as a fresh start"
+    fi
+    if [ "$fresh" = 1 ]; then
+        log "a fresh start was asked for ($STATE/fresh); starting a new session${SID:+ instead of resuming $SID}"
+        SID="" SESSION_REASON=fresh
+    elif [ -n "$SID" ] && [ "${quick:-0}" -ge 2 ]; then
+        log "the resumed session $SID ended quickly twice; starting a new session"
+        SID="" SESSION_REASON=quick
+    fi
+    if [ -n "$SID" ] && [ -f "$PROJECT_DIR/$SID.jsonl" ]; then
+        SESSION_ARGS=(--resume "$SID")
+        SESSION_NOTE="resumed session $SID"
+        SESSION_REASON=resumed
+    else
+        [ -n "$SID" ] || SID="$(new_uuid)"
+        SESSION_ARGS=(--session-id "$SID" -n "$NAME")
+        SESSION_NOTE="new session $SID"
+    fi
+}
+
+session_sentence() {
+    case "$SESSION_REASON" in
+        resumed) printf 'Resumed session %s.' "$SID" ;;
+        quick)   printf 'Started a new session (the previous one exited twice quickly).' ;;
+        fresh)   printf 'Started a new session (a fresh start was asked for).' ;;
+        *)       printf 'Started a new session.' ;;
+    esac
+}
+
+# Every <token> in <text> replaced with <value>.
+replace_all() {   # text token value
+    local rest="$1" out=""
+    while [[ $rest == *"$2"* ]]; do
+        out="$out${rest%%"$2"*}$3"
+        rest="${rest#*"$2"}"
+    done
+    printf '%s' "$out$rest"
+}
+
+# The time for {{time}}: in GP_TIME_ZONE when this machine knows that zone
+# (TZ is set for this one date command only), else in the local zone.
+prompt_time() {
+    local z="${GP_TIME_ZONE:-}" re='^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$'
+    if [ -n "$z" ]; then
+        if [[ $z =~ $re ]] && [ -f "/usr/share/zoneinfo/$z" ]; then
+            TZ="$z" date '+%Y-%m-%d %H:%M %z'
+            return
+        fi
+        log "GP_TIME_ZONE $z is not a time zone this machine knows (no /usr/share/zoneinfo/$z); {{time}} is in the local zone" >&2
+    fi
+    date '+%Y-%m-%d %H:%M %z'
+}
+
+# The start prompt with its placeholders filled in, or nothing (and status 1)
+# when there is none to send.
+start_prompt() {
+    local text host now bytes
+    [ -n "$START_PROMPT_FILE" ] || return 1
+    if [ ! -f "$START_PROMPT_FILE" ] || [ ! -r "$START_PROMPT_FILE" ]; then
+        log "no start prompt file at $START_PROMPT_FILE; starting without a start prompt" >&2
+        return 1
+    fi
+    text="$(cat "$START_PROMPT_FILE")"
+    if [ -z "$text" ]; then
+        log "the start prompt file $START_PROMPT_FILE is empty; starting without a start prompt" >&2
+        return 1
+    fi
+    host="$(uname -n 2>/dev/null)"; host="${host%%.*}"
+    now="$(prompt_time)"
+    text="$(replace_all "$text" '{{host}}' "${host:-unknown}")"
+    text="$(replace_all "$text" '{{time}}' "$now")"
+    text="$(replace_all "$text" '{{session_note}}' "$(session_sentence)")"
+    bytes="$(printf '%s' "$text" | wc -c)"; bytes=$((bytes + 0))
+    if [ "$bytes" -gt "$START_PROMPT_MAX" ]; then
+        log "the start prompt from $START_PROMPT_FILE is $bytes bytes filled in, over $START_PROMPT_MAX (tmux's limit); starting without a start prompt" >&2
+        return 1
+    fi
+    printf '%s' "$text"
+}
+
+# CLAUDE_ARGS for claude; SHOW_ARGS the same, with the persona's text shortened
+# for a dry run.
+build_command() {
+    local settings="$SETTINGS" bytes prompt
+    pick_session
+    CLAUDE_ARGS=()
+    SHOW_ARGS=()
+    # The settings file: the test's copy; in unattended mode the copy launch
+    # writes at every start, there even with no instance file.
+    SETTINGS_USED=""
+    if [ "$MODE" = "test" ]; then SETTINGS_USED="$TEST_SETTINGS"
+    elif [ "$UNATTENDED" = 1 ]; then SETTINGS_USED="$UNATTENDED_SETTINGS"
+    elif [ -f "$settings" ]; then SETTINGS_USED="$settings"; fi
+    if [ -n "$SETTINGS_USED" ]; then CLAUDE_ARGS+=(--settings "$SETTINGS_USED"); SHOW_ARGS+=(--settings "$SETTINGS_USED"); fi
+    # The persona, on top of the built-in prompt, as a string (see the top).
+    if [ ! -e "$PERSONA" ]; then
+        log "no persona file at $PERSONA; starting without the persona" >&2
+    elif [ ! -f "$PERSONA" ] || [ ! -r "$PERSONA" ]; then
+        log "the persona $PERSONA is not a readable file; starting without the persona" >&2
+    else
+        bytes="$(wc -c <"$PERSONA")"; bytes=$((bytes + 0))
+        if [ "$bytes" -le "$PERSONA_MAX" ]; then
+            CLAUDE_ARGS+=(--append-system-prompt "$(cat "$PERSONA")")
+            SHOW_ARGS+=(--append-system-prompt "<the persona: $bytes bytes from $PERSONA>")
+        else
+            log "the persona $PERSONA is $bytes bytes, over $PERSONA_MAX, too long for tmux as a string; passing it with --append-system-prompt-file (such a session refuses /fork)" >&2
+            CLAUDE_ARGS+=(--append-system-prompt-file "$PERSONA")
+            SHOW_ARGS+=(--append-system-prompt-file "$PERSONA")
+        fi
+    fi
+    # On a resume too: a resumed session would otherwise come back in the mode it saved.
+    if [ -n "$PERM_MODE" ]; then CLAUDE_ARGS+=(--permission-mode "$PERM_MODE"); SHOW_ARGS+=(--permission-mode "$PERM_MODE"); fi
+    CLAUDE_ARGS+=("${SESSION_ARGS[@]}"); SHOW_ARGS+=("${SESSION_ARGS[@]}")
+    if [ "$MODE" != "test" ] && prompt="$(start_prompt)"; then
+        CLAUDE_ARGS+=("$prompt"); SHOW_ARGS+=("$prompt")
+    fi
+    # --channels takes several names, so it goes last.
+    if [ -n "$CHANNELS" ]; then CLAUDE_ARGS+=(--channels "$CHANNELS"); SHOW_ARGS+=(--channels "$CHANNELS"); fi
+}
+
+# ---------------------------------------------------------------- checks
+
+# Claude Code's managed settings (the test suite names its own copy).
+managed_settings() {
+    if [ "${GP_TEST:-}" = "1" ]; then printf '%s' "${GP_MANAGED_SETTINGS:-/nonexistent/managed-settings.json}"; return; fi
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) printf '%s' "/Library/Application Support/ClaudeCode/managed-settings.json" ;;
+        *)      printf '%s' /etc/claude-code/managed-settings.json ;;
+    esac
+}
+MANAGED="$(managed_settings)"
+
+# shellcheck disable=SC2317,SC2329  # called through check
+plugin_installed() {
+    local v
+    v="$(claude_json get "$HOME/.claude/plugins/installed_plugins.json" plugins "$GP_PLUGIN_ID")" || return 1
+    [ -n "$v" ] && [ "$v" != "[]" ] && [ "$v" != "{}" ] && [ "$v" != "null" ]
+}
+# The first file that names the plugin in enabledPlugins decides, in Claude
+# Code's order: managed, the --settings file, local, project, user.
+# shellcheck disable=SC2317,SC2329  # called through check
+plugin_enabled() {
+    local f v
+    for f in "$MANAGED" "$SETTINGS" "$HOME_DIR/.claude/settings.local.json" \
+             "$HOME_DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
+        [ -f "$f" ] || continue
+        if v="$(claude_json get "$f" enabledPlugins "$GP_PLUGIN_ID")"; then [ "$v" = "true" ]; return; fi
+    done
+    return 1
+}
+# The plugin option unattended, from the managed settings and the instance's
+# settings file only, the first that sets it deciding (see the top): a value
+# in the home's .claude/ files or the user's settings never turns it on.
+# Status 1 when neither sets it.
+unattended_option() {
+    local f
+    for f in "$MANAGED" "$SETTINGS"; do
+        [ -f "$f" ] || continue
+        if claude_json get "$f" pluginConfigs "$GP_PLUGIN_ID" options unattended; then return 0; fi
+    done
+    return 1
+}
+
+# Unattended mode (see the top): off unless the option says on (or true, yes,
+# 1). Without python3 it reads as off, and the checks refuse a start anyway.
+UNATTENDED=0
+case "$(unattended_option 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    on | true | yes | 1) UNATTENDED=1 ;;
+esac
+UNATTENDED_SETTINGS="$STATE/settings.json"
+PERM_MODE="${GP_PERMISSION_MODE:-}"
+if [ -z "$PERM_MODE" ] && [ "$UNATTENDED" = 1 ]; then PERM_MODE=auto; fi
+# The modes start passes. bypassPermissions skips every check, and Claude Code
+# asks at startup to confirm it, which an unattended start would wait at.
+# shellcheck disable=SC2317,SC2329  # called through check
+perm_mode_ok() { case "$1" in acceptEdits | auto | dontAsk | manual | plan) return 0 ;; esac; return 1; }
+# A Buzz option of the plugin, from the settings file, else the user's
+# settings: the first that sets it to something. Nothing when neither does.
+buzz_option() {   # option
+    local f v
+    for f in "$SETTINGS" "$HOME/.claude/settings.json"; do
+        [ -f "$f" ] || continue
+        if v="$(claude_json get "$f" pluginConfigs "$GP_PLUGIN_ID" options "$1")" && [ -n "$v" ]; then
+            printf '%s' "$v"; return
+        fi
+    done
+}
+# Where the buzz MCP server looks for buzz-mcp: the plugin's buzz_mcp_path
+# option, else the build script's cache (as adapters/buzz/src/launch.mjs).
+buzz_mcp_file() {
+    local v
+    v="$(buzz_option buzz_mcp_path)"
+    if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+    printf '%s/buzz-mcp.mjs' "${BUZZ_MCP_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/ghost-protocol/buzz}"
+}
+# The key service's socket folder (the plugin's buzz_key_socket option), or
+# nothing. Without python3 it reads as none; the checks refuse a start anyway.
+KEY_SOCKET="$(buzz_option buzz_key_socket 2>/dev/null)"
+# shellcheck disable=SC2317,SC2329  # called through check
+key_command_empty() { [ -z "$(buzz_option buzz_key_command)" ]; }
+trusted() {
+    [ "$(claude_json get "$HOME/.claude.json" projects "$HOME_DIR" hasTrustDialogAccepted)" = "true" ]
+}
+# Claude Code's needs-login list, and the plugin's entries in it (see "The
+# needs-login list" at the top).
+NEEDS_AUTH="$HOME/.claude/mcp-needs-auth-cache.json"
+NEEDS_AUTH_PREFIX="plugin:${GP_PLUGIN_ID%@*}:"
+needs_auth() {   # [clear]: the count on stdout, and claude_json's status
+    claude_json needs-auth "$NEEDS_AUTH" "$NEEDS_AUTH_PREFIX" "$@" 2>/dev/null
+}
+needs_auth_problem() {   # status
+    case "$1" in
+        2) printf '%s is not a plain file (a link?): left alone' "$NEEDS_AUTH" ;;
+        3) printf '%s is not a JSON object: left alone' "$NEEDS_AUTH" ;;
+        *) printf 'could not read or update %s' "$NEEDS_AUTH" ;;
+    esac
+    printf "; if it lists the plugin's MCP servers, claude skips them"
+}
+# Before claude starts: the plugin's servers off the list.
+forget_needs_auth() {
+    local n rc
+    n="$(needs_auth clear)"; rc=$?
+    if [ "$rc" != 0 ]; then log "$(needs_auth_problem "$rc")"; return 0; fi
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    [ "$n" = 0 ] || log "took the plugin's $n MCP server(s) off Claude Code's needs-login list ($NEEDS_AUTH): they need no login, and claude would skip them"
+}
+
+# The LoadCredentialEncrypted= values of the instance's unit and its drop-ins,
+# one per line, in the order systemd reads them (an empty one clears the list).
+unit_credentials() {
+    local etc=/etc f line v list=""
+    if [ "${GP_TEST:-}" = "1" ]; then etc="${GP_ETC:-/nonexistent}"; fi
+    for f in "$etc/systemd/system/$NAME.service" "$etc/systemd/system/$NAME.service.d"/*.conf; do
+        [ -f "$f" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                LoadCredentialEncrypted=*)
+                    v="${line#LoadCredentialEncrypted=}"
+                    v="${v%"${v##*[![:space:]]}"}"
+                    if [ -z "$v" ]; then list=""; else list="$list$v
+"; fi ;;
+            esac
+        done <"$f"
+    done
+    printf '%s' "$list"
+}
+# The credential arrives, decrypted, in a throwaway unit as the instance's
+# user; the unit reports only whether it is there.
+# shellcheck disable=SC2317,SC2329  # called through check
+cred_decrypts() {   # value id
+    # shellcheck disable=SC2016  # $CREDENTIALS_DIRECTORY and $0 are the throwaway unit's own
+    as_root systemd-run --quiet --wait --pipe --collect -p "User=$(id -un)" \
+        -p "LoadCredentialEncrypted=$1" /bin/sh -c 'test -s "$CREDENTIALS_DIRECTORY/$0"' "$2" </dev/null
+}
+# api-token.key -> API_TOKEN_KEY
+cred_var() { printf '%s' "$1" | tr 'a-z.-' 'A-Z__'; }
+
+NOT_READY=0 UNTRUSTED=0
+check() {
+    local what="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "  ok       $what"; else echo "  MISSING  $what"; NOT_READY=1; fi
+}
+note() { echo "  note     $*"; }
+
+preflight_channels() {
+    local c p m
+    if [ -z "$CHANNELS" ]; then note "GP_CHANNELS is empty: no channel to check"; return; fi
+    for c in $(printf '%s' "$CHANNELS" | tr ',' ' '); do
+        case "$c" in
+            plugin:?*@?*)
+                p="${c#plugin:}"; m="${p#*@}"; p="${p%%@*}"
+                check "channel $c allowed in $MANAGED (channelsEnabled, allowedChannelPlugins)" \
+                    claude_json channel-allowed "$MANAGED" "$p" "$m" ;;
+            *) note "channel $c is not a plugin:<plugin>@<marketplace> channel; not checked" ;;
+        esac
+    done
+}
+
+preflight_credentials() {
+    local creds v id
+    [ "$MODE" = "dry" ] && [ -z "${CREDENTIALS_DIRECTORY:-}" ] || return 0
+    creds="$(unit_credentials)"
+    [ -n "$creds" ] || return 0
+    if ! command -v systemd-run >/dev/null 2>&1; then note "no systemd-run here: the unit's credentials were not checked"; return 0; fi
+    if ! root_prepare "the credential check"; then note "the unit's credentials were not checked: $ROOT_PROBLEM"; return 0; fi
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        id="${v%%:*}"
+        check "credential $id decrypts (exported as $(cred_var "$id"))" cred_decrypts "$v" "$id"
+    done <<EOF
+$creds
+EOF
+}
+
+preflight() {
+    local py=1 from="" src="unattended mode" n rc
+    echo "start: checks for instance $NAME"
+    check "claude at $CLAUDE_BIN" test -x "$CLAUDE_BIN"
+    check "the instance's home $HOME_DIR is a git checkout" test -e "$HOME_DIR/.git"
+    check "tmux" command -v tmux
+    if [ -f "$SETTINGS" ]; then echo "  ok       settings $SETTINGS"
+    elif [ -n "${GP_SETTINGS:-}" ]; then check "settings $SETTINGS (GP_SETTINGS)" test -f "$SETTINGS"
+    else note "no $SETTINGS; claude starts without --settings"; fi
+    check "python3 (it reads Claude Code's JSON files for the checks below)" command -v python3
+    command -v python3 >/dev/null 2>&1 || py=0
+    if [ "$py" = 1 ]; then
+        check "plugin $GP_PLUGIN_ID installed (~/.claude/plugins/installed_plugins.json)" plugin_installed
+        check "plugin $GP_PLUGIN_ID enabled for $HOME_DIR" plugin_enabled
+        if [ -n "$KEY_SOCKET" ]; then
+            check "no key command on the session's side (the plugin's buzz_key_command is empty)" key_command_empty
+        fi
+        if [ -z "$CHANNELS" ]; then
+            note "GP_CHANNELS is empty: no channel, so the plugin's Buzz servers must be off; their build and sockets are not checked"
+            for srv in buzz buzz-channel; do
+                check "MCP server plugin:${GP_PLUGIN_ID%@*}:$srv denied (deniedMcpServers in $MANAGED or $SETTINGS)" \
+                    claude_json mcp-denied "plugin:${GP_PLUGIN_ID%@*}:$srv" "$MANAGED" "$SETTINGS"
+            done
+        elif [ -n "$KEY_SOCKET" ]; then
+            note "a key service holds the relay key (buzz_key_socket $KEY_SOCKET); it runs its own buzz-mcp"
+            check "the key service's channel socket $KEY_SOCKET/channel.sock" test -S "$KEY_SOCKET/channel.sock"
+            check "the key service's buzz-mcp socket $KEY_SOCKET/buzz-mcp.sock" test -S "$KEY_SOCKET/buzz-mcp.sock"
+        else
+            check "buzz-mcp built ($(buzz_mcp_file))" test -s "$(buzz_mcp_file)"
+        fi
+        preflight_channels
+        if trusted >/dev/null 2>&1; then echo "  ok       $HOME_DIR trusted in ~/.claude.json"
+        else echo "  MISSING  $HOME_DIR trusted in ~/.claude.json"; NOT_READY=1; UNTRUSTED=1; fi
+        if [ "$UNATTENDED" = 1 ]; then
+            note "unattended mode is on (the plugin option unattended): permission dialogs are denied, and claude gets the settings copy $UNATTENDED_SETTINGS"
+            [ -f "$SETTINGS" ] && from="$SETTINGS"
+            check "unattended mode's settings go on top of ${from:-no settings file} (a JSON object)" claude_json overlay "$from" ""
+        fi
+    fi
+    if [ -n "$PERM_MODE" ]; then
+        [ -n "${GP_PERMISSION_MODE:-}" ] && src=GP_PERMISSION_MODE
+        if [ "$PERM_MODE" = bypassPermissions ]; then
+            echo "  MISSING  permission mode bypassPermissions ($src): start refuses it; it skips every check, and Claude Code asks at startup to confirm it"
+            NOT_READY=1
+        else
+            check "permission mode $PERM_MODE ($src): one of acceptEdits, auto, dontAsk, manual, plan" perm_mode_ok "$PERM_MODE"
+        fi
+    fi
+    preflight_credentials
+    if [ "$py" = 1 ] && [ "$MODE" = dry ]; then
+        n="$(needs_auth)"; rc=$?
+        if [ "$rc" != 0 ]; then note "$(needs_auth_problem "$rc")"
+        elif [ "${n:-0}" != 0 ]; then note "Claude Code's needs-login list ($NEEDS_AUTH) holds $n of the plugin's MCP servers, so claude would skip them: a start takes them off"; fi
+    fi
+}
+
+# Why a start or a test does not go ahead.
+refuse() {   # what
+    if [ "$UNTRUSTED" = "1" ]; then
+        log "the instance's home $HOME_DIR is not trusted in ~/.claude.json: claude would wait at the trust dialog and hear nothing."
+        log "  start never answers a dialog. Trust the folder once by hand: run claude in $HOME_DIR and accept the dialog."
+    fi
+    log "a check above failed; not $1"
+    exit 1
+}
+
+# Each credential file as an environment variable. Names only in the log.
+export_credentials() {
+    local f n v count=0 re='^[A-Z_][A-Z0-9_]*$'
+    [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -d "$CREDENTIALS_DIRECTORY" ] || return 0
+    for f in "$CREDENTIALS_DIRECTORY"/*; do
+        [ -f "$f" ] || continue
+        n="$(cred_var "${f##*/}")"
+        if ! [[ $n =~ $re ]]; then log "skipped a credential: its name is not a variable name"; continue; fi
+        case "$n" in
+            PATH|HOME|USER|LOGNAME|SHELL|IFS|ENV|BASH_ENV|PS4|TERM|TMUX|TMPDIR|CREDENTIALS_DIRECTORY|LD_*|DYLD_*|BASH_FUNC_*|GP_*)
+                log "skipped credential $n: that name is reserved"; continue ;;
+        esac
+        # A relay key, or anything that leads to one, never reaches Claude Code.
+        case "$n" in
+            BUZZ_AUTH_TAG)
+                if [ -n "$KEY_SOCKET" ]; then
+                    log "refused credential $n: with a key service, the owner's tag goes to the key units (LoadCredential=buzz-auth-tag in theirs), never into Claude Code's environment"
+                    continue
+                fi ;;
+            BUZZ_*|NOSTR_*)
+                log "refused credential $n: a Buzz or Nostr credential never goes into Claude Code's environment (a relay key lives with a key service: install/keyservice/setup)"
+                continue ;;
+        esac
+        v="$(cat "$f")" || { log "could not read credential $n"; return 1; }
+        export "$n=$v"
+        count=$((count + 1))
+    done
+    unset v
+    log "exported $count credential(s)"
+}
+
+# ---------------------------------------------------------------- dry run
+
+# The running session's Remote Control, from the watchdog's state file (see
+# Remote Control at the top). RC_BAD=1 for retrying, failed and down, so the dry run
+# ends NOT READY; a start never reads it.
+dry_remote_control() {
+    local line=""
+    if [ -f "$STATE/remote-control" ] && [ ! -L "$STATE/remote-control" ]; then
+        line="$(head -n 1 "$STATE/remote-control" 2>/dev/null | tr -cd '[:print:]')"
+    fi
+    case "${line%% *}" in
+        up)                echo "  ok       Remote Control: $line" ;;
+        checking | off)    echo "  note     Remote Control: $line" ;;
+        retrying | failed | down) echo "  FAIL     Remote Control: $line"; RC_BAD=1 ;;
+        '')                echo "  note     Remote Control: no state written ($STATE/remote-control); the watchdog writes it after claude starts" ;;
+        *)                 echo "  note     Remote Control: unreadable state ($STATE/remote-control)" ;;
+    esac
+}
+
+if [ "$MODE" = "dry" ]; then
+    preflight
+    build_command
+    echo
+    echo "It would run, in $HOME_DIR, in tmux -L $SOCK session $SESSION ($SESSION_NOTE):"
+    printf '  %q' "$CLAUDE_BIN" "${SHOW_ARGS[@]}"; echo
+    echo "through env GP_INSTANCE_NAME=$NAME$([ "$UNATTENDED" = 1 ] && printf ' GP_UNATTENDED=1'), for claude alone; its pid goes to $STATE/pane-pid"
+    if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then echo "with each credential in $CREDENTIALS_DIRECTORY as an environment variable"; fi
+    RC_BAD=0
+    if "${TMUX_CMD[@]}" has-session -t "=$SESSION" 2>/dev/null; then
+        echo "Note: tmux -L $SOCK session $SESSION is running now."
+        dry_remote_control
+    fi
+    if [ "$NOT_READY" = "0" ] && [ "$RC_BAD" = 0 ]; then echo "READY"; exit 0; else echo "NOT READY"; exit 1; fi
+fi
+
+# ---------------------------------------------------------------- the channel test
+
+if [ "$MODE" = "test" ]; then
+    [ -n "$CHANNELS" ] || { log "--test needs a channel to test, and GP_CHANNELS is empty"; exit 1; }
+    preflight
+    [ "$NOT_READY" = "0" ] || refuse "starting the test"
+    TEST_DIR="" TEST_SETTINGS="" TEST_PID=""
+    TEST_SOCKET_PATH="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"
+    # shellcheck disable=SC2317,SC2329  # run by the EXIT trap
+    test_cleanup() {
+        local i=0
+        "${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
+        rm -f "$TEST_SOCKET_PATH"
+        if [ -n "$TEST_DIR" ]; then rm -rf "$TEST_DIR"; fi
+        # claude ends on the server's hangup. Once it has (TERM after 10
+        # seconds), what Claude Code kept for the throwaway session goes too:
+        # its transcript, its session folders and its temporary folder, each
+        # named by the test's own new session id.
+        if [ -n "$TEST_PID" ]; then
+            while kill -0 "$TEST_PID" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+            if kill -0 "$TEST_PID" 2>/dev/null; then
+                kill "$TEST_PID" 2>/dev/null
+                i=0; while kill -0 "$TEST_PID" 2>/dev/null && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i + 1)); done
+            fi
+        fi
+        if [ -n "${SID:-}" ] && is_uuid "$SID"; then
+            rm -rf "${PROJECT_DIR:?}/$SID.jsonl" "${PROJECT_DIR:?}/$SID" "$HOME/.claude/session-env/$SID" \
+                "${TMPDIR:-/tmp}/claude-$(id -u)/${PROJECT_DIR##*/}/$SID"
+        fi
+    }
+    trap test_cleanup EXIT
+    trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+    TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gp-start-test.XXXXXX")" || { log "could not make a temporary folder"; exit 1; }
+    TEST_SETTINGS="$TEST_DIR/settings.json"
+    from=""; [ -f "$SETTINGS" ] && from="$SETTINGS"
+    # shellcheck disable=SC2016  # the key command is text, run later by the plugin's /bin/sh
+    if ! claude_json test-settings "$from" "$TEST_SETTINGS" "$GP_PLUGIN_ID" "https://127.0.0.1:9" \
+            'od -An -N32 -tx1 /dev/urandom | tr -d " \n"' "$UNATTENDED"; then
+        log "could not write the test copy of ${from:-the settings} (is it valid JSON?)"; exit 1
+    fi
+    build_command
+    # A clean environment for the test session: no credential of the caller's.
+    TEST_ENV=(HOME="$HOME" PATH="$PATH" DISABLE_AUTOUPDATER=1 GP_CLAUDE_SETTINGS="$TEST_SETTINGS")
+    while IFS= read -r n; do
+        case "$n" in
+            USER|LOGNAME|SHELL|LANG|LC_*|TERM|TZ|TMPDIR|TMUX_TMPDIR|XDG_*|BUZZ_MCP_CACHE|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR)
+                TEST_ENV+=("$n=${!n}") ;;
+        esac
+    done <<EOF
+$(compgen -e)
+EOF
+    # Unattended mode's permission hook, as in a start; never GP_INSTANCE_NAME,
+    # so the plugin's hooks leave the instance's state alone.
+    if [ "$UNATTENDED" = 1 ]; then TEST_ENV+=(GP_UNATTENDED=1); fi
+    # The test suite's stand-ins (GP_TEST=1) find their state through these.
+    if [ "${GP_TEST:-}" = "1" ]; then TEST_ENV+=(GP_TEST=1 "STUB_STATE=${STUB_STATE:-}"); fi
+    forget_needs_auth
+    log "testing the channel: claude in tmux -L $SOCK session $SESSION ($SESSION_NOTE)"
+    if ! env -i "${TEST_ENV[@]}" tmux -L "$SOCK" new-session -d -s "$SESSION" -c "$HOME_DIR" -x 220 -y 50 \
+            "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"; then
+        log "tmux new-session failed"; exit 1
+    fi
+    TEST_PID="$("${TMUX_CMD[@]}" display-message -p -t "=$SESSION:" '#{pane_pid}' 2>/dev/null || true)"
+    case "$TEST_PID" in ''|*[!0-9]*) TEST_PID="" ;; esac
+    trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+    REJECTED='not on (the|your org.s) approved channels|[Cc]hannels (are )?not (enabled|available|currently)'
+    NOTICE='Channels \(experimental\) messages from plugin:.* inject directly in this session|Listening for messages from:? ?[^ ]*'
+    # Dialogs that wait for a key. The MCP lines are Claude Code 2.1.314's
+    # project MCP-server approval ("New MCP server found in this project: <name>",
+    # or "<n> new MCP servers found in this project", and its options).
+    DIALOG='Loading development channels|trust the files in this folder|Do you trust|Is this a project you created or one you trust|Yes, I trust this folder|[Nn]ew MCP servers? found in this project|Continue without using this MCP server'
+    timeout="${GP_START_TEST_TIMEOUT:-120}"
+    case "$timeout" in ''|*[!0-9]*) timeout=120 ;; esac
+    deadline=$(( $(date +%s) + timeout ))
+    verdict="no channel notice within ${timeout}s" rc=1
+    while :; do
+        # Pane commands target "=<session>:", the session's current pane by
+        # its exact name: on tmux 3.4 a bare "=<session>" names no pane.
+        screen="$("${TMUX_CMD[@]}" capture-pane -p -J -t "=$SESSION:" 2>/dev/null || true)"
+        # The notice is quoted as it matched; a rejection or a dialog by its
+        # whole line, which names what it is about. A dialog is looked for
+        # before the notice: a screen with both would leave a real start
+        # waiting for a key, so it fails.
+        if line="$(printf '%s\n' "$screen" | grep -m 1 -E "$REJECTED")"; then
+            verdict="CHANNEL REJECTED: $(trim "$line")"; break
+        elif line="$(printf '%s\n' "$screen" | grep -m 1 -E "$DIALOG")"; then
+            verdict="A DIALOG IS WAITING for a key (start never presses one): $(trim "$line")"; break
+        elif line="$(printf '%s\n' "$screen" | grep -m 1 -oE "$NOTICE")"; then
+            verdict="CHANNEL REGISTERED with no dialog: $line"; rc=0; break
+        fi
+        if ! "${TMUX_CMD[@]}" has-session -t "=$SESSION" 2>/dev/null; then verdict="claude exited during the test"; break; fi
+        [ "$(date +%s)" -lt "$deadline" ] || break
+        sleep 1
+    done
+    log "$verdict"
+    exit "$rc"
+fi
+
+# ---------------------------------------------------------------- a fresh start
+
+# The session id start's file names, or nothing.
+current_sid() {
+    local sid=""
+    [ -s "$STATE/session-id" ] && sid="$(tr -d '[:space:]' <"$STATE/session-id")"
+    is_uuid "$sid" && printf '%s' "$sid"
+}
+# The pane start recorded in pane-id (%<n>), or nothing.
+recorded_pane() {
+    local id=""
+    if [ -f "$STATE/pane-id" ] && [ ! -L "$STATE/pane-id" ]; then id="$(tr -d '[:space:]' <"$STATE/pane-id")"; fi
+    if [[ $id =~ ^%[0-9]+$ ]]; then printf '%s' "$id"; fi
+}
+# The pid of the instance's pane (its claude), or nothing when not running.
+# The pane is the one in pane-id, wherever it is in the session: another
+# window may be the session's active one. With no pane-id, the session's
+# active pane.
+pane_pid() {
+    local p id
+    id="$(recorded_pane)"
+    if [ -n "$id" ]; then
+        p="$("${TMUX_CMD[@]}" list-panes -s -t "=$SESSION" -F '#{pane_id} #{pane_pid} #{pane_dead}' 2>/dev/null |
+            awk -v id="$id" '$1 == id && $3 == 0 { print $2; exit }')"
+    else
+        p="$("${TMUX_CMD[@]}" display-message -p -t "=$SESSION:" '#{pane_pid}' 2>/dev/null)" || return 0
+    fi
+    case "$p" in '' | *[!0-9]*) return 0 ;; esac
+    printf '%s' "$p"
+}
+
+# Idle (see the top): the turn-state marker does not say busy, the session's
+# transcript ends with a finished turn (or has none), and no sign of work
+# outside it (the activity check). BUSY_WHY says what was busy.
+instance_idle() {
+    local sid
+    BUSY_WHY=""
+    case "$(head -c 200 "$STATE/turn" 2>/dev/null)" in busy*) BUSY_WHY="the turn marker says busy"; return 1 ;; esac
+    sid="$(current_sid)"
+    if [ -n "$sid" ] && [ -f "$PROJECT_DIR/$sid.jsonl" ]; then
+        BUSY_WHY="$(claude_json turn-ended "$PROJECT_DIR/$sid.jsonl")"
+        case $? in
+            0) ;;
+            3) return 1 ;;
+            *) BUSY_WHY="the session's transcript is in a turn"; return 1 ;;
+        esac
+    fi
+    if BUSY_WHY="$(claude_json activity "$FRESH_QUIET" "$PROJECT_DIR" "$sid" "$(pane_pid)")"; then
+        return 1
+    fi
+    BUSY_WHY=""
+    return 0
+}
+
+# --idle: the same idle test, once, and nothing ended or set. The update
+# helper asks it before it swaps the agent's container.
+if [ "$MODE" = "idle" ]; then
+    FRESH_QUIET="${GP_FRESH_QUIET:-60}"
+    case "$FRESH_QUIET" in ''|*[!0-9]*) FRESH_QUIET=60 ;; esac
+    if instance_idle; then
+        log "instance $NAME is idle"
+        exit 0
+    fi
+    log "instance $NAME is busy: $BUSY_WHY"
+    exit 1
+fi
+
+if [ "$MODE" = "fresh" ]; then
+    mkdir -p "$STATE"
+    # Asked from the instance's own session (a fresh start when its work is
+    # done): that session's turn is the busy one, and it would wait on this
+    # call. So it goes on in the background, in a session of its own, and the
+    # call returns at once; the result goes to fresh.log.
+    if [ "${GP_INSTANCE_NAME:-}" = "$NAME" ] && [ "${GP_FRESH_DETACHED:-}" != 1 ]; then
+        if command -v setsid >/dev/null 2>&1; then
+            GP_FRESH_DETACHED=1 setsid "$SELF" --root "$ROOT" --name "$NAME" --fresh </dev/null >"$STATE/fresh.log" 2>&1 &
+        else
+            GP_FRESH_DETACHED=1 nohup "$SELF" --root "$ROOT" --name "$NAME" --fresh </dev/null >"$STATE/fresh.log" 2>&1 &
+        fi
+        log "asked from instance $NAME's own session: it waits in the background until this turn has ended, then restarts; the result goes to $STATE/fresh.log"
+        exit 0
+    fi
+    # A fresh file it cannot make is a refusal before anything is ended.
+    cannot_set() {
+        log "could not write $STATE/fresh; not restarting instance $NAME, and no fresh start is set"
+        exit 1
+    }
+    if ! "${TMUX_CMD[@]}" has-session -t "=$SESSION" 2>/dev/null; then
+        fresh_create; [ $? = 1 ] && cannot_set
+        log "instance $NAME is not running; its next start begins a new session ($STATE/fresh)"
+        exit 0
+    fi
+    wd=""
+    [ -s "$STATE/watchdog.pid" ] && wd="$(tr -cd '0-9' <"$STATE/watchdog.pid")"
+    if [ -z "$wd" ] || ! kill -0 "$wd" 2>/dev/null; then
+        log "instance $NAME runs without start's watchdog, which would not start it again; not restarting it, and no fresh start is set"
+        exit 1
+    fi
+    timeout="${GP_FRESH_TIMEOUT:-300}"
+    case "$timeout" in ''|*[!0-9]*) timeout=300 ;; esac
+    FRESH_QUIET="${GP_FRESH_QUIET:-60}"
+    case "$FRESH_QUIET" in ''|*[!0-9]*) FRESH_QUIET=60 ;; esac
+    if [ ! -d /proc/self ]; then
+        log "note: no /proc here, so the instance's tool commands are not seen; only its turn, its transcripts and its session folder are"
+    fi
+    # The session as it is now: a change while waiting means the instance moved
+    # on without this call (another --fresh, a restart, a /clear).
+    began_sid="$(current_sid)" began_pane="$(pane_pid)" began_fresh=0
+    if fresh_requested; then began_fresh=1; fi
+    deadline=$(( $(date +%s) + timeout ))
+    BUSY_WHY=""
+    while :; do
+        now_sid="$(current_sid)" now_pane="$(pane_pid)"
+        if [ "$now_sid" != "$began_sid" ] || [ "$now_pane" != "$began_pane" ]; then
+            log "instance $NAME moved on while this call waited (session ${began_sid:-none} in pane ${began_pane:-none}, now ${now_sid:-none} in pane ${now_pane:-none}): it was restarted or cleared meanwhile, so it is not restarted again"
+            exit 0
+        fi
+        if [ "$began_fresh" = 0 ] && fresh_requested; then
+            log "a fresh start of instance $NAME was set by another call meanwhile ($STATE/fresh); this one ends nothing"
+            exit 0
+        fi
+        if instance_idle; then
+            # Made only by this call (noclobber): another call that set it in
+            # the meantime has the restart in hand.
+            fresh_create; made=$?
+            if [ "$made" = 1 ]; then cannot_set; fi
+            if [ "$made" = 2 ] && [ "$began_fresh" = 0 ]; then
+                log "a fresh start of instance $NAME was set by another call meanwhile ($STATE/fresh); this one ends nothing"
+                exit 0
+            fi
+            # The pane once more, just before the kill (which goes by name).
+            now_pane="$(pane_pid)"
+            if [ "$now_pane" != "$began_pane" ]; then
+                if [ "$made" = 0 ]; then rm -f "$STATE/fresh"; fi
+                log "instance $NAME moved on while this call waited (pane ${began_pane:-none}, now ${now_pane:-none}): it was restarted meanwhile, so it is not restarted again"
+                exit 0
+            fi
+            "${TMUX_CMD[@]}" kill-session -t "=$SESSION" 2>/dev/null || true
+            log "instance $NAME was idle: its session is ended, and the watchdog starts a new one"
+            exit 0
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || break
+        sleep 1
+    done
+    [ -z "$BUSY_WHY" ] || log "the last sign of work: $BUSY_WHY"
+    log "BUSY: instance $NAME was still working after ${timeout}s; it was not restarted, and no fresh start is set"
+    exit 1
+fi
+
+# ---------------------------------------------------------------- start
+
+preflight
+[ "$NOT_READY" = "0" ] || refuse starting
+export_credentials || exit 1
+export DISABLE_AUTOUPDATER=1
+# GP_INSTANCE_NAME and GP_UNATTENDED go to the pane's claude alone (launch),
+# never into the tmux server's environment, where every window would get them.
+unset CREDENTIALS_DIRECTORY TMUX GP_INSTANCE_NAME GP_UNATTENDED GP_FRESH_DETACHED
+mkdir -p "$STATE"
+# For --fresh, which restarts only while start watches the session.
+printf '%s\n' "$$" >"$STATE/watchdog.pid"
+
+# A fresh request launch took (pick_session deleted its file) goes back when
+# claude cannot start, for the next start.
+fresh_back() {
+    if [ "$SESSION_REASON" = fresh ]; then fresh_create || true; fi
+}
+
+# How often the watchdog looks at the session and claude's pane, in seconds.
+WATCH_SECONDS="${GP_WATCH_SECONDS:-10}"
+case "$WATCH_SECONDS" in '' | *[!0-9]* | 0) WATCH_SECONDS=10 ;; esac
+# How long it waits for an ended claude's processes before each signal.
+STOP_SECONDS="${GP_STOP_SECONDS:-10}"
+case "$STOP_SECONDS" in '' | *[!0-9]* | 0) STOP_SECONDS=10 ;; esac
+
+# Writes <file> in the state folder in one step (a temporary file moved over it).
+state_write() {   # file value
+    { printf '%s\n' "$2" >"$STATE/.$1.$$" && mv -f "$STATE/.$1.$$" "$STATE/$1"; } 2>/dev/null && return 0
+    rm -f "$STATE/.$1.$$" 2>/dev/null
+    return 1
+}
+
+# Starts claude on the instance's socket: the command, the unattended settings
+# copy, the session id saved, the turn marker cleared, and the pane's id and
+# pid (claude's) written for the watchdog and the session-id and turn-state
+# hooks. launch server (the first start, and a fresh start after the session
+# ended) starts a new tmux server; launch window starts claude in a new window
+# of the running session, whose other windows stay as they are.
+CLAUDE_PANE="" CLAUDE_PID="" CLAUDE_START=""
+launch() {
+    local how="${1:-server}" pane_env out n
+    build_command
+    pane_env=()
+    # A new window gets the session's environment, which tmux rewrites at each
+    # attach from the attaching client for the names in update-environment
+    # (SSH_AUTH_SOCK, DISPLAY and the like). claude gets none of them that
+    # start itself does not have, so a restarted claude sees what a first
+    # start's claude sees, never the attached operator's forwarded agent; the
+    # operator's windows keep them. A name start has (PATH, HOME, a credential)
+    # is never unset, whatever the list says: anything on the tmux socket can
+    # set the list.
+    if [ "$how" = window ]; then
+        while IFS= read -r n; do
+            [[ $n =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            [ -n "${!n+x}" ] && continue
+            pane_env+=(-u "$n")
+        done < <({ "${TMUX_CMD[@]}" show-options -gv update-environment 2>/dev/null
+                   "${TMUX_CMD[@]}" show-options -v -t "=$SESSION:" update-environment 2>/dev/null; } | sort -u)
+    fi
+    pane_env+=(GP_INSTANCE_NAME="$NAME")
+    if [ "$UNATTENDED" = 1 ]; then
+        from=""; [ -f "$SETTINGS" ] && from="$SETTINGS"
+        if ! claude_json overlay "$from" "$UNATTENDED_SETTINGS"; then
+            log "could not write $UNATTENDED_SETTINGS from ${from:-no settings file}"
+            fresh_back
+            return 1
+        fi
+        pane_env+=(GP_UNATTENDED=1)
+    fi
+    # The status line cannot see claude's --settings flag, so it is told the file:
+    # in the new server's environment, or, for a new window, set again in the
+    # running server's (the settings file may have come or gone since).
+    if [ -n "$SETTINGS_USED" ]; then export GP_CLAUDE_SETTINGS="$SETTINGS_USED"; else unset GP_CLAUDE_SETTINGS; fi
+    if [ "$how" = window ]; then
+        if [ -n "$SETTINGS_USED" ]; then "${TMUX_CMD[@]}" set-environment -g GP_CLAUDE_SETTINGS "$SETTINGS_USED" 2>/dev/null || true
+        else "${TMUX_CMD[@]}" set-environment -gu GP_CLAUDE_SETTINGS 2>/dev/null || true; fi
+    fi
+    printf '%s\n' "$SID" >"$STATE/session-id"
+    rm -f "$STATE/turn" "$STATE/pane-pid" "$STATE/pane-id"
+    CLAUDE_PANE="" CLAUDE_PID="" CLAUDE_START=""
+    # A tmux server left on this socket is stopped, so the new one starts with
+    # this environment. A new window shares the running server's environment,
+    # which this start gave it.
+    if [ "$how" = server ]; then "${TMUX_CMD[@]}" kill-server 2>/dev/null || true; fi
+    forget_needs_auth
+    if [ "$how" = server ]; then
+        log "starting claude in tmux -L $SOCK session $SESSION ($SESSION_NOTE)"
+    else
+        log "starting claude in a new window of tmux -L $SOCK session $SESSION ($SESSION_NOTE); its other windows stay"
+    fi
+    started="$(date +%s)"
+    # tmux runs a command given as several words directly, with no shell: env
+    # sets the two names for claude alone and execs it, so the pane's pid is
+    # claude's. tmux prints the new pane's id and pid (-P -F). A new window
+    # opens behind the one the operator is on (-d).
+    if [ "$how" = server ]; then
+        out="$("${TMUX_CMD[@]}" new-session -d -P -F '#{pane_id} #{pane_pid}' -s "$SESSION" -c "$HOME_DIR" -x 220 -y 50 \
+            env "${pane_env[@]}" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}")"
+    else
+        out="$("${TMUX_CMD[@]}" new-window -d -P -F '#{pane_id} #{pane_pid}' -t "=$SESSION:" -c "$HOME_DIR" \
+            env "${pane_env[@]}" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}")"
+    fi
+    # shellcheck disable=SC2181  # the status of the command substitution above
+    if [ $? != 0 ]; then
+        fresh_back
+        if [ "$how" = server ]; then log "tmux new-session failed"; else log "tmux new-window failed"; fi
+        return 1
+    fi
+    # Claude Code runs its first hook well after this: it has its settings,
+    # plugins and MCP servers to load first.
+    out="$(printf '%s\n' "$out" | head -n 1)"
+    if [[ $out =~ ^(%[0-9]+)\ ([0-9]+)$ ]]; then
+        CLAUDE_PANE="${BASH_REMATCH[1]}" CLAUDE_PID="${BASH_REMATCH[2]}"
+        CLAUDE_START="$(proc_start "$CLAUDE_PID")"
+    elif [[ $out =~ ^(%[0-9]+) ]]; then
+        CLAUDE_PANE="${BASH_REMATCH[1]}"
+    fi
+    if [ -z "$CLAUDE_PANE" ] || ! state_write pane-id "$CLAUDE_PANE"; then
+        CLAUDE_PANE=""
+        log "could not note claude's pane in tmux session $SESSION; until the next start the watchdog watches the whole session, as if claude were its only window"
+    fi
+    if [ -z "$CLAUDE_PID" ]; then
+        log "could not read the pid of claude in tmux session $SESSION; the session-id and turn-state hooks stay off until the next start"
+    elif ! state_write pane-pid "$CLAUDE_PID"; then
+        log "could not write $STATE/pane-pid; the session-id and turn-state hooks stay off until the next start"
+    fi
+    return 0
+}
+
+# Claude's pane, from the session's list of panes: alive, dead (claude ended,
+# and tmux's remain-on-exit keeps the pane), gone, or unknown when tmux does
+# not answer (the session's own end is seen by has-session).
+pane_state() {   # pane id
+    local out dead
+    out="$("${TMUX_CMD[@]}" list-panes -s -t "=$SESSION" -F '#{pane_id} #{pane_dead}' 2>/dev/null)" || { echo unknown; return; }
+    dead="$(printf '%s\n' "$out" | awk -v id="$1" '$1 == id { print $2; exit }')"
+    case "$dead" in
+        0)  echo alive ;;
+        '') echo gone ;;
+        *)  echo dead ;;
+    esac
+}
+
+# A process's state and start time, "<state> <start>", from its stat file
+# (fields 3 and 22, read after its name, which may hold spaces); status 1 when
+# there is none (it is gone, or there is no /proc).
+proc_info() {   # pid
+    local line fld=()
+    [ -r "$PROC_DIR/$1/stat" ] || return 1
+    read -r line <"$PROC_DIR/$1/stat" 2>/dev/null || [ -n "$line" ] || return 1
+    read -r -a fld <<<"${line##*) }"
+    printf '%s %s\n' "${fld[0]:-}" "${fld[19]:-}"
+}
+proc_start() { local i; i="$(proc_info "$1")" || return 0; printf '%s' "${i#* }"; }
+
+# Whether <pid> is gone or is still the claude started at <start>, in any
+# state: a zombie keeps its start time, so a pid given out again, even to a
+# process that made its own session and died, never passes.
+lead_is_claude() {   # pid start
+    local lead
+    lead="$(proc_info "$1")" || return 0
+    [ "${lead#* }" = "$2" ]
+}
+# What is left of the claude that ran as <pid>, started at <start>: every
+# live process whose session or process group is <pid> (claude leads both in
+# its pane, and its tool commands stay in them), as "<pid> <start>" lines.
+# The kernel never gives out a pid still in use as a session or group id, so
+# when <pid> runs again as another process (another start time), the old
+# session is empty: nothing is left. A zombie is not left.
+claude_left() {   # pid start
+    local pid="$1" start="$2" f line p fld=() out=""
+    lead_is_claude "$pid" "$start" || return 0
+    for f in "$PROC_DIR"/[0-9]*/stat; do
+        read -r line <"$f" 2>/dev/null || continue
+        # state ppid pgrp session ...: the start time is the 20th
+        read -r -a fld <<<"${line##*) }"
+        case "${fld[0]:-}" in Z | X) continue ;; esac
+        [ "${fld[2]:-}" = "$pid" ] || [ "${fld[3]:-}" = "$pid" ] || continue
+        p="${f%/stat}"
+        out="$out${p##*/} ${fld[19]:-}
+"
+    done
+    # The leader once more: a pid given out again during the scan drops it.
+    lead_is_claude "$pid" "$start" || return 0
+    printf '%s' "$out"
+}
+
+# Ends what is left of a claude whose pane is gone, so two never answer at
+# once: it waits STOP_SECONDS for it to end on tmux's hangup, then sends TERM,
+# then KILL, each to a process only while its start time is still the one
+# listed. Status 1 when something may still run: then start hands over to
+# systemd, whose stop (KillMode=control-group) ends the whole service. A
+# child that called setsid itself left claude's session and group, and only
+# that hand-over at a later stop catches it. With no start time noted (no
+# /proc), nothing is signalled: a live pid, or a live process of its group,
+# is handed over; so is a claude whose pid was never read.
+stop_claude() {   # pid start
+    local pid="$1" start="$2" left sig i n p ps
+    if [ -z "$pid" ]; then
+        log "claude's pid was never read, so what is left of it cannot be checked"
+        return 1
+    fi
+    if [ -z "$start" ]; then
+        # The pid, or a live process of its group (a gone leader's children).
+        kill -0 "$pid" 2>/dev/null || kill -0 -- -"$pid" 2>/dev/null || return 0
+        log "claude's pid $pid is in use and its start time unknown; nothing is signalled"
+        return 1
+    fi
+    for sig in "" TERM KILL; do
+        if [ -n "$sig" ]; then
+            n="$(printf '%s\n' "$left" | grep -c .)"
+            log "claude ($pid) or what it started still runs after its pane closed ($n process(es)); sending $sig"
+            while read -r p ps; do
+                if [ -n "$p" ] && [ "$(proc_start "$p")" = "$ps" ]; then kill -s "$sig" "$p" 2>/dev/null; fi
+            done <<<"$left"
+        fi
+        i=0
+        while left="$(claude_left "$pid" "$start")"; [ -n "$left" ] && [ "$i" -lt $((STOP_SECONDS * 2)) ]; do
+            sleep 0.5; i=$((i + 1))
+        done
+        [ -n "$left" ] || return 0
+    done
+    log "$(printf '%s\n' "$left" | grep -c .) process(es) of the ended claude still run after KILL"
+    return 1
+}
+
+# How long claude ran (ran), up to ENDED_AT (when its end was seen), and,
+# when that was 90 seconds or less, one more quick exit in quick-exits.
+ENDED_AT=""
+count_exit() {
+    local n=0
+    ran=$(( ${ENDED_AT:-$(date +%s)} - started ))
+    [ "$ran" -le 90 ] || return 0
+    if [ -s "$STATE/quick-exits" ]; then n="$(tr -cd '0-9' <"$STATE/quick-exits")"; fi
+    n=$(( ${n:-0} + 1 ))
+    printf '%s\n' "$n" >"$STATE/quick-exits"
+}
+quick_exits() {
+    local n=0
+    if [ -s "$STATE/quick-exits" ]; then n="$(tr -cd '0-9' <"$STATE/quick-exits")"; fi
+    printf '%s' "${n:-0}"
+}
+
+# ---------------------------------------------------------------- Remote Control
+
+# See Remote Control at the top. RC_PHASE: wait (a new claude, not yet up),
+# backoff (down, a retry ahead), up, failed (gave up) or off (not watched).
+# A whole number, read in base 10 (08 is 8, not an octal error), else the
+# default; at most 9 digits.
+num_setting() {   # value default
+    case "$1" in
+        '' | *[!0-9]*) printf '%s' "$2" ;;
+        *) if [ "${#1}" -gt 9 ]; then printf '%s' "$2"; else printf '%s' "$((10#$1))"; fi ;;
+    esac
+}
+RC_MODE="${GP_REMOTE_CONTROL:-auto}"
+case "$RC_MODE" in on | off | auto) ;; *) log "GP_REMOTE_CONTROL=$RC_MODE is not on, off or auto; reading it as auto"; RC_MODE=auto ;; esac
+RC_WAIT="$(num_setting "${GP_RC_WAIT:-}" 60)"
+RC_BACKOFF="$(num_setting "${GP_RC_BACKOFF:-}" 120)"
+RC_TRIES="$(num_setting "${GP_RC_TRIES:-}" 3)"
+[ "$RC_TRIES" -ge 1 ] || RC_TRIES=1
+[ "$RC_TRIES" -le 16 ] || RC_TRIES=16
+RC_TRY=1 RC_PHASE=off RC_RETRY_AT=0 RC_RESTART=0 RC_BUSY_SAID=0 RC_SINCE=0 RC_WAITED=0
+FRESH_QUIET="$(num_setting "${GP_FRESH_QUIET:-}" 60)"
+
+rc_state() {   # state reason
+    state_write remote-control "$1 $RC_TRY/$RC_TRIES $(date -u +%Y-%m-%dT%H:%M:%SZ) $2" ||
+        log "could not write $STATE/remote-control"
+}
+# Up: claude's session file names a Remote Control (bridge) session.
+# With claude's start time known, the file's procStart must be it.
+rc_up() {
+    local f
+    [ -n "$CLAUDE_PID" ] || return 1
+    f="$HOME/.claude/sessions/$CLAUDE_PID.json"
+    grep -qE '"bridgeSessionId"[[:space:]]*:[[:space:]]*"[^"]+"' "$f" 2>/dev/null || return 1
+    [ -z "$CLAUDE_START" ] || grep -qE "\"procStart\"[[:space:]]*:[[:space:]]*\"?$CLAUDE_START\"?[[:space:]]*[,}]" "$f" 2>/dev/null
+}
+# Whether claude runs with Remote Control: GP_REMOTE_CONTROL, else its flag on
+# claude's own command line (a wrapper that execs claude passes it there).
+rc_wanted() {
+    case "$RC_MODE" in on) return 0 ;; off) return 1 ;; esac
+    [ -n "$CLAUDE_PID" ] && [ -r "$PROC_DIR/$CLAUDE_PID/cmdline" ] || return 1
+    local a
+    while IFS= read -r -d '' a; do
+        case "$a" in --remote-control | --remote-control=* | --rc | --rc=*) return 0 ;; esac
+    done <"$PROC_DIR/$CLAUDE_PID/cmdline"
+    return 1
+}
+# A tmux client attached to the session: a person may be at it.
+rc_attached() {
+    [ -n "$("${TMUX_CMD[@]}" list-clients -t "=$SESSION" -F '#{client_name}' 2>/dev/null)" ]
+}
+# After each start of claude.
+rc_launched() {
+    RC_RESTART=0 RC_BUSY_SAID=0
+    if [ "$RC_MODE" = off ]; then RC_PHASE=off; rc_state off "GP_REMOTE_CONTROL=off"; return; fi
+    RC_PHASE=wait RC_SINCE="${started:-$(date +%s)}"
+    rc_state checking "claude started; waiting up to ${RC_WAIT}s for Remote Control"
+}
+rc_down() {   # why
+    local wait
+    if [ -z "$CLAUDE_PANE" ]; then
+        RC_PHASE=failed
+        rc_state failed "$1; claude's pane is unknown, so it is not restarted"
+        log "FAIL: Remote Control is down ($1); claude's pane is unknown, so it is not restarted. Run /remote-control in the session, or restart the service"
+    elif [ "$RC_TRY" -lt "$RC_TRIES" ]; then
+        wait=$(( RC_BACKOFF * (1 << (RC_TRY - 1)) ))
+        RC_PHASE=backoff RC_RETRY_AT=$(( $(date +%s) + wait ))
+        RC_WAITED="$wait"
+        rc_state retrying "$1; claude restarts in ${wait}s, once idle"
+        log "Remote Control is down ($1), try $RC_TRY of $RC_TRIES; claude restarts, resumed, in ${wait}s, once the instance is idle"
+    else
+        RC_PHASE=failed
+        rc_state failed "$1; gave up after $RC_TRIES tries"
+        log "FAIL: Remote Control is down ($1) after $RC_TRIES tries; claude keeps running without it. Run /remote-control in the session, or restart the service"
+    fi
+}
+# Once a watch tick. Sets RC_RESTART and ends claude's pane for a retry.
+rc_tick() {
+    local now
+    case "$RC_PHASE" in off) return 0 ;; esac
+    now="$(date +%s)"
+    # A restart asked for, and claude's pane still alive on this look: it did
+    # not take; back to waiting for the next try, the try not counted. A pane
+    # tmux cannot tell about (the session going) is left to the loop.
+    if [ "$RC_RESTART" = 1 ]; then
+        [ "$(pane_state "$CLAUDE_PANE")" = alive ] || return 0
+        RC_RESTART=0 RC_TRY=$(( RC_TRY - 1 )) RC_PHASE=backoff RC_RETRY_AT=$(( now + RC_WAITED ))
+        rc_state retrying "claude's pane was still there after the restart; it tries again in ${RC_WAITED}s, once idle"
+        log "claude's pane was still there after the Remote Control restart; trying again in ${RC_WAITED}s"
+        return 0
+    fi
+    if rc_up; then
+        if [ "$RC_PHASE" != up ]; then
+            RC_PHASE=up
+            rc_state up "bridge session seen"
+            log "Remote Control is up (try $RC_TRY of $RC_TRIES)"
+        fi
+        return 0
+    fi
+    case "$RC_PHASE" in
+        up)
+            # It dropped after it was up. Claude Code reconnects by itself, so
+            # a drop is only reported, never retried.
+            RC_PHASE=dropped RC_SINCE="$now"
+            rc_state checking "the bridge session went away; waiting up to ${RC_WAIT}s"
+            ;;
+        dropped)
+            if [ $(( now - RC_SINCE )) -ge "$RC_WAIT" ]; then
+                RC_PHASE=down
+                rc_state down "the bridge session went away and is not back after ${RC_WAIT}s; Claude Code reconnects by itself, so claude is not restarted"
+                log "Remote Control dropped and is not back after ${RC_WAIT}s; claude is not restarted (Claude Code reconnects by itself, or run /remote-control in the session)"
+            fi
+            ;;
+        wait)
+            if [ $(( now - RC_SINCE )) -ge "$RC_WAIT" ]; then
+                if rc_wanted; then rc_down "no Remote Control session after ${RC_WAIT}s"
+                else RC_PHASE=off; rc_state off "claude runs without --remote-control"; fi
+            fi
+            ;;
+        backoff)
+            [ "$now" -ge "$RC_RETRY_AT" ] || return 0
+            # Busy is instance_idle's status, not whether it gave a reason.
+            local busy=1
+            if rc_attached; then BUSY_WHY="a tmux client is attached to the session"
+            elif ! instance_idle; then BUSY_WHY="${BUSY_WHY:-no reason given}"
+            else busy=0 BUSY_WHY=""
+            fi
+            if [ "$busy" = 1 ]; then
+                if [ "$RC_BUSY_SAID" = 0 ]; then log "the Remote Control retry waits: the instance is busy ($BUSY_WHY)"; RC_BUSY_SAID=1; fi
+                return 0
+            fi
+            RC_TRY=$(( RC_TRY + 1 )) RC_RESTART=1 RC_BUSY_SAID=0
+            log "restarting claude for Remote Control, try $RC_TRY of $RC_TRIES"
+            "${TMUX_CMD[@]}" kill-pane -t "$CLAUDE_PANE" 2>/dev/null || true
+            ;;
+    esac
+    return 0
+}
+
+launch server || exit 1
+rc_launched
+while :; do
+    # The session, and claude's pane in it: the pane can end while other
+    # windows keep the session alive.
+    ended=session ENDED_AT=""
+    while "${TMUX_CMD[@]}" has-session -t "=$SESSION" 2>/dev/null; do
+        if [ -n "$CLAUDE_PANE" ]; then
+            case "$(pane_state "$CLAUDE_PANE")" in
+                gone) ended=pane; break ;;
+                # Closing claude's dead pane can end the session (when it
+                # was the only window): then the session's path below.
+                dead) "${TMUX_CMD[@]}" kill-pane -t "$CLAUDE_PANE" 2>/dev/null || true
+                      if "${TMUX_CMD[@]}" has-session -t "=$SESSION" 2>/dev/null; then ended=pane; fi
+                      break ;;
+            esac
+        fi
+        sleep "$WATCH_SECONDS"
+        rc_tick
+        # A session that lived past 90 seconds clears the quick-exit count.
+        if [ $(( $(date +%s) - started )) -gt 90 ] && [ -e "$STATE/quick-exits" ]; then
+            rm -f "$STATE/quick-exits"
+        fi
+    done
+    if [ "$ended" = pane ]; then
+        # Claude ended in its window (/exit, a crash, or its window moved to
+        # another session) while the session goes on: claude starts again in a
+        # new window, and the other windows stay. What is left of the old one
+        # is ended first, or handed over to systemd.
+        ENDED_AT="$(date +%s)"
+        if ! stop_claude "$CLAUDE_PID" "$CLAUDE_START"; then
+            count_exit
+            log "leaving the restart to systemd, whose stop ends what is left of the old claude"
+            exit 1
+        fi
+        if [ "$FRESH_STUCK" = 0 ] && fresh_requested; then
+            log "claude's window ended with a fresh start asked for"
+            launch window || exit 1
+            rc_launched
+            continue
+        fi
+        # A Remote Control retry: not a quick exit.
+        if [ "$RC_RESTART" = 1 ]; then
+            launch window || exit 1
+            rc_launched
+            continue
+        fi
+        count_exit
+        # A third quick exit in a row goes to systemd, whose delay grows with
+        # each restart; the session's other windows go with the service then.
+        if [ "$(quick_exits)" -ge 3 ]; then
+            log "claude ended after ${ran}s, quickly for the third time in a row; leaving the restarts to systemd"
+            exit 1
+        fi
+        log "claude ended after ${ran}s; tmux session $SESSION goes on, so claude starts again in it"
+        launch window || exit 1
+        rc_launched
+        continue
+    fi
+    # Ended for a Remote Control retry (claude's pane was the session's only
+    # window): the new session at once, once what is left of the old claude
+    # has ended; not a quick exit.
+    if [ "$RC_RESTART" = 1 ]; then
+        if ! stop_claude "$CLAUDE_PID" "$CLAUDE_START"; then
+            log "leaving the restart to systemd, whose stop ends what is left of the old claude"
+            exit 1
+        fi
+        launch server || exit 1
+        rc_launched
+        continue
+    fi
+    # Ended with a fresh start asked for (start --fresh): the new session at
+    # once, not a restart by systemd, whose delay grows with each restart. Not
+    # when the file could not be deleted at the last start: each start would
+    # find it again, so systemd's restarts (and their quick-exit count) go on.
+    if [ "$FRESH_STUCK" != 0 ] || ! fresh_requested; then break; fi
+    log "the session ended with a fresh start asked for"
+    launch server || exit 1
+    rc_launched
+done
+count_exit
+log "claude ended after ${ran}s; tmux session $SESSION is gone"
+exit 1

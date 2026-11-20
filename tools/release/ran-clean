@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# ran-clean: the record that one of our own agents runs a release, for `tools/release/mark promote --ran <file>`. Run it on the
+# machine where the agent runs. It reads, and changes nothing.
+#
+#   ran-clean --container <name> [--out <file>]              an agent from the image (get.sh, the plugin): its container
+#   ran-clean --checkout <dir> --unit <name> [--out <file>]  an agent from a checkout of the repository, run by a systemd unit
+#
+# The record is one JSON object (to --out, or to standard output), "record": "gp-ran-clean/1", with the time it was taken and:
+#   install      image or checkout
+#   version      the version that runs: gp status's, or the checkout's plugin.json
+#   up_since     when the container or the unit last started; restarts, how often it was started again since it was made
+#   image        the container's image: the reference it was run from, its id, and the registry digests it is known by
+#   status       from gp status --json: state, relay, claude and the error's code (no key, no relay address)
+#   commit       the checkout's commit; changed, whether its tracked files differ from it
+#   unit         the unit's ActiveState and SubState
+# Whether that is clean, and long enough, is for mark promote to judge against the release; this prints a summary.
+# Exit 0: the record is written. Exit 2: usage, or something could not be read. Needs jq; docker, or git and systemctl.
+set -euo pipefail
+
+die() { echo "ran-clean: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; }
+
+container="" checkout="" unit="" out=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --container | --checkout | --unit | --out)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      case $1 in --container) container=$2 ;; --checkout) checkout=$2 ;; --unit) unit=$2 ;; --out) out=$2 ;; esac
+      shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+command -v jq >/dev/null 2>&1 || die "jq is not installed"
+if [ -n "$container" ]; then
+  [ -z "$checkout$unit" ] || die "give --container, or --checkout with --unit, not both"
+elif [ -n "$checkout" ]; then
+  [ -n "$unit" ] || die "--checkout needs --unit"
+else
+  usage >&2; die "give --container, or --checkout with --unit"
+fi
+iso() { [ -n "$1" ] && date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; } # an empty time is none (date takes it as midnight)
+taken=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [ -n "$container" ]; then
+  command -v docker >/dev/null 2>&1 || die "docker is not installed"
+  c=$(docker inspect "$container" 2>/dev/null | jq -e '.[0]') || die "no container $container"
+  id=$(jq -r '.Image' <<<"$c")
+  digests=$(docker image inspect "$id" --format '{{json .RepoDigests}}' 2>/dev/null) || digests='[]'
+  jq -e 'type == "array"' <<<"$digests" >/dev/null 2>&1 || digests='[]'
+  st='{}'
+  if [ "$(jq -r '.State.Running' <<<"$c")" = true ]; then
+    st=$(docker exec "$container" gp status --json 2>/dev/null) || true
+    st=$(jq -ec 'objects' <<<"$st" 2>/dev/null) || st='{}'
+  fi
+  since=$(iso "$(jq -r '.State.StartedAt' <<<"$c")") || die "cannot read when $container started"
+  record=$(jq -n --arg taken "$taken" --arg since "$since" --argjson c "$c" --argjson st "$st" --argjson digests "$digests" '{
+    record: "gp-ran-clean/1", taken_at: $taken, install: "image",
+    version: ($st.version // null), up_since: $since, running: $c.State.Running, restarts: $c.RestartCount,
+    image: {reference: $c.Config.Image, id: $c.Image, repo_digests: $digests},
+    status: {state: ($st.state // null), relay: ($st.relay // null), claude: ($st.claude // null),
+             error: (if $st.error then ($st.error.code // "error") else null end)},
+    commit: null, changed: null, unit: null}')
+else
+  command -v git >/dev/null 2>&1 || die "git is not installed"
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is not installed"
+  commit=$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null) || die "$checkout is not a checkout"
+  version=$(jq -er '.version | strings' "$checkout/.claude-plugin/plugin.json" 2>/dev/null) || die "no version in $checkout/.claude-plugin/plugin.json"
+  changed=false
+  [ -z "$(git -C "$checkout" status --porcelain --untracked-files=no)" ] || changed=true
+  show=$(systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p NRestarts -p ActiveEnterTimestamp 2>/dev/null) || die "systemctl cannot show $unit"
+  val() { sed -n "s/^$1=//p" <<<"$show"; }
+  [ "$(val LoadState)" = loaded ] || die "no unit $unit"
+  since=$(iso "$(val ActiveEnterTimestamp)") || since=""
+  restarts=$(val NRestarts)
+  [[ $restarts =~ ^[0-9]+$ ]] || restarts=null
+  record=$(jq -n --arg taken "$taken" --arg since "$since" --arg version "$version" --arg commit "$commit" --argjson changed "$changed" \
+    --arg active "$(val ActiveState)" --arg sub "$(val SubState)" --argjson restarts "$restarts" '{
+    record: "gp-ran-clean/1", taken_at: $taken, install: "checkout",
+    version: $version, up_since: (if $since == "" then null else $since end),
+    running: ($active == "active" and $sub == "running"), restarts: $restarts,
+    image: null, status: null, commit: $commit, changed: $changed, unit: {active_state: $active, sub_state: $sub}}')
+fi
+
+if [ -n "$out" ]; then printf '%s\n' "$record" >"$out"; else printf '%s\n' "$record"; fi
+jq -r '"ran-clean: \(.install) \(.version // "?"), running \(.running), up since \(.up_since // "?"), restarts \(.restarts // "?")"
+  + (if .status then ", state \(.status.state // "?"), relay \(.status.relay // "?"), claude \(.status.claude // "?"), error \(.status.error // "none")" else "" end)
+  + (if .commit then ", commit \(.commit[0:12])\(if .changed then " with changes" else "" end), unit \(.unit.active_state)/\(.unit.sub_state)" else "" end)' <<<"$record" >&2
+echo "ran-clean: then, where the release is: tools/release/mark promote v<version> --ran <this record>" >&2

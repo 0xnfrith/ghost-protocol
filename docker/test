@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# docker/test: build the image and check it, with no secrets and no relay.
+#
+# Usage: docker/test            (from the repository root; tool-tests runs it)
+#   GP_TEST_IMAGE=<ref>  check an image already built instead of building one
+#   GP_TEST_KEEP=1       keep the image and volumes it made
+#
+# It builds docker/Dockerfile from the repository root, then runs the image's
+# own commands in throwaway containers and volumes, and removes them on exit.
+set -euo pipefail
+
+ROOT="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
+run_id="gp-test-$$-$RANDOM"
+IMAGE="${GP_TEST_IMAGE:-ghost-protocol:$run_id}"
+made_image=0
+volumes=()
+containers=()
+images=()
+fails=0
+
+cleanup() {
+    local c v
+    for c in "${containers[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    if [ "${GP_TEST_KEEP:-}" != 1 ]; then
+        for c in "${images[@]}"; do docker image rm -f "$c" >/dev/null 2>&1 || true; done
+        for v in "${volumes[@]}"; do docker volume rm -f "$v" >/dev/null 2>&1 || true; done
+        [ "$made_image" = 0 ] || docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+pass() { printf 'PASS  %s\n' "$*"; }
+fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+# check <name> <command...>: passes when the command exits 0.
+check() { local n="$1"; shift; if "$@"; then pass "$n"; else fail "$n"; fi; }
+# volume <tag>: names a throwaway volume in $v and notes it for the cleanup (in
+# this shell, not a subshell, so the cleanup sees it).
+volume() { v="$run_id-$1"; volumes+=("$v"); }
+# run_in <volume> <args...>: one throwaway container of the image on that volume.
+run_in() { local v="$1"; shift; docker run --rm -i -v "$v:/data" "$IMAGE" "$@"; }
+
+# Shell scripts first: they need no image.
+if command -v shellcheck >/dev/null 2>&1; then
+    check "shellcheck docker/" shellcheck -x docker/test docker/entrypoint.sh docker/get.sh docker/gp/gp
+else
+    echo "note  shellcheck is not installed: the shell scripts were not linted"
+fi
+
+pin="$(sed -n 's/^CLAUDE_CODE_VERSION="\(.*\)"$/\1/p' install/pins.env)"
+if [ -z "${GP_TEST_IMAGE:-}" ]; then
+    echo "building $IMAGE"
+    docker build -q -f docker/Dockerfile -t "$IMAGE" . >/dev/null
+    made_image=1
+fi
+pass "the image builds"
+
+volume a
+out="$(run_in "$v" version)"
+check "version prints the image version" grep -q '^ghost-protocol image ' <<<"$out"
+out="$(run_in "$v" claude --version)"
+check "Claude Code is the pinned version ($pin)" grep -q "^$pin " <<<"$out"
+check "it runs as an unprivileged user" test "$(run_in "$v" sh -c 'id -u')" != 0
+# shellcheck disable=SC2016 # $HOME expands in the container
+check "HOME is the data volume" test "$(run_in "$v" sh -c 'printf %s "$HOME"')" = /data
+check "buzz-mcp is built" run_in "$v" test -s /opt/buzz-mcp/buzz-mcp.mjs
+check "the plugin is in the image" run_in "$v" test -f /opt/ghost-protocol/.claude-plugin/plugin.json
+check "the adapter's dependencies are installed" run_in "$v" test -d /opt/ghost-protocol/adapters/buzz/node_modules/nostr-tools
+check "the image holds no git history" run_in "$v" test ! -e /opt/ghost-protocol/.git
+check "the image holds no evals" run_in "$v" test ! -e /opt/ghost-protocol/evals
+check "the channel plugin is allowed in the managed settings" \
+    run_in "$v" python3 -c 'import json,sys; d=json.load(open("/etc/claude-code/managed-settings.json")); sys.exit(0 if d["channelsEnabled"] and {"marketplace":"ghost-protocol","plugin":"ghost-protocol"} in d["allowedChannelPlugins"] else 1)'
+
+# gp's own tests, inside the image (they use the adapter's dependencies there).
+check "gp's tests pass" run_in "$v" node --test '/opt/gp/test/*.test.mjs'
+out="$(run_in "$v" gp attest --self-test)"
+check "gp attest checks itself against the NIP-OA test vector" test "$out" = "$(printf 'GP_INTERFACE=1\nGP_SELF_TEST=passed')"
+
+# The agent under install/service/start, in a container: a made-up key and
+# token, a relay nobody answers on. start's own dry run must find it ready.
+volume b
+c="$run_id-agent"
+containers+=("$c")
+key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+docker run -d --name "$c" -v "$v:/data" -e GP_RELAY_KEY="$key" -e BUZZ_RELAY_URL=ws://127.0.0.1:9 \
+    -e BUZZ_ALLOWED_PUBKEYS="$(printf '%064d' 0 | tr 0 a)" -e CLAUDE_CODE_OAUTH_TOKEN=not-a-real-token -e GP_NAME="Test Agent" \
+    "$IMAGE" >/dev/null
+unset key
+for _ in $(seq 1 60); do
+    docker exec "$c" sh -c 'test -s /data/.local/state/ghost-protocol/agent/pane-pid' 2>/dev/null && break
+    sleep 1
+done
+check "the agent's state is running" docker exec "$c" grep -q '^running ' /data/.gp/agent-state
+out="$(docker exec -u node "$c" /opt/ghost-protocol/install/service/start --root /data/work --name agent --dry-run 2>&1)" || true
+check "start's dry run finds the instance ready" grep -q '^READY' <<<"$out"
+check "start runs claude in unattended mode with auto permissions" grep -q -- '--permission-mode  auto' <<<"$out"
+check "start gives claude the persona" grep -q 'append-system-prompt .*persona.*/data/.gp/persona.md' <<<"$out"
+check "the persona carries the agent's name" docker exec "$c" grep -q '^# Test Agent$' /data/.gp/persona.md
+# shellcheck disable=SC2016 # expands in the container
+check "the instance manifest in the volume is valid" docker exec -u node "$c" bash -c 'cd /opt/ghost-protocol && GP_DIR=$PWD && . install/lib/common.sh && . install/lib/instance.sh && manifest_load /data/work/agent/.ghost-protocol/instance.toml && manifest_check_values'
+out="$(docker exec -u node "$c" /opt/ghost-protocol/install/service/start --root /data/work --name agent --idle 2>&1)" && rc=0 || rc=$?
+check "start --idle answers idle or busy, and ends nothing" sh -c "printf '%s' '$out' | grep -Eq 'instance agent is (idle|busy)' && [ $rc -le 1 ] && docker exec '$c' test -s /data/.local/state/ghost-protocol/agent/pane-pid"
+check "the release check runs beside the agent" docker exec "$c" pgrep -f 'gp.mjs update watch'
+# No relay answers here: the profile is tried, and tried again later.
+check "the agent's profile is sent beside the agent, and tried again" sh -c "docker exec '$c' pgrep -f 'gp.mjs profile publish --retry' >/dev/null && docker exec '$c' grep -q 'gp profile: .*trying again in 15 s' /data/.gp/profile.log"
+check "gp update check with no image repository: nothing on offer" sh -c "docker exec '$c' gp update check | grep -qx 'GP_UPDATE_AVAILABLE=no'"
+# A release check for a repository that is not one of the two release
+# repositories (a fake registry in the container, on 127.0.0.1): refused before
+# the registry is asked anything, and nothing goes on offer.
+reg="127.0.0.1:5999/ghost-protocol"
+# After the check, one request of the test's own shows that the registry's log works.
+# shellcheck disable=SC2016 # expands in the container
+out="$(docker exec -e GP_IMAGE_REPO="$reg" "$c" sh -c 'node /opt/gp/test/fake-registry.mjs 5999 0.0.1 99.0.0 latest >/tmp/fake-registry.log & p=$!; sleep 1; gp update check; rc=$?; node -e "fetch(\"http://127.0.0.1:5999/control\").catch(() => {})"; sleep 1; kill $p; exit $rc' 2>/dev/null)" || true
+check "gp update check for another image repository: update-check-failed" sh -c "printf '%s\n' \"\$1\" | grep -qx 'GP_ERROR=update-check-failed' && printf '%s\n' \"\$1\" | grep -q 'is not a release repository'" - "$out"
+check "gp update check for another image repository asks its registry nothing" sh -c "[ \"\$(docker exec '$c' cat /tmp/fake-registry.log)\" = 'GET /control' ]"
+out="$(docker exec "$c" gp status --json)" || true
+check "gp update check for another image repository puts nothing on offer" python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1])["update"]=={"available":False,"version":None} else 1)' "$out"
+# A release of the staging image pinned by digest, as a release check puts it
+# on offer (gp's tests check that path against the fake registry).
+want="$(docker exec "$c" node -e 'import("/opt/gp/test/fake-registry.mjs").then((m) => console.log(m.digestOf("99.0.0")))')"
+repo="ghcr.io/0xnfrith/ghost-protocol-staging"
+out="$(docker exec "$c" gp update offer 99.0.0 --image "$repo:99.0.0@$want" 2>/dev/null)" || true
+check "gp update offer takes the staging image pinned by digest" grep -qx "GP_UPDATE_AVAILABLE=yes" <<<"$out"
+out="$(docker exec "$c" gp status --json)" || true
+check "gp status --json carries the update image digest-pinned" python3 -c 'import json,sys; u=json.loads(sys.argv[1])["update"]; sys.exit(0 if u=={"available":True,"version":"99.0.0","image":sys.argv[2]+":99.0.0@"+sys.argv[3],"digest":sys.argv[3]} else 1)' "$out" "$repo" "$want"
+docker exec -u node "$c" rm -f /data/.gp/update-available.json /data/.gp/release-images.json
+# A note for the agent (here: the confirm after an update) is typed into its
+# claude once start --idle says it is idle.
+if docker exec -u node "$c" /opt/ghost-protocol/install/service/start --root /data/work --name agent --idle >/dev/null 2>&1; then
+    docker exec -u node "$c" sh -c 'printf %s "{\"action\":\"update\",\"from\":\"0.0.1\",\"to\":\"0.0.2\",\"result\":\"done\",\"told\":false,\"at\":\"2020-01-01T00:00:00Z\"}" > /data/.gp/handoff.json'
+    told=0
+    for _ in $(seq 1 60); do docker exec "$c" grep -q '"told": true' /data/.gp/handoff.json 2>/dev/null && told=1 && break; sleep 1; done
+    check "the confirm note is given to the agent once it is idle" test "$told" = 1
+    # shellcheck disable=SC2016 # expands in the container
+    check "the note is in claude's pane" sh -c "docker exec -u node '$c' sh -c 'tmux -L agent capture-pane -p -J -t \"\$(cat /data/.local/state/ghost-protocol/agent/pane-id)\" -S -200' | grep -q 'GHOST Protocol\] You were updated from version 0.0.1 to 0.0.2'"
+    docker exec -u node "$c" rm -f /data/.gp/handoff.json
+else
+    echo "note  claude in the test container is busy: the note's delivery was not checked"
+fi
+# gp update begin asks start --idle while claude runs: begun or busy, never an error.
+docker exec "$c" sh -c 'gp update poll && gp update offer 9.9.9 && gp update request' >/dev/null 2>&1
+out="$(docker exec "$c" gp update begin 2>/dev/null)" || true
+check "gp update begin runs start's idle test in the container" grep -Eqx 'GP_UPDATE=(begun|busy)' <<<"$out"
+docker exec -u node "$c" rm -f /data/.gp/update-state.json /data/.gp/update-request.json /data/.gp/update-available.json /data/.gp/updater-seen
+out="$(docker exec "$c" gp status --json)" || true
+check "gp status --json prints one JSON object with the interface's fields" python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if list(d)==["interface","version","state","agent_pubkey","relay_url","relay","claude","update","previous_version","error"] and d["interface"]==1 else 1)' "$out"
+check "gp status: claude active, relay unreachable, no tag yet: needs-auth-tag" python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if (d["claude"],d["relay"],d["state"])==("active","unreachable","needs-auth-tag") else 1)' "$out"
+check "the key is not in the container's logs" sh -c "! docker logs '$c' 2>&1 | grep -q '[0-9a-f]\{64\}'"
+docker rm -f "$c" >/dev/null
+# Polled, not a fixed wait: under arm64 emulation this start takes about 35 s.
+started=0
+if docker run -d --name "$c" -v "$v:/data" "$IMAGE" >/dev/null; then
+    for _ in $(seq 1 60); do docker logs "$c" 2>&1 | grep -q 'start: starting claude' && started=1 && break; sleep 2; done
+fi
+check "a new container on the same volume starts from the volume alone" test "$started" = 1
+docker rm -f "$c" >/dev/null
+
+# With no Claude sign-in the agent waits, and says so.
+volume c
+docker run -d --name "$c" -v "$v:/data" -e GP_RELAY_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+    -e BUZZ_RELAY_URL=ws://127.0.0.1:9 -e BUZZ_ALLOWED_PUBKEYS="$(printf '%064d' 0 | tr 0 a)" "$IMAGE" >/dev/null
+for _ in $(seq 1 30); do docker exec "$c" grep -q '^needs-claude ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+check "with no Claude sign-in the agent waits (needs-claude)" docker exec "$c" grep -q '^needs-claude ' /data/.gp/agent-state
+check "gp status says needs-auth-tag first (no tag, no sign-in)" sh -c "docker exec '$c' gp status --json | grep -q '\"state\":\"needs-auth-tag\"'"
+docker rm -f "$c" >/dev/null
+
+# The install with no terminal: get.sh, with the image already here.
+name="Get Test $run_id"
+slug="$(docker run --rm "$IMAGE" gp slug "$name" | sed -n 's/^GP_SLUG=//p')"
+containers+=("gp-$slug" "gp-$slug.updater"); volumes+=("gp-$slug-data")
+owner_key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+owner="$(printf '%s\n' "$owner_key" | docker run --rm -i "$IMAGE" gp attest "$(printf '%064d' 0 | tr 0 c)" | sed -n 's/^GP_OWNER_PUBKEY=//p')"
+out="$(GP_IMAGE="$IMAGE" GP_NO_PULL=1 sh docker/get.sh --name "$name" --relay ws://127.0.0.1:9 --owner "$owner" 2>/dev/null)" || true
+check "get.sh prints the agent's public key as one line" grep -qx 'GP_AGENT_PUBKEY=[0-9a-f]\{64\}' <<<"$out"
+check "get.sh leaves the agent's container running" test "$(docker inspect -f '{{.State.Running}}' "gp-$slug" 2>/dev/null)" = true
+sleep 3
+check "the printed key is the agent's" sh -c "docker exec 'gp-$slug' gp status --json | grep -q '\"agent_pubkey\":\"${out#GP_AGENT_PUBKEY=}\"'"
+out2="$(GP_IMAGE="$IMAGE" GP_NO_PULL=1 sh docker/get.sh --name "$name" --relay ws://127.0.0.1:9 --owner "$owner" 2>/dev/null)" || true
+check "get.sh again keeps the key" test "$out2" = "$out"
+check "get.sh with no terminal and no --updater starts no helper" sh -c "! docker inspect 'gp-$slug.updater' >/dev/null 2>&1"
+out2="$(GP_IMAGE="$IMAGE" GP_NO_PULL=1 sh docker/get.sh --name "$name" --relay ws://127.0.0.1:9 --owner "$owner" --updater yes 2>/dev/null)" || true
+check "get.sh --updater yes starts the update helper beside the agent" test "$(docker inspect -f '{{.State.Running}} {{index .Config.Cmd 0}}' "gp-$slug.updater" 2>/dev/null)" = "true updater"
+out2="$(GP_IMAGE="$IMAGE" GP_NO_PULL=1 sh docker/get.sh --name "$name" --relay ws://127.0.0.1:9 --owner "$owner" 2>/dev/null)" || true
+check "get.sh again keeps the helper an earlier install chose" test "$(docker inspect -f '{{.State.Running}}' "gp-$slug.updater" 2>/dev/null)" = true
+check "get.sh still prints only the key" test "$out2" = "$out"
+check "get.sh refuses a missing setting" sh -c "! GP_IMAGE='$IMAGE' GP_NO_PULL=1 sh docker/get.sh --name x >/dev/null 2>&1"
+
+# After start, with no terminal: the owner's tag and the Claude sign-in.
+agent="${out#GP_AGENT_PUBKEY=}"
+tag="$(printf '%s\n' "$owner_key" | docker run --rm -i "$IMAGE" gp attest "$agent" --expires-in 1h | sed -n 's/^GP_AUTH_TAG=//p')"
+unset owner_key
+out="$(printf '%s\n' "$tag" | docker exec -i "gp-$slug" gp auth-tag set 2>/dev/null)" || true
+check "gp auth-tag set takes the owner's tag" grep -qx 'GP_AUTH_TAG=accepted' <<<"$out"
+check "gp auth-tag set reports the relay (unreachable here)" grep -qx 'GP_RELAY=unreachable' <<<"$out"
+out="$(printf '["auth","%s","","%0128d"]\n' "$owner" 0 | docker exec -i "gp-$slug" gp auth-tag set 2>/dev/null)" || true
+check "gp auth-tag set refuses a tag that does not verify" grep -qx 'GP_ERROR=bad-auth-tag' <<<"$out"
+check "gp claude status: not-active" test "$(docker exec "gp-$slug" gp claude status)" = "$(printf 'GP_INTERFACE=1\nGP_CLAUDE=not-active')"
+out="$(printf 'not a token\n' | docker exec -i "gp-$slug" gp claude token 2>/dev/null)" || true
+check "gp claude token refuses what is not a token" grep -qx 'GP_ERROR=claude-token-invalid' <<<"$out"
+# A token of the right shape is tried with one claude -p, which must not load
+# the plugin: its channel would log in to the relay without the owner's tag.
+out="$(printf 'sk-ant-oat01-%s\n' "$(printf '%040d' 0)" | docker exec -i "gp-$slug" gp claude token 2>/dev/null)" || true
+check "gp claude token refuses a token Claude does not take" grep -qx 'GP_ERROR=claude-token-invalid' <<<"$out"
+check "the token's trial starts no channel" docker exec "gp-$slug" sh -c '! grep -qs "buzz-channel: started" /data/.gp/buzz/channel.log'
+out="$(sleep 15 | docker exec -i "gp-$slug" gp claude login 2>/dev/null)" || true
+check "gp claude login prints the sign-in address on a pipe" grep -q '^GP_CLAUDE_LOGIN_URL=https://' <<<"$out"
+check "gp claude login with no code fails cleanly" grep -qx 'GP_ERROR=claude-login-failed' <<<"$out"
+check "the state is still needs-claude" sh -c "docker exec 'gp-$slug' gp status --json | grep -q '\"state\":\"needs-claude\"'"
+
+# --- The update helper: an update, the way back, and a version that fails its
+# check, on two tags made from the image (no registry: a pull that fails goes
+# on with the copy already here).
+repo="$run_id/ghost-protocol"
+# tag_as <version> [<extra Dockerfile line>]: the image as $repo:<version>,
+# for the image's own platform (an arm64 image checked on an amd64 machine).
+platform="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$IMAGE")"
+tag_as() {
+    images+=("$repo:$1")
+    printf 'FROM %s\nRUN echo %s > /etc/gp-image-version\nENV GP_IMAGE_VERSION=%s\n%s\n' "$IMAGE" "$1" "$1" "${2:-}" \
+        | docker build -q --platform "$platform" -t "$repo:$1" - >/dev/null
+}
+tag_as 1.0.0
+tag_as 1.1.0
+# 1.2.0 cannot answer gp status: the helper must go back.
+tag_as 1.2.0 'RUN rm /opt/gp/status.mjs'
+volume upd
+a="$run_id-upd"
+containers+=("$a" "$a.updater")
+docker run --rm -v "$v:/data" "$repo:1.0.0" init --name "Update Test" --relay ws://127.0.0.1:9 --owner "$owner" >/dev/null
+docker run -d --name "$a" --restart unless-stopped -v "$v:/data" "$repo:1.0.0" >/dev/null
+# status_field <field>: one field of gp status --json in the agent's container.
+status_field() { docker exec "$a" gp status --json 2>/dev/null | python3 -c 'import json,sys; v=json.load(sys.stdin); [v:=v[k] for k in sys.argv[1].split(".")]; print(json.dumps(v))' "$1" 2>/dev/null; }
+# wait_for <field> <json value> <seconds>
+wait_for() { local _; for _ in $(seq 1 "$3"); do [ "$(status_field "$1")" = "$2" ] && return 0; sleep 1; done; return 1; }
+out="$(docker exec "$a" gp update request 2>/dev/null)" || true
+check "with no helper, gp update request is no-updater" grep -qx 'GP_ERROR=no-updater' <<<"$out"
+out="$(docker exec "$a" gp update rollback 2>/dev/null)" || true
+check "with no helper, gp update rollback is no-updater" grep -qx 'GP_ERROR=no-updater' <<<"$out"
+docker run -d --name "$a.updater" --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock "$repo:1.0.0" updater --target "$a" --poll 2 >/dev/null
+for _ in $(seq 1 30); do docker exec "$a" test -s /data/.gp/updater-seen 2>/dev/null && break; sleep 1; done
+out="$(docker exec "$a" gp update request 2>/dev/null)" || true
+check "with the helper and nothing newer: no-update-available" grep -qx 'GP_ERROR=no-update-available' <<<"$out"
+# A digest stands in for the release manifest's, and the public repository for
+# the one a release check reads: only the two release repositories are put on
+# offer. The helper pulls the agent's own repository and the tag, not this pin.
+pin="ghcr.io/0xnfrith/ghost-protocol:1.1.0@$(docker image inspect --format '{{.Id}}' "$repo:1.1.0")"
+offered="{\"available\": true, \"version\": \"1.1.0\", \"image\": \"$pin\", \"digest\": \"${pin##*@}\"}"
+docker exec "$a" gp update offer 1.1.0 --image "$pin" >/dev/null
+check "gp status shows the update on offer, pinned by digest" test "$(status_field update)" = "$offered"
+out="$(docker exec "$a" gp update request 2>/dev/null)" || true
+check "gp update request: requested" grep -qx 'GP_UPDATE=requested' <<<"$out"
+out="$(docker exec "$a" gp update request 2>/dev/null)" || true
+check "a second request: update-in-progress" grep -qx 'GP_ERROR=update-in-progress' <<<"$out"
+check "the helper swaps the agent onto 1.1.0" wait_for version '"1.1.0"' 180
+check "after the update: running state kept, previous_version 1.0.0" test "$(status_field previous_version)" = '"1.0.0"'
+check "after the update: nothing on offer" test "$(status_field update)" = '{"available": false, "version": null}'
+check "the agent keeps its volume and key" test "$(docker inspect --format '{{range .Mounts}}{{.Name}}{{end}}' "$a")" = "$v"
+check "the agent keeps its restart policy" test "$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$a")" = unless-stopped
+moved=0
+for _ in $(seq 1 60); do [ "$(docker inspect --format '{{.Config.Image}}' "$a.updater" 2>/dev/null)" = "$repo:1.1.0" ] && moved=1 && break; sleep 1; done
+check "the helper moves itself onto the agent's tag" test "$moved" = 1
+for _ in $(seq 1 30); do docker exec "$a" find /data/.gp/updater-seen -newermt '-5 seconds' 2>/dev/null | grep -q . && break; sleep 1; done
+out="$(docker exec "$a" gp update rollback 2>/dev/null)" || true
+check "gp update rollback: rollback-requested" grep -qx 'GP_UPDATE=rollback-requested' <<<"$out"
+check "the way back: the agent runs 1.0.0 again" wait_for version '"1.0.0"' 180
+check "after the way back: previous_version null, 1.1.0 on offer, pinned as before" test "$(status_field previous_version) $(status_field update)" = "null $offered"
+for _ in $(seq 1 60); do docker exec "$a" find /data/.gp/updater-seen -newermt '-5 seconds' 2>/dev/null | grep -q . && break; sleep 1; done
+docker exec "$a" gp update offer 1.2.0 >/dev/null
+docker exec "$a" gp update request >/dev/null 2>&1 || true
+# The helper waits 2 minutes for gp status in the new container, then goes back.
+done_failed=0
+for _ in $(seq 1 150); do docker exec "$a" grep -q '"result": "failed"' /data/.gp/handoff.json 2>/dev/null && done_failed=1 && break; sleep 2; done
+check "a version that fails its check: the handoff note says the update failed" test "$done_failed" = 1
+check "and the helper went back to 1.0.0" wait_for version '"1.0.0"' 30
+check "after the failed update gp status says update-failed" test "$(status_field state) $(status_field error.code)" = '"error" "update-failed"'
+
+if command -v pwsh >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # PowerShell's own variables
+    check "get.ps1 parses" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path docker/get.ps1), [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
+else
+    echo "note  pwsh is not installed: get.ps1 was not parsed"
+fi
+
+if [ "$fails" -gt 0 ]; then
+    echo "docker/test: $fails check(s) failed"
+    exit 1
+fi
+echo "docker/test: all checks passed"

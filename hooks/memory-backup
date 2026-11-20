@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# memory-backup: a Claude Code PostToolUse hook (Write, Edit, MultiEdit and
+# NotebookEdit). Right after a session writes a file inside a memory folder
+# that an installed memory backup watches, it writes the time into that
+# backup's trigger file. The backup's root-owned path unit
+# (<name>-memory-backup.path) sees the change and starts a backup, which runs
+# in its own sandbox, one at a time (install/memory-backup/). A hook cannot
+# start a system unit itself, and the trigger can only start the backup that
+# is already installed, so the hook needs no trust in the session.
+#
+# Which folders: the ones the root-owned settings files of installed backups
+# name, /usr/local/lib/ghost-protocol/<name>/memory-backup/settings (FOLDER=
+# and STATE=). A settings file that is a symlink, or not owned by root, is
+# ignored. The session's manifest plays no part: a write into a watched folder
+# counts from any session and any subagent. The written file's folder is
+# compared as a real path, so a path through .. or a symlink counts where it
+# lands.
+#
+# The hook is the instant path. A write that never passes through a tool call
+# (Claude Code's own background memory work, say) is the backup timer's, every
+# 15 minutes.
+#
+# It prints nothing and always exits 0. Any parse failure, a missing jq, or
+# empty input does nothing. The plugin option memory_backup switches it off.
+#
+# Test: install/test/memory-backup.test.sh
+set -uo pipefail
+MB_LIBDIR=/usr/local/lib/ghost-protocol
+MB_OWNER=0
+HOOKS_DIR="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 0
+# shellcheck source=lib/hook.sh
+. "$HOOKS_DIR/lib/hook.sh" || exit 0
+hook_on memory_backup || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+input=$(cat)
+[ -n "$input" ] || exit 0
+file=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || exit 0
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null) || exit 0
+[ -n "$file" ] || exit 0
+case "$file" in
+  /*) ;;
+  *) [ -n "$cwd" ] || exit 0; file="$cwd/$file" ;;
+esac
+dir=$(phys "$(dirname -- "$file")")
+[ -d "$dir" ] || exit 0
+
+for settings in "$MB_LIBDIR"/*/memory-backup/settings; do
+  { [ -f "$settings" ] && [ ! -L "$settings" ]; } || continue
+  owner=$(stat -c %u "$settings" 2>/dev/null || stat -f %u "$settings" 2>/dev/null || echo x)
+  [ "$owner" = "$MB_OWNER" ] || continue
+  folder=$(sed -n 's/^FOLDER=//p' "$settings" | head -n 1)
+  state=$(sed -n 's/^STATE=//p' "$settings" | head -n 1)
+  case "$folder" in /?*) ;; *) continue ;; esac
+  case "$state" in /?*) ;; *) continue ;; esac
+  case "$dir/" in "$folder"/*) ;; *) continue ;; esac # guard:inside
+  # The backup's own state folder: there, not a symlink, and this user's.
+  { [ -d "$state" ] && [ ! -L "$state" ] && [ -O "$state" ]; } || continue
+  trigger="$state/trigger"
+  [ ! -L "$trigger" ] || continue
+  date +%s >"$trigger" 2>/dev/null || true
+done
+exit 0

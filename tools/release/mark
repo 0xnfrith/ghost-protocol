@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# mark: promotes a release, or withdraws a bad one and moves the "latest" release back. A dry run unless --apply is given.
+#
+#   mark promote  <tag> --ran <record> [--min-up <minutes>] [--apply] [--repo <owner/name>]
+#   mark withdraw <tag> --reason <words> [--apply] [--repo <owner/name>]
+#
+# A release is made as a pre-release (tools/release/ci/run), and stays one until one of our own agents has run it cleanly.
+# `promote` is the hand step taken then. It refuses without the record of that run, made by tools/release/ran-clean on the
+# agent's machine, and judges it against the release:
+#   - the agent runs this release: the record's version is the tag's; an agent from the image runs the image the release's
+#     get.sh pins (its digest), and one from a checkout runs the tag's commit with no tracked file changed;
+#   - cleanly: it is running and was never started again (restarts 0); from the image, gp status says running, relay
+#     connected, Claude active and no error; from a checkout, its unit is active and running;
+#   - long enough: up for --min-up minutes (60 by default) when the record was taken.
+# Then it clears the pre-release mark, makes the release the "latest" one when it is the highest full release, and puts at the
+# top of its notes when it was promoted. The release workflow then adds the image's plain version tag (tools/release/ci/promote),
+# which is when every install's release check offers it. `withdraw`
+# marks a release bad: it sets the pre-release mark again (GitHub never offers a pre-release as the latest), puts a line
+# "WITHDRAWN: <reason>" at the top of its notes, and makes the highest remaining full release the latest, so that the address
+# releases/latest/download/get.sh goes back to a good release at once. Nothing is deleted: no tag, no release, no image, and nothing
+# is pushed to git. A withdrawn release's image stays where it is, under its own version.
+#
+# <owner/name> comes from the origin remote's address unless --repo is given. GitHub is read and written with gh (GH_HOST, GH_TOKEN
+# as gh takes them). Needs gh and jq. Exit 0: done (or, in a dry run, the plan holds). Exit 2: refused, with the reason.
+set -euo pipefail
+
+die() { echo "mark: $*" >&2; exit 2; }
+
+[ $# -ge 1 ] || die "usage: mark promote <tag> --ran <record> | withdraw <tag> --reason <words>, [--apply] [--repo <owner/name>]"
+action=$1
+shift
+case $action in promote | withdraw) ;; -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;; *) die "the action is promote or withdraw" ;; esac
+tag="" reason="" repo="" apply=false ran="" min_up=60
+while [ $# -gt 0 ]; do
+  case $1 in
+    --apply) apply=true; shift ;;
+    --reason) [ $# -ge 2 ] || die "--reason needs a value"; reason=$2; shift 2 ;;
+    --repo) [ $# -ge 2 ] || die "--repo needs a value"; repo=$2; shift 2 ;;
+    --ran) [ $# -ge 2 ] || die "--ran needs a value"; ran=$2; shift 2 ;;
+    --min-up) [ $# -ge 2 ] || die "--min-up needs a value"; min_up=$2; shift 2 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$tag" ] || die "one tag only"; tag=$1; shift ;;
+  esac
+done
+for tool in gh jq; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"; done
+semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'
+[[ $tag =~ ^v$semver$ ]] || die "the tag '$tag' is not v<x.y.z> or v<x.y.z>-<pre-release>"
+if [ "$action" = promote ]; then
+  [ -n "$ran" ] || die "promote needs --ran <record>: a release is promoted only once one of our own agents has run it cleanly (tools/release/ran-clean)"
+  [ -f "$ran" ] || die "no record $ran"
+  [[ $min_up =~ ^[0-9]+$ ]] || die "--min-up is a whole number of minutes"
+fi
+if [ "$action" = withdraw ]; then
+  [ -n "$reason" ] || die "withdraw needs --reason"
+  [[ $reason != *$'\n'* && ${#reason} -le 300 ]] || die "the reason is one line of 300 characters or fewer"
+fi
+if [ -z "$repo" ]; then
+  url=$(git remote get-url origin 2>/dev/null) || die "no origin remote; give --repo"
+  url=${url%/}; url=${url%.git}; repo=${url%/*}; repo=${repo##*[:/]}/${url##*/}
+fi
+[[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]] || die "cannot tell the repository (owner/name); give --repo"
+
+rel=$(gh release view "$tag" --repo "$repo" --json tagName,isPrerelease,isDraft,body 2>/dev/null) || die "no release $tag in $repo"
+[ "$(jq -r .isDraft <<<"$rel")" = false ] || die "$tag is a draft"
+body=$(jq -r .body <<<"$rel" | tr -d '\r')
+withdrawn=false
+case $body in "WITHDRAWN:"*) withdrawn=true ;; esac
+all=$(gh release list --repo "$repo" --limit 200 --json tagName,isPrerelease,isDraft) || die "cannot list the releases of $repo"
+
+# The highest full release (not a pre-release, not a draft, not withdrawn), leaving out $1 when it is given.
+# Withdrawn ones are marked as pre-releases, so a full release is never withdrawn.
+semver_key() { # v1.2.3-rc.1 -> a sortable key: pre-releases sort below their release
+  local v=${1#v} core pre
+  core=${v%%-*}
+  pre=""
+  [ "$v" = "$core" ] || pre=${v#*-}
+  IFS=. read -r a b c <<<"$core"
+  if [ -n "$pre" ]; then pre=0-$pre; else pre=1; fi
+  printf '%08d.%08d.%08d.%s\n' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$pre"
+}
+highest_full() {
+  local t best="" bestkey="" k
+  while IFS= read -r t; do
+    [ "$t" != "${1:-}" ] || continue
+    [[ $t =~ ^v$semver$ ]] || continue
+    k=$(semver_key "$t")
+    if [ -z "$best" ] || [[ $k > $bestkey ]]; then best=$t; bestkey=$k; fi
+  done < <(jq -r '.[] | select(.isPrerelease == false and .isDraft == false) | .tagName' <<<"$all")
+  printf '%s' "$best"
+}
+
+# judge_record: the record of --ran against this release; sets up (seconds). Refuses (exit 2) with every reason it finds.
+judge_record() {
+  local r why=() taken since want pinned digest commit
+  r=$(jq -ec 'objects' "$ran" 2>/dev/null) || die "the record $ran is not a JSON object"
+  [ "$(jq -r .record <<<"$r")" = gp-ran-clean/1 ] || die "the record $ran is not one ran-clean made (gp-ran-clean/1)"
+  want=${tag#v}
+  echo "  record: $(jq -r '"\(.install) \(.version // "?"), taken \(.taken_at // "?")"' <<<"$r")"
+  [ "$(jq -r '.version // ""' <<<"$r")" = "$want" ] || why+=("the agent runs $(jq -r '.version // "an unknown version"' <<<"$r"), not $want")
+  [ "$(jq -r .running <<<"$r")" = true ] || why+=("it is not running")
+  [ "$(jq -r .restarts <<<"$r")" = 0 ] || why+=("it was started again ($(jq -r '.restarts // "unknown"' <<<"$r") restarts)")
+  taken=$(jq -r '.taken_at // ""' <<<"$r") since=$(jq -r '.up_since // ""' <<<"$r")
+  # An empty time is none: date would take it as midnight.
+  [ -z "$taken" ] || taken=$(date -u -d "$taken" +%s 2>/dev/null) || taken=""
+  [ -z "$since" ] || since=$(date -u -d "$since" +%s 2>/dev/null) || since=""
+  if [ -z "$taken" ] || [ -z "$since" ]; then
+    why+=("the record has no time it was taken or started"); up=0
+  else
+    up=$((taken - since))
+    [ "$up" -ge $((min_up * 60)) ] || why+=("it was up $((up / 60)) minutes, under $min_up")
+  fi
+  case $(jq -r .install <<<"$r") in
+    image)
+      jq -e '.status.state == "running" and .status.relay == "connected" and .status.claude == "active" and .status.error == null' <<<"$r" >/dev/null ||
+        why+=("gp status is not clean: $(jq -r '"state \(.status.state // "?"), relay \(.status.relay // "?"), claude \(.status.claude // "?"), error \(.status.error // "none")"' <<<"$r")")
+      pinned=$(gh release download "$tag" --repo "$repo" --pattern get.sh --output - 2>/dev/null |
+        grep -oE '[a-z0-9][a-z0-9.:/_-]*:[0-9A-Za-z.-]+@sha256:[0-9a-f]{64}' | sort -u) || pinned=""
+      if [ -z "$pinned" ] || [ "$(grep -c . <<<"$pinned")" != 1 ]; then die "cannot read the one image the get.sh of $tag pins"; fi
+      digest=${pinned##*@}
+      jq -e --arg d "$digest" '.image.id == $d or ((.image.reference // "") | endswith("@" + $d)) or any((.image.repo_digests // [])[]; endswith("@" + $d))' <<<"$r" >/dev/null ||
+        why+=("its image is not the release's ($digest)")
+      ;;
+    checkout)
+      commit=$(gh api "repos/$repo/commits/$tag" --jq .sha 2>/dev/null) || die "cannot read the commit of $tag in $repo"
+      [ "$(jq -r .commit <<<"$r")" = "$commit" ] || why+=("the checkout is at $(jq -r '.commit // "?"' <<<"$r" | cut -c1-12), not $tag's commit ${commit:0:12}")
+      [ "$(jq -r .changed <<<"$r")" = false ] || why+=("the checkout has changed files")
+      jq -e '.unit.active_state == "active" and .unit.sub_state == "running"' <<<"$r" >/dev/null ||
+        why+=("its unit is $(jq -r '"\(.unit.active_state // "?")/\(.unit.sub_state // "?")"' <<<"$r")")
+      ;;
+    *) why+=("the record's install is neither image nor checkout") ;;
+  esac
+  if [ ${#why[@]} -gt 0 ]; then
+    printf '  not clean: %s\n' "${why[@]}" >&2
+    die "$tag stays a pre-release: the record does not show one of our own agents running it cleanly"
+  fi
+  echo "  ran cleanly: $want, up $((up / 60)) minutes, no restarts"
+}
+
+echo "mark: $action $tag in $repo"
+case $action in
+  promote)
+    [ "$withdrawn" = false ] || die "$tag was withdrawn; a withdrawn release is not promoted"
+    if [ "$(jq -r .isPrerelease <<<"$rel")" != true ]; then echo "mark: $tag is a full release already: nothing to do"; exit 0; fi
+    judge_record
+    top=$(highest_full "$tag")
+    latest_flag=--latest
+    if [ -n "$top" ] && [[ $(semver_key "$top") > $(semver_key "$tag") ]]; then latest_flag=--latest=false; fi
+    echo "  would: clear the pre-release mark of $tag$([ "$latest_flag" = --latest ] && echo ', and make it the latest release' || echo " (the latest stays $top, which is higher)")"
+    if [ "$up" -ge 7200 ]; then for_how_long="$((up / 3600)) hours"; else for_how_long="$((up / 60)) minutes"; fi
+    line="Promoted on $(date -u +%Y-%m-%d), after one of our own agents had run it cleanly for $for_how_long."
+    echo "  would: put at the top of its notes: $line"
+    $apply || { echo "mark: dry run, nothing changed (--apply does it)"; exit 0; }
+    notes=$(mktemp)
+    trap 'rm -f "$notes"' EXIT
+    first=${body%%$'\n'*}
+    if [[ $first == *"A pre-release until one of our own agents has run it cleanly." ]]; then
+      rest=""; [ "$first" = "$body" ] || rest=${body#*$'\n'}
+      printf '%s\n%s\n' "${first%A pre-release until*}$line" "$rest" >"$notes"
+    else
+      printf '%s\n\n%s\n' "$line" "$body" >"$notes"
+    fi
+    gh release edit "$tag" --repo "$repo" --prerelease=false "$latest_flag" --notes-file "$notes" >/dev/null
+    echo "mark: $tag is promoted; the release workflow now adds the image's version tag (tools/release/ci/promote)"
+    ;;
+  withdraw)
+    back=$(highest_full "$tag")
+    echo "  would: mark $tag as a pre-release, put 'WITHDRAWN: $reason' at the top of its notes"
+    if [ -n "$back" ]; then echo "  would: make $back the latest release"; else echo "  note:  there is no other full release: after this nothing is the latest"; fi
+    $apply || { echo "mark: dry run, nothing changed (--apply does it)"; exit 0; }
+    notes=$(mktemp)
+    trap 'rm -f "$notes"' EXIT
+    if [ "$withdrawn" = true ]; then body=${body#*$'\n\n'}; fi
+    printf 'WITHDRAWN: %s\n\n%s\n' "$reason" "$body" >"$notes"
+    gh release edit "$tag" --repo "$repo" --prerelease --latest=false --notes-file "$notes" >/dev/null
+    if [ -n "$back" ]; then gh release edit "$back" --repo "$repo" --latest >/dev/null; fi
+    echo "mark: $tag is withdrawn${back:+; the latest release is $back}"
+    ;;
+esac
