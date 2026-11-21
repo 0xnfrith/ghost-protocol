@@ -96,6 +96,20 @@ check "Claude Code downloads from downloads.claude.ai" \
 check "gh downloads from the cli/cli GitHub releases" \
     grep -q 'https://github.com/cli/cli/releases/download/v' "$SRC/install/lib/github.sh"
 
+# 6b. Every action a workflow takes from outside the repository is pinned to
+#     a commit (40 hex characters), so a moved tag cannot change what runs
+#     with a workflow's token; that covers the release workflow's jobs, which
+#     write releases and packages.
+uses_lines="$(grep -hE '^[[:space:]]*(- )?uses:' "$SRC"/.github/workflows/*.yml 2>/dev/null \
+    | sed -E 's/^[[:space:]]*(- )?uses:[[:space:]]*//; s/[[:space:]]+#.*$//')"
+check "the workflows use some actions" [ -n "$uses_lines" ]
+unpinned="$(printf '%s\n' "$uses_lines" | grep . | grep -vE '^\./' | grep -vE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$' || true)"
+if [ -z "$unpinned" ]; then ok "every action from outside the repository is pinned to a commit"
+else bad "actions not pinned to a commit: $(printf '%s' "$unpinned" | tr '\n' ' ')"; fi
+rel_checkouts="$(grep -oE '^      - uses: actions/checkout@[0-9a-f]{40}' "$SRC/.github/workflows/release.yml" || true)"
+check "the release workflow's two jobs (release, promote) each take the checkout" [ "$(printf '%s\n' "$rel_checkouts" | grep -c .)" -eq 2 ]
+check "the release workflow's two checkouts are one commit" [ "$(printf '%s\n' "$rel_checkouts" | sort -u | grep -c .)" -eq 1 ]
+
 # 7. No Homebrew; no write to the global git config.
 # shellcheck disable=SC2086
 check "no Homebrew" sh -c "! cat $CODE | grep -vE '^[[:space:]]*#' | grep -qiE '(^|[^a-z])brew[[:space:]]'"

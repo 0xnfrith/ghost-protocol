@@ -48,17 +48,20 @@ STUB
 chmod +x "$T/bin/docker" "$T/bin/gh"
 export PATH="$T/bin:$PATH"
 
-# world <pre|full|draft|withdrawn> [pinned reference]: a release of v1.2.3 whose get.sh pins the reference, and a registry
-# that holds $DIGEST under pre-1.2.3.
+# The line tools/release/mark promote puts first in a promoted release's notes.
+PROMOTED="Promoted on 2026-11-20, after one of our own agents had run it cleanly for 75 minutes."
+# world <pre|full|draft|withdrawn> [pinned reference] [notes]: a release of v1.2.3 whose get.sh pins the reference, and a
+# registry that holds $DIGEST under pre-1.2.3. A full release's notes lead with mark's line unless notes are given.
 world() {
   rm -rf "$S"
   mkdir -p "$S"
+  local pre=false draft=false body=${3:-$PROMOTED$'\n\nnotes'}
   case $1 in
-    pre) printf '{"isPrerelease":true,"isDraft":false,"body":"notes"}\n' ;;
-    full) printf '{"isPrerelease":false,"isDraft":false,"body":"notes"}\n' ;;
-    draft) printf '{"isPrerelease":false,"isDraft":true,"body":"notes"}\n' ;;
-    withdrawn) printf '{"isPrerelease":false,"isDraft":false,"body":"WITHDRAWN: bad\\n\\nnotes"}\n' ;;
-  esac >"$S/release.json"
+    pre) pre=true body="notes" ;;
+    draft) draft=true ;;
+    withdrawn) body="WITHDRAWN: bad"$'\n\n'"$PROMOTED" ;;
+  esac
+  jq -nc --argjson p "$pre" --argjson d "$draft" --arg b "$body" '{isPrerelease: $p, isDraft: $d, body: $b}' >"$S/release.json"
   printf '#!/bin/sh\nIMAGE="${GP_IMAGE:-%s}"\n' "${2:-$IMG:1.2.3@$DIGEST}" >"$S/get.sh"
   echo "$DIGEST" >"$S/digests"
   echo "$IMG:pre-1.2.3 $DIGEST" >"$S/tags"
@@ -112,6 +115,46 @@ world full
 rm "$S/release.json"
 run
 check_eq "no release: refused" "$rc" "2"
+
+# Promoted by mark: its line, first in the live notes. A re-run, or a release hand-edited to a full one, is not enough.
+for case in "no line|notes" "the line not first|notes"$'\n\n'"$PROMOTED" "no notes|" "a near miss|Promoted on 2026-11-20, after an agent had run it cleanly for 75 minutes."; do
+  world full "" "${case#*|}"
+  if [ -z "${case#*|}" ]; then jq -c '.body = ""' "$S/release.json" >"$S/r" && mv "$S/r" "$S/release.json"; fi
+  run
+  check_eq "full, but not through mark (${case%%|*}): refused" "$rc" "2"
+  check_not "full, but not through mark (${case%%|*}): nothing tagged" "imagetools create" "$calls"
+done
+check_has "not through mark: says so" "promote it with mark" "$out"
+world full "" "GHOST Protocol v1.2.3. $PROMOTED"$'\r\n\r\nnotes'
+run
+check_eq "mark's line after the release's own words, CRLF: exit 0" "$rc" "0"
+check_eq "mark's line after other words: tagged" "$(tagged)" "$DIGEST"
+# shellcheck disable=SC2016 # the line as mark holds it, unexpanded
+check_has "mark promote still writes the line ci/promote looks for" \
+  'line="Promoted on $(date -u +%Y-%m-%d), after one of our own agents had run it cleanly for $for_how_long."' "$(cat "$ROOT/tools/release/mark")"
+
+# The pin is the image under pre-<version>, the one the release run pushed.
+world full
+echo "$OTHER" >>"$S/digests"
+echo "$IMG:pre-1.2.3 $OTHER" >"$S/tags"
+run
+check_eq "pre-1.2.3 is another digest: refused" "$rc" "2"
+check_has "pre-1.2.3 is another digest: says so" "the release's pin does not match pre-1.2.3: $IMG:pre-1.2.3 is $OTHER, the pin is $DIGEST" "$out"
+check_not "pre-1.2.3 is another digest: nothing tagged" "imagetools create" "$calls"
+GP_RELEASE_DRY=1 run
+check_eq "pre-1.2.3 is another digest, a dry run: refused too" "$rc" "2"
+world full
+: >"$S/tags"
+run
+check_eq "no pre-1.2.3: refused" "$rc" "2"
+check_has "no pre-1.2.3: says so" "the release's pin does not match pre-1.2.3: $IMG:pre-1.2.3 is not in the registry" "$out"
+check_not "no pre-1.2.3: nothing tagged" "imagetools create" "$calls"
+world pre
+rm "$S/release.json" "$S/get.sh"
+echo "$OTHER" >>"$S/digests"
+echo "$IMG:pre-1.2.3 $OTHER" >"$S/tags"
+GP_RELEASE_GITHUB=0 GP_RELEASE_LOGIN=0 GP_RELEASE_DIGEST=$DIGEST run
+check_eq "no GitHub, pre-1.2.3 another digest: refused" "$rc" "2"
 
 # What get.sh pins.
 world full "$IMG:1.2.4@$DIGEST"

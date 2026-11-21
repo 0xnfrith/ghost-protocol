@@ -15,9 +15,11 @@
 #   GP_RELEASE_GITHUB    0: no GitHub release to read; the digest is GP_RELEASE_DIGEST (a local proof)
 #   GP_RELEASE_DRY       1: check and print the plan; tag nothing
 #
-# It refuses (exit 2) when the release is still a pre-release, a draft or withdrawn; when its get.sh does not pin
-# <image>:<version>@<digest>; when that image is not in the registry; and when <image>:<version> is there already for another
-# digest: a tag is never moved. When the tag is there for this digest, there is nothing to do (exit 0).
+# It refuses (exit 2) when the release is still a pre-release, a draft or withdrawn; when the first line of its notes, read live,
+# lacks the line `tools/release/mark promote` writes (so a re-run, or a release hand-edited to a full one, cannot skip the
+# ran-clean judgement); when its get.sh does not pin <image>:<version>@<digest>; when that image is not in the registry; when
+# <image>:pre-<version>, the tag the release run pushed, is not that same digest; and when <image>:<version> is there already
+# for another digest: a tag is never moved. When the tag is there for this digest, there is nothing to do (exit 0).
 # Needs jq and Docker with buildx; gh unless GP_RELEASE_GITHUB=0.
 set -euo pipefail
 
@@ -50,7 +52,12 @@ else
   [ "$(jq -r .isDraft <<<"$rel")" = false ] || die "$tag is a draft"
   [ "$(jq -r .isPrerelease <<<"$rel")" = false ] ||
     die "$tag is still a pre-release: it is promoted (tools/release/mark promote) once one of our agents has run it cleanly"
-  case $(jq -r .body <<<"$rel") in "WITHDRAWN:"*) die "$tag was withdrawn" ;; esac
+  notes=$(jq -r .body <<<"$rel")
+  case $notes in "WITHDRAWN:"*) die "$tag was withdrawn" ;; esac
+  # The line mark promote writes (tools/release/mark), first in the notes; after other words on that line is fine.
+  first=${notes%%$'\n'*}
+  [[ $first =~ Promoted\ on\ [0-9]{4}-[0-9]{2}-[0-9]{2},\ after\ one\ of\ our\ own\ agents\ had\ run\ it\ cleanly\ for\ [0-9] ]] ||
+    die "the notes of $tag lack, in their first line, the line tools/release/mark promote writes: promote it with mark, after one of our own agents has run it cleanly"
   getsh=$(gh release download "$tag" --repo "$repo" --pattern get.sh --output - 2>/dev/null) || die "cannot read the get.sh of $tag"
   pins=$(grep -oE '[a-z0-9][a-z0-9.:/_-]*:[0-9A-Za-z.-]+@sha256:[0-9a-f]{64}' <<<"$getsh" | sort -u || true)
   [ "$(grep -c . <<<"$pins")" = 1 ] || die "the get.sh of $tag does not pin one image"
@@ -73,6 +80,11 @@ if now=$(digest_of "$ref" 2>/dev/null); then
   say "$ref is already $digest: nothing to do"
   exit 0
 fi
+# The pin is the image the release run pushed, under its pre- tag: not some other image that happens to be in the registry.
+pre="$image:pre-$version"
+pred=$(digest_of "$pre" 2>/dev/null) || die "the release's pin does not match pre-$version: $pre is not in the registry"
+[ "$pred" = "$digest" ] || die "the release's pin does not match pre-$version: $pre is $pred, the pin is $digest"
+say "$pre is $digest too"
 
 # 3. The tag: the same manifest, under the plain version.
 say "would: tag $image@$digest as $ref (every install's release check then offers $version)"

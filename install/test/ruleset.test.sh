@@ -531,6 +531,15 @@ check "triggers: an inline map with paths"        trig 'on: {pull_request: {path
 check "triggers: pull_request_target is not it"   trig 'on: pull_request_target\njobs:\n' ''
 check "triggers: push only"                       trig 'on:\n  push:\n    branches: [main]\njobs:\n' ''
 
+# The release workflow's jobs write releases and packages (the release job)
+# or the image's tags (the promote job): none of them runs for a pull
+# request, and the promote job runs on a release marked released alone.
+REL="$SRC/.github/workflows/release.yml"
+check "workflows: release.yml runs on no pull request" [ -z "$(pr_trigger "$REL")" ]
+check "workflows: release.yml has no pull_request_target trigger" sh -c "! grep -q 'pull_request_target' '$REL'"
+check "workflows: release.yml takes a release event of the type released alone" \
+    sh -c "[ \"\$(awk '/^on:/ { f = 1; next } /^[^ #]/ { f = 0; r = 0 } f && /^  release:/ { r = 1; next } f && /^  [^ ]/ { r = 0 } r && NF' '$REL')\" = '    types: [released]' ]"
+
 # The secret scan reads its settings only from .github/: its own config, no
 # ignore file elsewhere, no inline allow.
 GATES="$SRC/.github/workflows/gates.yml"

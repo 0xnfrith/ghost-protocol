@@ -7,6 +7,12 @@
 #   GH_TOKEN        this run's own token: write access to the repository's releases and packages, nothing else
 #   GP_RELEASE_TAG  the tag being released
 # No other secret: the image goes to this repository's own package registry, with this run's token.
+#
+# On a release that is promoted (tools/release/mark promote clears its pre-release mark, which GitHub reports as "released"), the
+# promote job runs tools/release/ci/promote, which adds the plain <version> tag to the image digest the release's get.sh pins. Only
+# then does an agent's update check offer the release. The job refuses a pre-release, a draft, a withdrawn release and one whose
+# notes do not carry the line mark promote writes once one of our own agents has run it cleanly; ci/promote then reads the release
+# again and makes its own checks. Its token reads the repository and writes its packages, nothing else.
 name: release
 
 on:
@@ -14,12 +20,17 @@ on:
     tags: ['v*']
   # By hand, from the Actions tab, on a tag: to re-run a release whose run failed.
   workflow_dispatch:
+  # A pre-release made a full release (tools/release/mark promote), or a release published as full: the promote job.
+  release:
+    types: [released]
 
 permissions:
   contents: read
 
+# One run at a time per tag, and a promotion in a group of its own (release-promote-refs/tags/<tag>): a release run queued for the
+# same tag never cancels a waiting promotion, nor the other way round.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'release' && 'promote-' || '' }}${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -27,6 +38,7 @@ jobs:
     # GitHub's runner, never GP_CI_RUNS_ON: a release runs on a tag, and tags are cut on the public copy (and its staging copy), not in
     # the repository the variable is set in. Its build also needs buildx, arm64 emulation it registers itself (a privileged container)
     # and gh, and its token writes the public image and release.
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -60,3 +72,52 @@ jobs:
             exit 1
           fi
           exec ./tools/release/ci/run
+
+  promote:
+    # GitHub's runner, as the release job: a release is promoted on the public copy (and its staging copy), and its token writes
+    # the public image's tags.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # the release and its get.sh
+      packages: write # the plain version tag
+    steps:
+      # The default branch, not the tag: the checks that run are the newest ones, whatever the promoted tag's tree holds.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - name: tools/release/ci/promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GP_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_NOTES: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_PRERELEASE" != false ] || [ "$RELEASE_DRAFT" != false ]; then
+            echo "::error title=Not promoted::$GP_RELEASE_TAG is a pre-release or a draft (pre-release: $RELEASE_PRERELEASE, draft: $RELEASE_DRAFT)."
+            exit 1
+          fi
+          case $RELEASE_NOTES in
+            WITHDRAWN:*)
+              echo "::error title=Not promoted::$GP_RELEASE_TAG was withdrawn: a withdrawn release is never promoted."
+              exit 1
+              ;;
+          esac
+          first=${RELEASE_NOTES%%$'\n'*}
+          if ! [[ $first =~ Promoted\ on\ [0-9]{4}-[0-9]{2}-[0-9]{2},\ after\ one\ of\ our\ own\ agents\ had\ run\ it\ cleanly\ for\ [0-9] ]]; then
+            echo "::error title=Not promoted::The notes of $GP_RELEASE_TAG lack, in their first line, the line tools/release/mark promote writes: promote it with mark, after one of our own agents has run it cleanly."
+            exit 1
+          fi
+          if [ ! -e tools/release/ci/promote ]; then
+            echo "::notice title=Nothing promoted::No tools/release/ci/promote in this tree."
+            exit 0
+          fi
+          if [ ! -x tools/release/ci/promote ]; then
+            echo "::error file=tools/release/ci/promote::tools/release/ci/promote is not executable (chmod +x, and commit the mode)"
+            exit 1
+          fi
+          exec ./tools/release/ci/promote
