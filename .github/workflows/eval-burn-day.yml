@@ -1,0 +1,50 @@
+# The CI evals' daily burn: once a day it runs evals/ci/burn-day, which gathers the burn rows that every CI eval run kept (the
+# eval-burn-<attempt> artifact of evals.yml), sums the day before (UTC) and posts that sum to the team channel as the CI
+# operator (the eval channel while the secret GP_EVAL_BURN_CHANNEL_ID is not set), and writes it to the job's summary. The sum is an estimate at list prices; the Claude plan's credit meter is the
+# real figure. Run it by hand from the Actions tab for another day.
+#
+# evals/ is not copied into the public repository, so there this workflow finds no evals/ci/burn-day and passes with a notice.
+name: eval-burn-day
+
+on:
+  schedule:
+    - cron: "20 0 * * *" # 00:20 UTC, the day before
+  workflow_dispatch:
+    inputs:
+      date:
+        description: The day to sum, YYYY-MM-DD (UTC). Empty for yesterday.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  burn-day:
+    runs-on: ${{ vars.GP_CI_RUNS_ON != '' && fromJSON(vars.GP_CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read # the artifacts of the CI eval runs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: evals/ci/burn-day
+        env:
+          GP_EVAL_GITHUB_TOKEN: ${{ github.token }}
+          GP_EVAL_OPERATOR_KEY: ${{ secrets.GP_EVAL_OPERATOR_KEY }}
+          GP_EVAL_RELAY_URL: ${{ secrets.GP_EVAL_RELAY_URL }}
+          GP_EVAL_CHANNEL_ID: ${{ secrets.GP_EVAL_CHANNEL_ID }}
+          GP_EVAL_BURN_CHANNEL_ID: ${{ secrets.GP_EVAL_BURN_CHANNEL_ID }}
+          BURN_DATE: ${{ inputs.date }}
+        run: |
+          set -euo pipefail
+          if [ ! -e evals/ci/burn-day ]; then
+            echo "::notice title=No evals::No evals/ci/burn-day in this tree: no burn to sum."
+            exit 0
+          fi
+          exec ./evals/ci/burn-day ${BURN_DATE:+--date "$BURN_DATE"}
