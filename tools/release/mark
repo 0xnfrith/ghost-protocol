@@ -91,7 +91,7 @@ highest_full() {
 
 # judge_record: the record of --ran against this release; sets up (seconds). Refuses (exit 2) with every reason it finds.
 judge_record() {
-  local r why=() taken since want pinned digest commit
+  local r why=() taken since want assets asset pinned digest commit
   r=$(jq -ec 'objects' "$ran" 2>/dev/null) || die "the record $ran is not a JSON object"
   [ "$(jq -r .record <<<"$r")" = gp-ran-clean/1 ] || die "the record $ran is not one ran-clean made (gp-ran-clean/1)"
   want=${tag#v}
@@ -113,7 +113,13 @@ judge_record() {
     image)
       jq -e '.status.state == "running" and .status.relay == "connected" and .status.claude == "active" and .status.error == null' <<<"$r" >/dev/null ||
         why+=("gp status is not clean: $(jq -r '"state \(.status.state // "?"), relay \(.status.relay // "?"), claude \(.status.claude // "?"), error \(.status.error // "none")"' <<<"$r")")
-      pinned=$(gh release download "$tag" --repo "$repo" --pattern get.sh --output - 2>/dev/null |
+      # get.sh is read through the API (the asset's id, then its bytes, which the API sends on from the signed storage address),
+      # not `gh release download`: the download asks the public API host for the asset, so it fails where gh reaches GitHub
+      # through GH_HOST.
+      assets=$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null) || die "cannot read the release $tag of $repo through the API"
+      asset=$(jq -r '[.assets[]? | select(.name == "get.sh") | .id] | if length == 1 then .[0] else empty end' <<<"$assets" 2>/dev/null) || asset=""
+      [[ $asset =~ ^[0-9]+$ ]] || die "cannot read the one image the get.sh of $tag pins: the release has no get.sh"
+      pinned=$(gh api -H 'Accept: application/octet-stream' "repos/$repo/releases/assets/$asset" 2>/dev/null |
         grep -oE '[a-z0-9][a-z0-9.:/_-]*:[0-9A-Za-z.-]+@sha256:[0-9a-f]{64}' | sort -u) || pinned=""
       if [ -z "$pinned" ] || [ "$(grep -c . <<<"$pinned")" != 1 ]; then die "cannot read the one image the get.sh of $tag pins"; fi
       digest=${pinned##*@}

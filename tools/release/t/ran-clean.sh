@@ -138,7 +138,9 @@ cat >"$T/bin/gh" <<'STUB'
 case "$1 $2" in
   "release view") echo '{"tagName":"v1.1.0","isPrerelease":true,"isDraft":false,"body":"notes"}' ;;
   "release list") echo '[{"tagName":"v1.1.0","isPrerelease":true,"isDraft":false}]' ;;
-  "release download") printf 'IMAGE="${GP_IMAGE:-ghcr.io/acme/ghost-protocol:1.1.0@%s}"\n' "$STUB_DIGEST" ;;
+  "api repos/acme/ghost-protocol/releases/tags/v1.1.0") echo '{"assets":[{"id":7,"name":"get.sh"}]}' ;;
+  "api -H") [ "$3 $4" = "Accept: application/octet-stream repos/acme/ghost-protocol/releases/assets/7" ] || exit 1
+    printf 'IMAGE="${GP_IMAGE:-ghcr.io/acme/ghost-protocol:1.1.0@%s}"\n' "$STUB_DIGEST" ;;
   "api repos/acme/ghost-protocol/commits/v1.1.0") echo "$TAG_COMMIT" ;;
   *) exit 1 ;;
 esac

@@ -21,7 +21,19 @@ cat >"$T/bin/gh" <<'STUB'
 case "$1 $2" in
   "release view") jq -e --arg t "$3" '.[] | select(.tagName == $t)' "$RELEASES" || exit 1 ;;
   "release list") cat "$RELEASES" ;;
-  "release download") [ -f "$GETSH" ] && cat "$GETSH" || exit 1 ;;
+  # get.sh is read through the API: the release with its assets (from $ASSETS, else get.sh as id 7 when $GETSH exists; none
+  # when $API_DOWN is set), then the asset's bytes. Every read is logged to $READS.
+  "api repos/acme/widget/releases/tags/"*)
+    echo "gh $*" >>"$READS"
+    [ $# = 2 ] && [ -z "${API_DOWN:-}" ] || exit 1
+    a='[{"id":8,"name":"SHA256SUMS"}]'
+    [ ! -f "$GETSH" ] || a='[{"id":7,"name":"get.sh"},{"id":8,"name":"SHA256SUMS"}]'
+    [ -z "${ASSETS:-}" ] || a=$ASSETS
+    echo "{\"tag_name\":\"${2##*/}\",\"assets\":$a}" ;;
+  "api -H")
+    echo "gh $*" >>"$READS"
+    [ "$3 $4" = "Accept: application/octet-stream repos/acme/widget/releases/assets/7" ] && [ -f "$GETSH" ] && cat "$GETSH" || exit 1 ;;
+  "release download") exit 1 ;; # the download does not work through GH_HOST: mark must not need it
   "api repos/acme/widget/commits/"*) [ -n "${TAG_COMMIT:-}" ] && echo "$TAG_COMMIT" || exit 1 ;;
   "release edit")
     echo "gh $*" >>"$CALLS"
@@ -34,7 +46,7 @@ case "$1 $2" in
 esac
 STUB
 chmod +x "$T/bin/gh"
-export PATH="$T/bin:$PATH" RELEASES=$T/releases.json CALLS=$T/calls GETSH=$T/get.sh
+export PATH="$T/bin:$PATH" RELEASES=$T/releases.json CALLS=$T/calls GETSH=$T/get.sh READS=$T/reads
 
 # releases <tag:pre|full[:body]>...
 releases() {
@@ -201,6 +213,25 @@ run promote v1.1.0 --ran "$T/rec.json"
 check_eq "no get.sh in the release: refused" "$rc" "2"
 check_has "no get.sh: says so" "cannot read the one image the get.sh of v1.1.0 pins" "$out"
 getsh 1.1.0
+: >"$READS"
+run promote v1.1.0 --ran "$T/rec.json"
+check_eq "get.sh read through the API: ok" "$rc" "0"
+check_has "get.sh read through the API: the release by its tag" "gh api repos/acme/widget/releases/tags/v1.1.0" "$(cat "$READS")"
+check_has "get.sh read through the API: the asset's bytes" "gh api -H Accept: application/octet-stream repos/acme/widget/releases/assets/7" "$(cat "$READS")"
+ASSETS='[{"id":7,"name":"get.sh"},{"id":9,"name":"get.sh"}]' run promote v1.1.0 --ran "$T/rec.json"
+check_eq "two assets named get.sh: refused" "$rc" "2"
+check_has "two assets named get.sh: says so" "the release has no get.sh" "$out"
+API_DOWN=1 run promote v1.1.0 --ran "$T/rec.json"
+check_eq "the release cannot be read through the API: refused" "$rc" "2"
+check_has "the release cannot be read: says so, not that get.sh is missing" "cannot read the release v1.1.0 of acme/widget through the API" "$out"
+ASSETS='null' run promote v1.1.0 --ran "$T/rec.json"
+check_eq "a release with no asset list: refused" "$rc" "2"
+check_has "a release with no asset list: no get.sh" "the release has no get.sh" "$out"
+ASSETS='[{"id":7,"name":"get.sh.bak"},{"id":9,"name":"xget.sh"}]' run promote v1.1.0 --ran "$T/rec.json"
+check_eq "only look-alike names: refused" "$rc" "2"
+ASSETS='[{"id":9,"name":"get.sh"}]' run promote v1.1.0 --ran "$T/rec.json"
+check_eq "get.sh's bytes cannot be read: refused" "$rc" "2"
+check_eq "get.sh's bytes cannot be read: nothing changed" "$calls" ""
 TAG_COMMIT="" rec checkout
 TAG_COMMIT="" run promote v1.1.0 --ran "$T/rec.json"
 check_eq "the tag's commit cannot be read: refused" "$rc" "2"
