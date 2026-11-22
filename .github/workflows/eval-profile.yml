@@ -1,0 +1,39 @@
+# The CI operator's relay profile, by hand only: run it from the Actions tab (workflow_dispatch). It runs evals/ci/profile, which
+# publishes the profile (kind 0) of the key in GP_EVAL_OPERATOR_KEY, the key the evals in CI hold their conversations with, so
+# that the eval channel shows a name for it, then reads it back from the relay and checks it. The script's head says more.
+#
+# The key goes to the script in its environment only; the script writes it to an owner-only file, shreds it at the end and
+# never prints it.
+#
+# evals/ is not copied into the public repository, so there this workflow finds no evals/ci/profile and passes with a notice.
+name: eval-profile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: evals/ci/profile
+        env:
+          GP_EVAL_OPERATOR_KEY: ${{ secrets.GP_EVAL_OPERATOR_KEY }}
+          GP_EVAL_RELAY_URL: ${{ secrets.GP_EVAL_RELAY_URL }}
+          GP_EVAL_CHANNEL_ID: ${{ secrets.GP_EVAL_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
+          if [ ! -e evals/ci/profile ]; then
+            echo "::notice title=No evals::No evals/ci/profile in this tree: no profile to publish."
+            exit 0
+          fi
+          exec ./evals/ci/profile
