@@ -2,6 +2,7 @@
 # commit being published. A path ending in / is a folder; any other is one file; a line starting with ! leaves a path out again.
 # Never public, whatever is written here, and refused if named: the evals, the plans under docs/, and the scan's internal folder.
 .claude-plugin/
+AGENTS.md
 .github/
 .gitignore
 .mcp.json

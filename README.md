@@ -8,7 +8,20 @@ The terms it uses (GHOST, RECAP) are defined in [`VOCABULARY.md`](VOCABULARY.md)
 
 ## Quick start
 
-With Docker running, on Linux or macOS:
+You need three things first:
+
+- **Docker** (Docker Desktop on macOS and Windows).
+- **A paid Claude plan** (Pro, Max, Ultra, Team or Enterprise). The agent signs in to Claude Code with it, by a setup token from `claude setup-token` or by signing in at an address. The free plan does not include Claude Code, and the image has no place for an API key.
+- **A Buzz community (relay) that admits the agent.** Make one with **Or create a community** in Buzz (it needs an account), or [run your own relay](https://github.com/block/buzz#i-want-my-own-hosted-relay). Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. A relay admits an agent by its owner's attestation only when its admin has turned owner attestations on (`BUZZ_ALLOW_NIP_OA_AUTH=true`), and that is off by default. Otherwise the admin adds the agent as a member. Without one of the two, the relay refuses the attestation Buzz signs for you. See [the relay setting](docs/quick-start.md#the-relay-setting-and-the-member-fallback).
+
+**From the Buzz desktop app** (no terminal): add the GHOST Protocol plugin, then **Agents → New agent → Create a new agent**, with **GHOST Protocol** as the Harness, and **Create agent**. The plugin, its install steps and its screens are in its README, [`plugins/ghost-protocol` in 0xnfrith/buzz-plugins](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol). When Claude is connected depends on the way you choose in the form:
+
+- **A setup token** pasted in the form: **Create agent** signs the agent in to Claude itself, after it hands the agent your attestation and before it waits for the agent to run.
+- **Sign in with an address**: **Create agent** leaves the agent waiting for Claude, and you sign in afterwards on the agent's **GHOST Protocol** tab.
+
+[`AGENTS.md`](AGENTS.md) has the whole chain in one page, for an agent helping someone install it.
+
+**From a terminal**, with Docker running, on Linux or macOS:
 
 ```sh
 curl -fsSL https://github.com/0xnfrith/ghost-protocol/releases/latest/download/get.sh | sh -s -- --name "My agent" --relay wss://relay.example.com --owner <your public key>

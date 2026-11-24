@@ -28,6 +28,7 @@ set -euo pipefail
 #   tool-tests     the tests that live beside what they test, found by name: every tools/<name>/test that is a file, and
 #                  docker/test. docker/test builds the image, which carries LICENSE, NOTICE and persona/; .dockerignore decides
 #                  what goes into it
+#                  (tools/release/t/quickstart.sh reads AGENTS.md, README.md and docs/quick-start.md)
 #   evals          the evals of a real agent (evals/ci/run): what the agent runs, the adapter, the hooks, the installer, the
 #                  image, the plugin manifest and its MCP settings, and the persona, and the evals themselves
 #   gates          the secret scan of every commit, and the scan of the tree for internal names, stray keys and email addresses:
@@ -38,12 +39,12 @@ rows=(
   "adapter-tests  adapters/buzz/ hooks/load-proof hooks/lib/ install/lib/ install/test/fixtures/manifests/good-v1.toml"
   "rollout-check-test  tools/rollout-check/ hooks/session-id hooks/turn-state hooks/load-proof hooks/lib/ install/lib/ install/test/fixtures/manifests/"
   "backlog-test   backlog/ .claude-plugin/plugin.json"
-  "tool-tests     tools/ docker/ .dockerignore LICENSE NOTICE persona/"
+  "tool-tests     tools/ docker/ .dockerignore LICENSE NOTICE persona/ AGENTS.md README.md docs/quick-start.md"
   "evals          adapters/ hooks/ install/ docker/ .dockerignore .claude-plugin/plugin.json .mcp.json persona/ evals/"
   "gates          *"
 )
 # The paths that no test reads, on purpose (the gates still scan them):
-#   docs/  the specs, read by people
+#   docs/  the specs, read by people (except docs/quick-start.md, read by tools/release/t/quickstart.sh)
 untested=(docs/)
 
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"

@@ -105,7 +105,10 @@ test("a change to one part calls only the tests that read it, and the gates", ()
   assert.deepEqual(pullRequest({ "hooks/session-id": "changed\n" }), ["install-test", "rollout-check-test", "evals", "gates"]);
   assert.deepEqual(pullRequest({ "install/install": "changed\n" }), ["install-test", "evals", "gates"]);
   assert.deepEqual(pullRequest({ "tools/ruleset/ruleset": "changed\n" }), ["install-test", "tool-tests", "gates"]);
-  assert.deepEqual(pullRequest({ "README.md": "changed\n" }), ["install-test", "gates"]);
+  assert.deepEqual(pullRequest({ "README.md": "changed\n" }), ["install-test", "tool-tests", "gates"]);
+  // tools/release/t/quickstart.sh reads the quick start, README.md and AGENTS.md; the other docs stay untested.
+  assert.deepEqual(pullRequest({ "docs/quick-start.md": "changed\n" }), ["tool-tests", "gates"]);
+  assert.deepEqual(pullRequest({ "AGENTS.md": "new\n" }), ["tool-tests", "gates"]);
   assert.deepEqual(pullRequest({ "VOCABULARY.md": "changed\n" }), ["install-test", "gates"]);
   assert.deepEqual(pullRequest({}, ["VOCABULARY.md"]), ["install-test", "gates"]);
   assert.deepEqual(pullRequest({ ".claude-plugin/plugin.json": "{}\n" }), ["install-test", "backlog-test", "evals", "gates"]);

@@ -5,13 +5,13 @@ This gets a GHOST Protocol agent running on your own computer, answering you on 
 ## What you need
 
 - **Docker.** Docker Desktop on macOS and Windows, Docker Engine on Linux. `docker version` must print a server version. See [Docker Desktop on a laptop](#docker-desktop-on-a-laptop) first if you are on macOS or Windows.
-- **A Claude subscription** that Claude Code can sign in to. The agent uses it for every answer.
-- **A Buzz relay** you can reach, and your own Buzz account. The agent becomes yours: it answers you and nobody else. The Buzz way takes the relay and your key from Buzz. The terminal way needs the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`).
+- **A paid Claude plan**: Pro, Max, Ultra, Team or Enterprise. The free plan does not include Claude Code, so it is not enough. The agent uses the plan for every answer. It signs in with a setup token (`claude setup-token`, on any computer with Claude Code) or at an address it shows. It takes no API key.
+- **A Buzz relay** you can reach, and your own Buzz account. A community comes from **Or create a community** in Buzz (it needs an account), or from [a relay of your own](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay must admit the agent: its admin turns owner attestations on, which is off by default, or adds the agent as a member (see [the relay setting](#the-relay-setting-and-the-member-fallback)). Otherwise the relay refuses the attestation Buzz signs for you. Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. The agent becomes yours: it answers you and nobody else. The Buzz way takes the relay and your key from Buzz. The terminal way needs the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`).
 - **Hosted:** coming soon. For now the agent runs on a computer you own.
 
 ## Install, the Buzz way
 
-This needs the Buzz **desktop** app: the browser build cannot install plugins or start Docker. Buzz uses the relay you are on and your own key, so you type neither.
+This needs the Buzz **desktop** app: the browser build cannot install plugins or start Docker. Buzz uses the relay you are on and your own key, so you type neither. For an agent helping someone through these steps, [`AGENTS.md`](../AGENTS.md) has the whole chain in one page.
 
 1. Install the GHOST Protocol plugin. In Buzz, open **Settings → Plugins → Manage plugins** and press **Add**. Put `https://github.com/0xnfrith/buzz-plugins` in **Git or GitHub repository** and press **Find**. Pick **GHOST Protocol**, press **Continue**, read what it asks for (every program it may run is `docker`), and press **Install plugin**. The [plugin's README](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol) shows each screen.
 2. Make sure Docker is running. The plugin's **GHOST Protocol** page (press **Cmd+K**, or Ctrl+K, and type `GHOST`) says **Docker is running** when Buzz can reach it.
@@ -20,6 +20,8 @@ This needs the Buzz **desktop** app: the browser build cannot install plugins or
    - **Your Claude account**: paste a setup token (run `claude setup-token` on a computer with Claude Code), or choose to sign in at an address.
    - **Let GHOST Protocol update itself?** Yes starts the update helper (see [Update](#update)). No starts none, and you update by hand.
 5. Press **Create agent**. Buzz downloads the image (about 1 GB on disk, so the first time takes a while), makes the agent's key, starts it, signs its attestation as you and, with a token, signs it in to Claude. No terminal is needed. If you chose the address, open the agent's **GHOST Protocol** tab and sign in there.
+
+   **When Claude is connected:** with a setup token pasted in the form, **Create agent** signs the agent in to Claude itself, after it hands the agent your attestation and before it waits for the agent to run. With the address, **Create agent** leaves the agent waiting for Claude, and you sign in afterwards on the agent's **GHOST Protocol** tab.
 6. When its status says **Running**, mention it in a channel.
 
 If its status says the relay refused the attestation, go to [the relay setting](#the-relay-setting-and-the-member-fallback).
@@ -97,7 +99,7 @@ Then mention the agent in a channel on your relay. It answers in the thread.
 
 A Buzz relay admits a key that is not a member only when the relay's owner-attestation option is on, and that option is **off by default**. Without it, the agent connects, is refused with "not a relay member", and `gp status` shows `GP_RELAY=refused-not-member`. You have two ways out:
 
-1. **Turn the option on** at the relay (its admin does this), then restart the agent: `docker restart gp-my-agent`.
+1. **Turn the option on** at the relay (its admin does this: `BUZZ_ALLOW_NIP_OA_AUTH=true` in the relay's settings), then restart the agent: `docker restart gp-my-agent`.
 2. **Add the agent as a member.** Give the relay's admin the agent's public key (`GP_AGENT_PUBKEY` from the install, also in `gp status`) and ask for it to be added as a member. The tag is then not needed, and `gp auth-tag set` can be skipped.
 
 If you own the relay, you are the admin.
