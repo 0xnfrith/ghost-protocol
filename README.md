@@ -301,7 +301,7 @@ A key service keeps the key with a separate OS user, so the model's processes ca
 |---|---|---|
 | the admin (for example the machine's first user) | installs and updates, with sudo; never Claude Code | yes |
 | the agent user | the instance: Claude Code, its hooks, tools and subagents, and the adapter's two keyless pipes | no: no sudo, and none of the groups that amount to root. Rootless Docker is fine |
-| the key's user, `gp-key-<name>` | the channel and buzz-mcp, one process per connection, as systemd units | no; a system user with no home and no shell |
+| the key's user, `gp-key-<name>` | the channel, buzz-mcp and the [git sign-in](#the-git-sign-in), one process per connection, as systemd units | no; a system user with no home and no shell |
 | the GitHub App key's user, `gp-gh-<name>` | only with the [GitHub App slot](#the-github-app-slot): its review action, one process per connection | no; a system user with no home and no shell, alone in its own group |
 
 The adapter's side of this (the pipe and `launch.mjs serve`) is in [`adapters/buzz/README.md`](adapters/buzz/README.md#key-service). The admin sets up the rest with [`install/keyservice/setup`](install/keyservice/setup), from the admin's own clone of GHOST Protocol. It is a dry run by default, which checks everything and prints every file in full; `--apply` makes the changes:
@@ -336,9 +336,10 @@ The setup runs code from that clone (itself, and the shell libraries in `install
 | `.../outbox/` | the agent user, the key's group, 2770 | Where the session puts a file to send. |
 | `.../files/` | the key's user, the agent's group, 2750 | buzz-mcp's `BUZZ_MCP_ROOT`: the only folder its `path` and `files` arguments read. Only the key's user writes it, but the outbox's copy step puts the session's files there, so nothing in it is trusted: never an allowlist. |
 | `.../media/` | the key's user, the agent's group, 2750 | Where `media_get` saves, readable by the agent user. |
-| `/etc/systemd/system/gp-key-<name>-*` | root, 0644 | Six units, made from [`install/service/key-*`](install/service/): the channel's and buzz-mcp's sockets and services, and the outbox's path unit and service. With the GitHub App slot, two more: the GitHub socket and its service. |
+| `/etc/systemd/system/gp-key-<name>-*` | root, 0644 | Eight units, made from [`install/service/key-*`](install/service/): the channel's, buzz-mcp's and the git sign-in's sockets and services, and the outbox's path unit and service. With the GitHub App slot, two more: the GitHub socket and its service. |
 | `/var/lib/ghost-protocol-key/<name>/` | the key's user, 0700 | The channel's cursor, log and lock (systemd's `StateDirectory=`). |
-| `/run/ghost-protocol-key/<name>/` | made by systemd | The two sockets (three with the GitHub App slot: `github.sock`). Only root and the agent user's own group can connect. |
+| `/run/ghost-protocol-key/<name>/` | made by systemd | The three sockets, `channel.sock`, `buzz-mcp.sock` and `git.sock` (four with the GitHub App slot: `github.sock`). Only root and the agent user's own group can connect. |
+| the agent user's `~/.gitconfig` | the agent user | For the relay's address only: an empty credential helper, then the root-owned git sign-in helper with `git.sock`, and `useHttpPath = true`. Nothing else there is changed. |
 | `/run/ghost-protocol-setup/setup.lock` | root, 0600, in a root 0700 folder | Held by root for a running `--apply`, so that one runs at a time. |
 
 **What it refuses, before changing anything:**
@@ -390,6 +391,16 @@ install/keyservice/setup --name <name> --agent-user <user> --rollback --apply
 Each puts the code for that commit in place (or reuses it; a rollback runs its old copy as it is, with no `npm ci`, when that copy is intact: root's alone, the commit's files, buzz-mcp of its pin, its dependencies there), writes the units for it, records the commit it moves from, stops the listeners and every open connection, starts the listeners again, and then restarts `<name>.service`: a pipe cannot hand a running MCP session over to a new server, so the whole instance starts again. Copies that no instance runs or rolls back to are removed.
 
 **Undo.** As the admin: `systemctl disable --now gp-key-<name>-channel.socket gp-key-<name>-buzz-mcp.socket gp-key-<name>-outbox.path`, remove the six units and `daemon-reload`, then set the instance's key command back and empty `buzz_key_socket`. The key file, the settings and the state stay until removed by hand, so nothing is lost by mistake. The GitHub App slot alone: `systemctl disable --now gp-key-<name>-github.socket`, stop `gp-key-<name>-github@*.service`, remove its two units and `daemon-reload`, then remove `github.conf` and `public-text.json`, shred `github-app.pem` and any `.github-app.pem.new-*` or `.github-app.pem.old-*` beside it (the slot is on while the key or `github.conf` is there), remove its user (`userdel gp-gh-<name>`), and delete the key on GitHub.
+
+### The git sign-in
+
+A relay's git repositories (git over HTTP at `https://<relay>/git/<owner>/<repo>`) take an `Authorization: Nostr <event>` header: a NIP-98 event (kind 27235) that a member's key signs, with the repository's root URL in its `u` tag. The relay honours one for about a minute, for every request of a clone, fetch or push. Git's own credential helper protocol can carry it, but every ready-made helper signs with a key the user running git can read. With a key service, the agent user has no such key.
+
+So every key service has a third socket, `git.sock`, served as the key's user like buzz-mcp ([`adapters/buzz/src/git-auth.mjs`](adapters/buzz/src/git-auth.mjs), `launch.mjs serve git`). Each connection gets one answer: one sign-in for one repository on the instance's own relay (`BUZZ_RELAY_URL`). The request names only the protocol, host and path git asked about. The key side builds the event itself, with the owner's tag inside it when there is one. It refuses any other host or scheme, and any path that is not `git/<owner>/<repo>`, so the socket never signs for the relay's other endpoints. Its unit has no network. Each sign-in leaves one line in the unit's journal (`journalctl -u 'gp-key-<name>-git@*'`).
+
+On the agent user's side, [`adapters/buzz/src/git-credential.mjs`](adapters/buzz/src/git-credential.mjs) is git's credential helper. It holds no key, uses Node.js built-ins only, and runs from the root-owned copy in `/opt/ghost-protocol/<commit>/`. The setup names it in the agent user's global git settings for the relay's address only, and checks it last: the helper asks the socket, as the agent user, for its key's public key, which must be the instance's. After that, `git clone`, `git fetch` and `git pull` work as the agent user for any relay repository whose channel the agent's key is a member of. That needs git 2.46 or newer, the first that sends `capability[]=authtype` (`boot.sh` installs it on Ubuntu).
+
+The relay does not check a sign-in's method, so it cannot be limited to fetches: a push is limited by the relay's own roles and protection rules for that repository, as it is for a person's key. A rollback to a commit without the git sign-in removes its two units. The git settings stay, and git then says it cannot reach the key service.
 
 ### The GitHub App slot
 

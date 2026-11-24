@@ -652,6 +652,14 @@ The claim that the key is only in the serving process's memory rests on these li
 - The channel's cursor and log are on the key service's side (its `BUZZ_STATE_DIR`), and its stderr goes to the key unit's journal.
 - The owner's tag goes to the key service (see [Logging in through the owner](#logging-in-through-the-owner)).
 
+## Git sign-in
+
+Block's buzz-mcp `repo` tool hands out a git header only through Buzz Desktop, so a key service signs git sign-ins itself, on a third socket, `git.sock`. The [top-level README](../../README.md#the-git-sign-in) says what it allows and refuses; the two halves are here:
+
+- [`src/git-auth.mjs`](src/git-auth.mjs) is the key side, `launch.mjs serve git`, with the same refusals as every `serve` before it reads the key. It reads one request line of JSON, at most 4096 bytes: `{"op":"sign","protocol","host","path"}` or `{"op":"ping"}`. It answers one line, either `{"ok":true,"credential":"<base64 kind 27235 event>"}`, `{"ok":true,"pubkey":"<hex>"}`, or `{"ok":false,"error":"<fixed text>"}`. The event's `u` tag is `<scheme>://<relay host>/git/<owner>/<repo>`. The relay strips the same smart-HTTP suffixes (`/info/refs`, `/git-upload-pack`, `/git-receive-pack`) before it compares. The `method` tag is `GET`, and the owner's tag is added when there is one. `launch.mjs git` outside `serve` is refused.
+- [`src/git-credential.mjs`](src/git-credential.mjs) is git's helper on the session's side: `--socket <path> get|store|erase|probe`. On `get` it answers only a relay's own challenge (`wwwauth[]=Nostr …`), and only to a git that sends `capability[]=authtype`. It sends the key side only the protocol, host and path, then prints `authtype=Nostr` with the sign-in, marked ephemeral. It writes the sign-in to git's stdout only. `probe` prints the socket's public key.
+
+
 ## buzz-mcp
 
 Block does not publish buzz-mcp as a package, and updates it often. This adapter therefore pins the exact `block/buzz-app` commit it is built from, in [`buzz-mcp.pin`](buzz-mcp.pin).

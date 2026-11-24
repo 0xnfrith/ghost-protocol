@@ -134,6 +134,12 @@
 #   --yes                  never wait for a sudo password (sudo -n only)
 #   -h, --help             this help
 #
+# The git sign-in (every commit that has it): the agent user's git signs in to
+# the relay's repositories through the key service's git.sock, with no key on
+# its side. Setup names the root-owned helper in the agent user's global git
+# settings, for the relay's address only (adapters/buzz/README.md, "Git
+# sign-in"). Then `git pull` in a clone of a relay repo works as the agent.
+#
 # With the GitHub App slot, the session runs tools/github-review/gp-github-review
 # (keyless) to post a review; adding the slot to an instance that runs starts
 # only the GitHub socket, and never restarts the session.
@@ -161,6 +167,17 @@ usage_error() { echo "setup: $*" >&2; echo "Try: install/keyservice/setup --help
 
 # The GitHub App slot's last check (ks_github_answers), recorded; status 1
 # on a FAIL. Nothing to do without the slot.
+# The git sign-in's settings in the agent user's git (ks_git_config), recorded;
+# status 1 when they could not be written (a FAIL line).
+git_settings() {
+    [ "$KS_GIT" = 1 ] || return 0
+    heading "the agent user's git, for the relay (as $KS_AGENT)"
+    if ! ks_git_config; then record FAIL git "$KS_WHY"; return 1; fi
+    if [ "$KS_GIT_CHANGED" = 1 ]; then record DONE git "$KS_AGENT's git signs in to $KS_GIT_ORIGIN through $KS_RUN/git.sock"
+    else record OK git "$KS_AGENT's git signs in to $KS_GIT_ORIGIN through $KS_RUN/git.sock"; fi
+    return 0
+}
+
 ks_github_report() {
     [ "$KS_GH" = 1 ] || return 0
     heading "the GitHub socket answers (as $KS_AGENT)"
@@ -299,6 +316,7 @@ case "$MODE" in
         else KS_COMMIT="$KS_PREV"; fi ;;
 esac
 ks_check_source
+ks_git_state
 [ "$KS_GH" = 0 ] || ks_check_github
 # A rollback runs its old copy as it is, when that copy is intact.
 [ "$MODE" = rollback ] && [ -n "$KS_PIN" ] && ks_check_reuse
@@ -349,6 +367,8 @@ say "commit: $KS_COMMIT$([ -n "$KS_CUR" ] && [ "$KS_CUR" != "$KS_COMMIT" ] && ec
 say "node: $KS_NODE_SRC$([ "$KS_NODE_COPY" = 1 ] && echo ", copied to $KS_NODE (it is not root-owned)" || echo ' (root-owned, run where it is)')"
 say "buzz-mcp: $KS_BUZZ_MCP_SRC (pin $KS_PIN)"
 [ "$KS_REUSE" = 0 ] || say "the copy at $KS_OPT/$KS_COMMIT is intact: it is run as it is"
+if [ "$KS_GIT" = 1 ]; then say "the git sign-in: on (git.sock; the agent user's git signs in to the relay through it)"
+else say "the git sign-in: off (commit $KS_COMMIT has no $KS_GIT_CODE)"; fi
 [ "$KS_GH" = 0 ] || say "the GitHub App slot: on ($(printf '%s' "$KS_GH_LINES" | sed -n 's/^GITHUB_REVIEW_REPOS=//p' | tr ',' '\n' | grep -c .) repo(s) on its allowlist)"
 record OK checks "the machine, the agent user, the key's user, the code and the settings$([ "$KS_GH" = 1 ] && echo ', and the GitHub App slot')"
 
@@ -434,6 +454,11 @@ if [ "$APPLY" = 0 ]; then
     fi
     say "then it would check, as $KS_AGENT and as $KS_KEY_USER, that neither can read the key file, that $KS_AGENT can write none of the code, the settings, the tag or the allowlist, that everything installed is root's alone, and that systemd loads each unit as written, with no drop-in that changes it; only then would it record the commit and leave the listeners enabled"
     say "and last, with the listeners on, it would make one real connection to each socket as $KS_AGENT, which must be answered"
+    if [ "$KS_GIT" = 1 ]; then
+        say "then, in $KS_AGENT's global git settings, for $(ks_git_origin || echo 'the relay'): an empty credential helper, then $KS_OPT/$KS_COMMIT/$KS_GIT_HELPER --socket $KS_RUN/git.sock, and useHttpPath = true (nothing else there changes)"
+    elif [ -e "$KS_UNITDIR/$(ks_unit_name key-git.socket)" ]; then
+        say "and it would take the git sign-in's units away (this commit has none)"
+    fi
     if [ "$KS_GH" = 1 ]; then
         say "and ask the GitHub socket, as $KS_AGENT, for the key's fingerprint$([ "$KS_GH_SKIP_CHECK" = 1 ] && echo ' (not GitHub: --skip-github-check)' || echo ', then GitHub for the App (GET /app with a JWT, made on the key'"'"'s side)')"
     fi
@@ -497,6 +522,9 @@ fi
 
 heading "the units"
 if ! ks_write_units; then record FAIL units "$KS_WHY"; report_print; exit 1; fi
+if [ "$KS_GIT" = 0 ]; then
+    if ! ks_drop_git_units; then record FAIL units "$KS_WHY"; report_print; exit 1; fi
+fi
 MOVED=0
 [ "$MODE" != install ] && [ "$KS_COMMIT" != "$KS_CUR" ] && MOVED=1
 
@@ -528,6 +556,7 @@ if [ "$MODE" = install ] && [ -z "$KS_CUR" ]; then
     fi
     record OK answers "each socket answered a real connection, made as $KS_AGENT"
     ks_github_report || { report_print; exit 1; }
+    git_settings || { report_print; exit 1; }
     record DONE keyservice "installed and listening at $KS_RUN"
     heading "next, on the instance's side (as $KS_AGENT)"
     say "1. In the instance's settings file (~/.config/ghost-protocol/$KS_NAME.json, the one its service passes with --settings),"
@@ -567,6 +596,7 @@ else
     fi
     record OK answers "each socket answered a real connection, made as $KS_AGENT"
     ks_github_report || { report_print; exit 1; }
+    git_settings || { report_print; exit 1; }
 
     if [ "$MODE" != install ] && [ "$MOVED" = 0 ]; then
         say "the key service of $KS_NAME already runs $KS_COMMIT"

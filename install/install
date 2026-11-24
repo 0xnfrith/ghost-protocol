@@ -34,7 +34,8 @@
 #
 # An update (--update, which boot.sh --update passes after it moved the
 # checkout to the new pinned commit) runs only steps 1, 3 (the home already on
-# this machine: --instance-dir, or ~/<repo>; never a clone), 4, 7 (the pinned
+# this machine: --instance-dir, or ~/<repo>; never a clone), 4, 5 (the layout:
+# only what is missing is made or added, and nothing there is moved), 7 (the pinned
 # Claude Code, without the sign-in check), 11 (with the Buzz adapter's
 # dependencies installed again when its lockfile changed) and 14 (the memory
 # and auto-mode guards, then the restart of <name>.service when the checkout
@@ -248,8 +249,14 @@ if [ "$UPDATE_MODE" = "1" ]; then
     step_preflight        || finish
     step_instance_update  || finish
     step_manifest         || finish
+    # The layout too, adding only: it makes the folders that are missing,
+    # wires the worktree hook and adds the shared folders to
+    # additionalDirectories, each when it is not there yet. It moves nothing,
+    # takes no entry out of additionalDirectories (LAYOUT_PRUNE=false), and a
+    # place that holds something else is a warning, never a stop (LAYOUT_SOFT=1).
+    LAYOUT_PRUNE=false LAYOUT_SOFT=1 step_layout || finish
     step_claude           || finish
-    record SKIP update "update: GitHub access, the layout, the setup hook, the Claude sign-in, the status line and the tools are not checked; a run without --update checks them"
+    record SKIP update "update: GitHub access, the setup hook, the Claude sign-in, the status line and the tools are not checked; a run without --update checks them"
     step_plugins          || finish
     step_service          || finish
     finish

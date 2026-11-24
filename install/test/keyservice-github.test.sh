@@ -75,7 +75,7 @@ setup() {
     cat >"$T/state/passwd" <<EOF
 root:x:0:0:root:/root:/bin/bash
 $ME:x:$(id -u):$(id -g)::$T/home:/bin/bash
-agent:x:4242:4242::/home/agent:/bin/bash
+agent:x:4242:4242::$T/agent-home:/bin/bash
 EOF
     cat >"$T/state/group" <<EOF
 root:x:0:
@@ -83,7 +83,7 @@ sudo:x:27:$ME
 systemd-journal:x:101:agent
 agent:x:4242:
 EOF
-    mkdir -p "$T/procsys/fs" "$T/etc/systemd/system"
+    mkdir -p "$T/procsys/fs" "$T/etc/systemd/system" "$T/agent-home"
     echo 1 >"$T/procsys/fs/protected_symlinks"; echo 1 >"$T/procsys/fs/protected_hardlinks"
     B="$T/home/.cache/ghost-protocol/buzz"
     mkdir -p "$B"
@@ -151,13 +151,13 @@ check "usage: the App key from a terminal: says why" out_has 'never from a termi
 t_env "$SETUP" --help >"$OUT" 2>&1; RC=$?
 check "--help lists the slot's options" sh -c "grep -q -- '--github-app-key-from-stdin' '$OUT' && grep -q -- '--replace-github-app-key' '$OUT' && grep -q -- '--github-settings <file>' '$OUT' && grep -q -- '--github-public-text <file>' '$OUT' && grep -q -- '--skip-github-check' '$OUT'"
 
-# 2. A dry run with the slot: READY, github.conf and the eight units in full,
+# 2. A dry run with the slot: READY, github.conf and the ten units in full,
 #    the key never, nothing written.
 setup
 gh_ks "$GHKEY" --settings "$SETTINGS" --key-generate --github-settings "$GHS" --github-public-text "$RULES"
 check "dry run: exit 0" rc_is 0
 check "dry run: READY" out_has '^READY$'
-check "dry run: eight units in full" sh -c "[ \"\$(grep -c 'would write .*/gp-key-inst-' '$OUT')\" = 8 ]"
+check "dry run: ten units in full" sh -c "[ \"\$(grep -c 'would write .*/gp-key-inst-' '$OUT')\" = 10 ]"
 check "dry run: the GitHub socket and unit among them" sh -c "grep -q 'would write .*/gp-key-inst-github.socket' '$OUT' && grep -q 'would write .*/gp-key-inst-github@.service' '$OUT'"
 check "dry run: github.conf in full" sh -c "grep -q '| GITHUB_APP_CLIENT_ID=$CLIENT' '$OUT' && grep -q '| GITHUB_REVIEW_REPOS=4242:example-org/review-target,77:Example-Org/Other.Repo' '$OUT'"
 check "dry run: github.conf holds the reviewer's own identities, COMMENT off, and where the rules are" sh -c "grep -qF '| GITHUB_REVIEW_OWN_LOGINS=$OWN_LOGIN' '$OUT' && grep -qF '| GITHUB_REVIEW_OWN_EMAILS=$OWN_EMAIL' '$OUT' && grep -q '| GITHUB_REVIEW_ALLOW_COMMENT=0' '$OUT' && grep -q '| GITHUB_REVIEW_PUBLIC_TEXT_FILE=.*/etc/ghost-protocol/inst/public-text.json' '$OUT'"
@@ -182,7 +182,7 @@ check "install: the App key is never given to another user" sh -c "! grep -q 'ch
 check "install: github.conf, 0644, the settings and nothing else" sh -c "[ \"\$(stat -c %a '$ETC_GP/github.conf')\" = 644 ] && [ \"\$(grep -v '^#' '$ETC_GP/github.conf')\" = \"\$(printf 'GITHUB_APP_CLIENT_ID=$CLIENT\nGITHUB_REVIEW_REPOS=4242:example-org/review-target,77:Example-Org/Other.Repo\nGITHUB_REVIEW_OWN_LOGINS=$OWN_LOGIN\nGITHUB_REVIEW_OWN_EMAILS=$OWN_EMAIL\nGITHUB_REVIEW_ALLOW_COMMENT=0\nGITHUB_REVIEW_PUBLIC_TEXT_FILE=$ETC_GP/public-text.json')\" ]"
 check "install: the public-text rules, 0644, the file given" sh -c "[ \"\$(stat -c %a '$ETC_GP/public-text.json')\" = 644 ] && cmp -s '$RULES' '$ETC_GP/public-text.json'"
 check "install: the rules checked by the root-owned copy's code, before they were installed" sh -c "grep -qx 'node ghrules $T/work.*/in/.*public-text.json' '$T/state/calls' || grep -q '^node ghrules ' '$T/state/calls'"
-check "install: eight units" [ "$(units_n)" = 8 ]
+check "install: ten units" [ "$(units_n)" = 10 ]
 check "install: the GitHub socket enabled and started" sh -c "[ -f '$T/state/keyunit.gp-key-inst-github.socket.enabled' ] && [ -f '$T/state/keyunit.gp-key-inst-github.socket.active' ]"
 check "install: asked as the agent user whether it reads the App key" grep -qx "runuser agent test -r $ETC_GP/github-app.pem" "$T/state/calls"
 check "install: asked as the key's user too" grep -qx "runuser gp-key-inst test -r $ETC_GP/github-app.pem" "$T/state/calls"
@@ -194,7 +194,7 @@ I=verify   # the instance name a template is asked about by
 check "install: the GitHub units read as systemd loads them" sh -c "grep -qx 'systemctl cat gp-key-inst-github@$I.service' '$T/state/calls' && grep -qx 'systemctl cat gp-key-inst-github.socket' '$T/state/calls'"
 check "install: the socket asked, as the agent user, with the root-owned copy" grep -q "^runuser agent env -i PATH=/usr/bin:/bin .* $OPT/$C1/bin/node --disable-sigusr1 $OPT/$C1/adapters/buzz/src/github-review.mjs --socket $T/run/ghost-protocol-key/inst fingerprint\$" "$T/state/calls"
 check "install: then GitHub, for the App" grep -qx 'node ghprobe app' "$T/state/calls"
-check "install: only once the listeners are on" sh -c "awk '/^systemctl enable 5\$/ { on = NR } /^node ghprobe fingerprint\$/ { p = NR } END { exit !(on && p > on) }' '$T/state/calls'"
+check "install: only once the listeners are on" sh -c "awk '/^systemctl enable 6\$/ { on = NR } /^node ghprobe fingerprint\$/ { p = NR } END { exit !(on && p > on) }' '$T/state/calls'"
 check "install: recorded" out_has 'OK +github +the GitHub socket answered as agent, and GitHub knows the key'
 check "install: says how the session posts a review" out_has 'gp-github-review --socket .*/run/ghost-protocol-key/inst review <owner/repo>'
 check "install: the relay side as before" sh -c "grep -qE 'OK +answers' '$OUT' && grep -qE 'DONE +keyservice +installed and listening' '$OUT'"
@@ -266,13 +266,13 @@ check "replace with the same key: the key stays" sh -c "[ \"\$(cat '$ETC_GP/gith
 #    the App key later): only the GitHub socket starts; the session runs on.
 setup
 install_ks
-check "relay only: six units, no GitHub socket" sh -c "[ \"\$(ls '$UNITS' | grep -c '^gp-key-inst-')\" = 6 ] && [ ! -e '$UNITS/gp-key-inst-github.socket' ]"
+check "relay only: eight units, no GitHub socket" sh -c "[ \"\$(ls '$UNITS' | grep -c '^gp-key-inst-')\" = 8 ] && [ ! -e '$UNITS/gp-key-inst-github.socket' ]"
 check "relay only: the socket not asked" sh -c "! grep -q '^node ghprobe' '$T/state/calls'"
 unit_loaded; touch "$T/state/unit-inst.service.active"
 : >"$T/state/calls"
 gh_ks "$GHKEY" --github-settings "$GHS" --github-public-text "$RULES" --apply
 check "slot added: exit 0" rc_is 0
-check "slot added: eight units" [ "$(units_n)" = 8 ]
+check "slot added: ten units" [ "$(units_n)" = 10 ]
 check "slot added: the GitHub socket enabled and started" sh -c "[ -f '$T/state/keyunit.gp-key-inst-github.socket.enabled' ] && [ -f '$T/state/keyunit.gp-key-inst-github.socket.active' ]"
 check "slot added: the session not restarted" [ ! -e "$T/state/unit-inst.service.restarts" ]
 check "slot added: the relay's connections left alone" sh -c "! grep -q 'stop-pattern gp-key-inst-channel@' '$T/state/calls' && ! grep -q '^systemctl stop: gp-key-inst-channel.socket' '$T/state/calls'"

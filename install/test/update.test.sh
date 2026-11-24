@@ -102,7 +102,9 @@ check "update: no Claude sign-in was tried" not_called "claude auth login"
 check "update: the sign-in is not checked" out_has 'OK +claude +.*sign-in not checked \(update\)'
 check "update: no GitHub call and no clone" no_github
 check "update: the setup hook did not run" not_called setup
-check "update: the skipped steps are named" out_has 'SKIP +update +update: GitHub access, the layout, the setup hook'
+check "update: the skipped steps are named" out_has 'SKIP +update +update: GitHub access, the setup hook'
+check "update: the layout step runs too" out_has '(DONE|OK) +layout +'
+check "update: the layout's shared folders are there" [ -d "$T/home/work/repos" ]
 check "update: the checkout added as a directory marketplace" grep -qx "ghost-protocol $GP" "$T/state/claude.marketplaces"
 check "update: the plugin installed at user scope" grep -qx "$GP_PLUGIN enabled user" "$T/state/claude.plugins"
 check "update: DONE gp-plugin" out_has "DONE +gp-plugin +$GP_PLUGIN installed from $GP"
@@ -111,6 +113,25 @@ check "update: through try-restart, as root" sh -c "grep -q '^sudo -n ' '$T/stat
 check "update: DONE restart" out_has "DONE +restart +restarted $UNIT: it runs $C2 \\(it ran $C1\\)"
 check "update: the instance's home is left as it is" out_has 'OK +instance +.*not fetched, pulled or switched'
 check "update: no menu question" out_has 'Choices \(update: none asked\)'
+
+# 1a. The layout on an update only adds: a place that holds something else is
+#     left alone and the update goes on; another root's entries in
+#     additionalDirectories are kept.
+world
+mkdir -p "$T/home/.claude"
+printf '%s\n' '{"permissions":{"additionalDirectories":["/other/repos","/other/worktrees","/other/media","/other/desk","/other/scratch"]}}' >"$T/home/.claude/settings.json"
+mkdir -p "$T/home/work"; echo "not a folder" >"$T/home/work/media"
+update --yes
+check "update layout, something in the way: exit 0" rc_is 0
+check "update layout, something in the way: SKIP, left alone" out_has 'SKIP +layout +.*left alone'
+check "update layout, something in the way: the file kept" grep -qx "not a folder" "$T/home/work/media"
+check "update layout, something in the way: the plugin still installed" out_has "DONE +gp-plugin +"
+world; t_tool jq
+mkdir -p "$T/home/.claude"
+printf '%s\n' '{"permissions":{"additionalDirectories":["/other/repos","/other/worktrees","/other/media","/other/desk","/other/scratch"]}}' >"$T/home/.claude/settings.json"
+update --yes
+check "update layout: this root's folders added" sh -c "jq -e '.permissions.additionalDirectories | map(endswith(\"/work/repos\")) | any' '$T/home/.claude/settings.json' >/dev/null"
+check "update layout: another root's entries kept" sh -c "jq -e '.permissions.additionalDirectories | index(\"/other/repos\") != null and index(\"/other/scratch\") != null' '$T/home/.claude/settings.json' >/dev/null"
 
 # 1b. An instance with a key service (install/keyservice/setup): the update
 #     says that the admin moves the key side's root-owned copy, with the

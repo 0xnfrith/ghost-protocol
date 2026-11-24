@@ -62,7 +62,8 @@ layout_wire_hook() {   # root dry(0|1)
 # already there is not added again, and a later copy of one is dropped. An
 # old root's folders are replaced: a parent that holds all five shared folders
 # in the list and is not this root is taken for an old root (a move or a new
-# root in the manifest), and its five entries go.
+# root in the manifest), and its five entries go, unless LAYOUT_PRUNE=false (an
+# update: it only adds).
 layout_settings_file() { printf '%s' "$HOME/.claude/settings.json"; }
 
 # The jq filters name jq's own $variables inside single quotes, on purpose.
@@ -74,9 +75,9 @@ LAYOUT_DIRS_JQ='
     (.permissions.additionalDirectories // []) as $cur
     | if ($cur | type) != "array" then error("permissions.additionalDirectories is not a list") else . end
     | ($names | map($root + "/" + .)) as $want
-    | ([$cur[] | select(shared) | split_.p] | unique
+    | (if $prune then ([$cur[] | select(shared) | split_.p] | unique
        | map(. as $p | select($p != $root and (test("[|\n]") | not)
-             and all($names[]; has_($cur; $p + "/" + .))))) as $gone
+             and all($names[]; has_($cur; $p + "/" + .))))) else [] end) as $gone
     | (reduce ($cur[] | select((shared and has_($gone; split_.p)) | not)) as $e
          ([]; if has_($want; $e) and has_(.; $e) then . else . + [$e] end)) as $kept
     | ($kept + [$want[] | select(. as $w | has_($kept; $w) | not)]) as $new
@@ -108,7 +109,7 @@ layout_add_dirs() {   # root dry(0|1)
     else
         src='{}'
     fi
-    out="$(printf '%s' "$src" | jq --arg root "$root" --argjson names "$names" "$LAYOUT_DIRS_JQ" 2>&1)" \
+    out="$(printf '%s' "$src" | jq --arg root "$root" --argjson names "$names" --argjson prune "${LAYOUT_PRUNE:-true}" "$LAYOUT_DIRS_JQ" 2>&1)" \
         || { DIRS_LINE="not added: jq could not edit $f ($out)"; return 0; }
     if [ -e "$f" ] && printf '%s\n' "$out" | jq -e --slurpfile a "$f" '. == $a[0]' >/dev/null 2>&1; then
         DIRS_STATE=already
@@ -173,6 +174,12 @@ step_layout() {
         return 0
     fi
     if ! layout_make_dirs "$root" "$DRY_RUN"; then
+        if [ "${LAYOUT_SOFT:-0}" = 1 ]; then
+            # An update never stops here: what is in the way stays as it is.
+            warn "a layout folder's place under $root holds something else (see above): left alone, and the update goes on"
+            record SKIP layout "a layout folder's place under $root holds something else (see above); left alone"
+            return 0
+        fi
         record FAIL layout "a layout folder's place under $root holds something else (see above)"
         return 1
     fi

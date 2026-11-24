@@ -31,6 +31,8 @@
 # It records "node ghprobe <action>". It also plays rules check <path> (the
 # public-text rules file): "rules 1", or refused (exit 1) while ghrules.fail
 # is there or the file is not; it records "node ghrules <path>".
+# It also plays the git sign-in's helper (git-credential.mjs --socket <path>
+# probe): see its case below.
 # Anything else is an unexpected call.
 S="${STUB_STATE:?}"
 echo "node $#" >>"$S/calls"
@@ -94,6 +96,16 @@ case "${1:-}" in
                 exit 0 ;;
         esac
         echo "node stub: unexpected github-review.mjs call" >&2; exit 64 ;;
+    */git-credential.mjs)
+        # The git sign-in's helper: --socket <path> probe. It answers with the
+        # stand-in public key (64 "a"s), unless gitprobe.fails is there (it
+        # could not reach the socket, exit 1); gitprobe.wrong gives another key.
+        # It records "node gitprobe <action>".
+        echo "node gitprobe ${4:-}" >>"$S/calls"
+        if [ -f "$S/gitprobe.fails" ]; then echo "probe: ${3:-}: could not reach the key service (ECONNREFUSED)"; exit 1; fi
+        k="$(printf '%064d' 0 | tr 0 a)"; [ -f "$S/gitprobe.wrong" ] && k="$(printf '%064d' 0 | tr 0 c)"
+        echo "probe: ${3:-} answered (key $k)"
+        exit 0 ;;
     */launch.mjs)
         [ "${2:-}" = probe ] || { echo "node stub: unexpected launch.mjs call" >&2; exit 64; }
         echo "node probe ${3:-}" >>"$S/calls"

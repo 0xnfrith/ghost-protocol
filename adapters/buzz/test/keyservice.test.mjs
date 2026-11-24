@@ -1194,3 +1194,64 @@ test("end to end: the one-shot send runs as `serve send`, with the key from the 
     relay.hooks.requireAuthTag = false;
   }
 });
+
+// ---------------------------------------------------------------- the git sign-in
+
+test("serve git: one sign-in for one repository on the relay, signed by the key service's key, with the owner's tag", async () => {
+  const { verifyEvent } = await import("nostr-tools/pure");
+  const home = keyHome("serve-git");
+  const repo = `git/${owner.pubkey}/ops-notes`;
+  const ask = (request, env = {}) =>
+    serveOnce("git", { home, input: `${JSON.stringify(request)}\n`, env: { BUZZ_RELAY_URL: "wss://relay.example.com", ...env } });
+  for (const path of [repo, `${repo}/info/refs`, `${repo}/git-upload-pack`, `${repo}/git-receive-pack`]) {
+    const r = ask({ op: "sign", protocol: "https", host: "relay.example.com", path });
+    leakTexts.push(r.stdout, r.stderr);
+    assert.equal(r.status, 0, r.stderr);
+    const answer = JSON.parse(r.stdout);
+    assert.deepEqual(Object.keys(answer).sort(), ["credential", "ok"]);
+    const event = JSON.parse(Buffer.from(answer.credential, "base64").toString("utf8"));
+    assert.ok(verifyEvent(event));
+    assert.equal(event.kind, 27235);
+    assert.equal(event.pubkey, agent.pubkey);
+    assert.equal(event.content, "");
+    assert.deepEqual(event.tags, [["u", `https://relay.example.com/${repo}`], ["method", "GET"], TAG]);
+    assert.ok(Math.abs(event.created_at - Date.now() / 1000) < 30);
+    assert.match(r.stderr, new RegExp(`signed a git sign-in for ${owner.pubkey}/ops-notes`));
+  }
+  const ping = ask({ op: "ping" });
+  assert.equal(ping.status, 0, ping.stderr);
+  assert.deepEqual(JSON.parse(ping.stdout), { ok: true, pubkey: agent.pubkey });
+  // Never another host, scheme, endpoint or shape: the socket is no general signer.
+  for (const [request, why] of [
+    [{ op: "sign", protocol: "https", host: "other.example.com", path: repo }, /only the instance's own relay/],
+    [{ op: "sign", protocol: "http", host: "relay.example.com", path: repo }, /only https/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: "events" }, /one repository/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: "query" }, /one repository/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: `git/${owner.pubkey}/a/b` }, /one repository/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: `git/${owner.pubkey}/..` }, /name must be/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: `git/${owner.pubkey}/.hidden` }, /name must be/],
+    [{ op: "sign", protocol: "https", host: "relay.example.com", path: "git/NOTHEX/repo" }, /owner must be/],
+    [{ op: "event", kind: 1, content: "hi" }, /op must be sign or ping/],
+  ]) {
+    const r = ask(request);
+    leakTexts.push(r.stdout, r.stderr);
+    assert.equal(r.status, 1, JSON.stringify(request));
+    const answer = JSON.parse(r.stdout);
+    assert.equal(answer.ok, false);
+    assert.equal(answer.credential, undefined);
+    assert.match(answer.error, why);
+  }
+  const junk = serveOnce("git", { home, input: "not json\n", env: { BUZZ_RELAY_URL: "wss://relay.example.com" } });
+  assert.equal(junk.status, 1);
+  assert.match(JSON.parse(junk.stdout).error, /one line of JSON/);
+  const long = serveOnce("git", { home, input: `${"x".repeat(5000)}\n`, env: { BUZZ_RELAY_URL: "wss://relay.example.com" } });
+  assert.equal(long.status, 1);
+  assert.match(JSON.parse(long.stdout).error, /at most 4096 bytes/);
+});
+
+test("launch.mjs git: the sign-in runs only on the key service's side", () => {
+  const r = spawnSync(process.execPath, [LAUNCH, "git"], { env: { ...BASE_ENV, BUZZ_PRIVATE_KEY: agent.hex }, encoding: "utf8", input: "" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /usage/);
+  assert.equal(r.stdout, "");
+});

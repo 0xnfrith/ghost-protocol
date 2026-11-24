@@ -38,7 +38,7 @@
 //       an MCP initialize, and the server's answer. It prints the server's
 //       name, or why there was no answer, and exits 0 only when it answered.
 //       install/keyservice/setup runs it as the instance's user.
-//   node launch.mjs serve channel|buzz-mcp|send|task …
+//   node launch.mjs serve channel|buzz-mcp|send|task|git …
 //       the key service's side, run by systemd as the key's user, one
 //       process per connection. It takes the key from the file descriptor
 //       systemd opened for it (OpenFile=…:buzz-key), sets it from inside
@@ -180,16 +180,18 @@ const scripts = {
   task: () => join(ROOT, "src", "task-cli.mjs"),
   thread: () => join(ROOT, "src", "thread.mjs"),
   status: () => join(ROOT, "src", "status-cli.mjs"),
+  git: () => join(ROOT, "src", "git-auth.mjs"),
 };
 // The key service runs only these; the one-shot thread read is the guard's,
 // which never runs with a key service, and the status line is not served
 // there (yet).
-const SERVED = new Set(["channel", "buzz-mcp", "send", "task"]);
+const SERVED = new Set(["channel", "buzz-mcp", "send", "task", "git"]);
 
 /** Today's way: the key from BUZZ_KEY_COMMAND, handed to the server in its own environment. */
 async function launch(target) {
-  if (!Object.hasOwn(scripts, target)) {
-    fail("usage: launch.mjs channel|buzz-mcp|send|task|thread|status, or launch.mjs serve channel|buzz-mcp|send|task");
+  // The git sign-in runs only on the key service's side (serve git).
+  if (!Object.hasOwn(scripts, target) || target === "git") {
+    fail("usage: launch.mjs channel|buzz-mcp|send|task|thread|status, or launch.mjs serve channel|buzz-mcp|send|task|git");
   }
 
   ensureDeps();
@@ -441,7 +443,7 @@ function mcpRootProblem() {
  * key is never in an environment the kernel shows in /proc/<pid>/environ.
  */
 async function serve(target) {
-  if (!SERVED.has(target)) fail("usage: launch.mjs serve channel|buzz-mcp|send|task");
+  if (!SERVED.has(target)) fail("usage: launch.mjs serve channel|buzz-mcp|send|task|git");
   // 1. Nothing may run in this process before the server: no node options
   //    (but --disable-sigusr1) and no loader settings.
   if (process.execArgv.some((option) => !ALLOWED_NODE_OPTIONS.has(option))) {
@@ -530,5 +532,5 @@ const target = process.argv[2];
 const socketFolder = setting("BUZZ_KEY_SOCKET");
 if (target === "serve") await serve(process.argv[3]);
 else if (target === "probe") await probeSocket(process.argv[3], socketFolder);
-else if (socketFolder && Object.hasOwn(scripts, target)) await pipeTo(target, socketFolder);
+else if (socketFolder && Object.hasOwn(scripts, target) && target !== "git") await pipeTo(target, socketFolder);
 else await launch(target);

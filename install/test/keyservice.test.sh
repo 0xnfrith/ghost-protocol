@@ -14,7 +14,7 @@
 #     the code at /opt/ghost-protocol/<commit> from git (never the working
 #     tree), writes the key file 0400 from stdin without printing it, the
 #     settings, the tag, the shared folders with their owners and modes, and
-#     the six units, then asks as the agent user and as the key's user whether
+#     the eight units (the git sign-in's two among them), then asks as the agent user and as the key's user whether
 #     either can read the key (a yes stops it, and nothing is started).
 #   - The units: the key's user, the key by OpenFile=, no key anywhere else,
 #     the sandbox (every hardening line), the sockets' group and modes, one
@@ -68,7 +68,7 @@ setup() {
     cat >"$T/state/passwd" <<EOF
 root:x:0:0:root:/root:/bin/bash
 $ME:x:$(id -u):$(id -g)::$T/home:/bin/bash
-agent:x:4242:4242::/home/agent:/bin/bash
+agent:x:4242:4242::$T/agent-home:/bin/bash
 EOF
     cat >"$T/state/group" <<EOF
 root:x:0:
@@ -83,7 +83,7 @@ staff:x:50:
 systemd-journal:x:101:agent
 agent:x:4242:
 EOF
-    mkdir -p "$T/procsys/fs" "$T/etc/systemd/system"
+    mkdir -p "$T/procsys/fs" "$T/etc/systemd/system" "$T/agent-home"
     echo 1 >"$T/procsys/fs/protected_symlinks"; echo 1 >"$T/procsys/fs/protected_hardlinks"
     B="$T/home/.cache/ghost-protocol/buzz"
     mkdir -p "$B"
@@ -165,7 +165,7 @@ check "dry run: exit 0" rc_is 0
 check "dry run: READY" out_has '^READY$'
 check "dry run: the key's user would be made, a system user with no shell" out_has 'would run: useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin'
 check "dry run: buzz.env in full" out_has '\| BUZZ_RELAY_URL=https://relay.example.com'
-check "dry run: each unit in full" sh -c "grep -c 'would write .*/gp-key-inst-' '$OUT' | grep -qx 6"
+check "dry run: each unit in full" sh -c "grep -c 'would write .*/gp-key-inst-' '$OUT' | grep -qx 8"
 check "dry run: the key is never printed, nor read" out_lacks "$STANDIN"
 check "dry run: nothing written" nothing_written
 check "dry run: no user made" not_called useradd
@@ -897,7 +897,7 @@ check "install: the shared folder, 0711" [ "$(mode_of "$SRV_GP")" = 711 ]
 check "install: outbox 2770, the agent user's, the key's group" sh -c "[ \"\$(stat -c %a '$SRV_GP/outbox')\" = 2770 ] && grep -qx 'chown agent:gp-key-inst $SRV_GP/outbox' '$T/state/calls'"
 check "install: files 2750, the key's user's, the agent's group" sh -c "[ \"\$(stat -c %a '$SRV_GP/files')\" = 2750 ] && grep -qx 'chown gp-key-inst:agent $SRV_GP/files' '$T/state/calls'"
 check "install: media 2750, the key's user's, the agent's group" sh -c "[ \"\$(stat -c %a '$SRV_GP/media')\" = 2750 ] && grep -qx 'chown gp-key-inst:agent $SRV_GP/media' '$T/state/calls'"
-check "install: six units" sh -c "[ \"\$(ls '$UNITS' | grep -c '^gp-key-inst-')\" = 6 ]"
+check "install: eight units" sh -c "[ \"\$(ls '$UNITS' | grep -c '^gp-key-inst-')\" = 8 ]"
 check "install: the listeners enabled and started" sh -c "[ -f '$T/state/keyunit.gp-key-inst-channel.socket.active' ] && [ -f '$T/state/keyunit.gp-key-inst-buzz-mcp.socket.active' ] && [ -f '$T/state/keyunit.gp-key-inst-outbox.path.enabled' ]"
 check "install: asked as the agent user whether it reads the key" grep -qx "runuser agent test -r $ETC_GP/buzz-key" "$T/state/calls"
 check "install: asked as the key's user too" grep -qx "runuser gp-key-inst test -r $ETC_GP/buzz-key" "$T/state/calls"
@@ -905,6 +905,45 @@ check "install: asked whether the agent user writes the code" grep -qx "runuser 
 check "install: the instance is not restarted (its side is not switched yet)" sh -c "! grep -q 'systemctl try-restart' '$T/state/calls'"
 check "install: says what the instance's side does next" out_has '"buzz_key_socket": ".*/run/ghost-protocol-key/inst"'
 check "install: no temporary folder left" no_temp_left
+check "install: the git sign-in's socket and unit" sh -c "[ -f '$UNITS/gp-key-inst-git.socket' ] && [ -f '$UNITS/gp-key-inst-git@.service' ]"
+check "install: the git socket enabled and started" [ -f "$T/state/keyunit.gp-key-inst-git.socket.active" ]
+check "install: the git socket asked, as the agent user, for its key" grep -qx "node gitprobe probe" "$T/state/calls"
+GH_HELPER="!$OPT/$C1/bin/node --disable-sigusr1 $OPT/$C1/adapters/buzz/src/git-credential.mjs --socket $T/run/ghost-protocol-key/inst/git.sock"
+agit() { GIT_CONFIG_GLOBAL="$T/agent-home/.gitconfig" git config --global "$@"; }
+check "install: the agent's git, an empty helper for the relay first" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get-all credential.https://relay.example.com.helper | head -n 1)\" = '' ]"
+check "install: then the root-owned helper with the git socket" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get-all credential.https://relay.example.com.helper | sed -n 2p)\" = '$GH_HELPER' ]"
+check "install: and useHttpPath" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get credential.https://relay.example.com.useHttpPath)\" = true ]"
+check "install: nothing else in the agent's git settings" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --list | grep -vc '^credential.https://relay.example.com.')\" = 0 ]"
+check "install: the agent's git written as the agent user" grep -q "^runuser agent env -i HOME=$T/agent-home PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 git -C $T/agent-home config --file=$T/agent-home/.gitconfig --add credential.https://relay.example.com.helper" "$T/state/calls"
+check "install: the git settings reported" out_has "DONE.*agent's git signs in to https://relay.example.com through .*/git.sock"
+GITK="$T/agent-home/.gitconfig"; cp "$GITK" "$T/gitconfig.before"
+ks --apply
+check "a second run: OK" rc_is 0
+check "a second run: the git settings already there (OK, not DONE)" out_has "OK.*agent's git signs in to https://relay.example.com"
+check "a second run: the git settings unchanged" cmp -s "$GITK" "$T/gitconfig.before"
+# The agent user's own settings for other addresses are kept; a stale helper
+# for the relay is replaced.
+agit user.name "agent" && agit --replace-all credential.https://relay.example.com.helper "!stale-helper"
+ks --apply
+check "a stale helper: replaced" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get-all credential.https://relay.example.com.helper | tr '\\n' '|')\" = '|$GH_HELPER|' ]"
+check "a stale helper: the agent's own settings kept" sh -c "[ \"\$(GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get user.name)\" = agent ]"
+
+# The relay's address as git writes it: the scheme's own port left out.
+setup
+sed -i 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=wss://relay.example.com:443#' "$SETTINGS"
+install_ks
+check "a relay URL with its default port: installed" rc_is 0
+check "a relay URL with its default port: git's address without it" sh -c "GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get credential.https://relay.example.com.useHttpPath | grep -qx true"
+
+# The git socket must answer with the instance's own key.
+for why in fails wrong; do
+    setup
+    touch "$T/state/gitprobe.$why"
+    install_ks
+    check "git socket $why: FAIL (exit 1)" rc_is 1
+    check "git socket $why: says why" out_has "the git socket did not answer as agent with the instance's public key"
+    check "git socket $why: the agent's git is not pointed at it" [ ! -e "$T/agent-home/.gitconfig" ]
+done
 
 # The code comes from the commit, never the working tree.
 setup
@@ -1052,6 +1091,24 @@ check "rollback, its copy changed: exit 0" rc_is 0
 check "rollback, its copy changed: not reused" out_has "is not reused \\(adapters/buzz/src differs from the commit's\\)"
 check "rollback, its copy changed: put together again (npm ci)" grep -q '^npm ci' "$T/state/calls"
 check "rollback, its copy changed: the commit's file back" sh -c "git -C '$GPF' show '$C1:adapters/buzz/src/launch.mjs' | cmp -s - '$OPT/$C1/adapters/buzz/src/launch.mjs'"
+git -C "$GPF" reset -q --hard "$C1"
+# A commit without the git sign-in (a rollback past its start): its units go,
+# the other sockets serve on.
+setup
+install_ks
+git -C "$GPF" rm -q adapters/buzz/src/git-auth.mjs && git -C "$GPF" commit -q -m "no git sign-in"
+: >"$T/state/calls"
+ks --update --apply
+check "a commit with no git sign-in: exit 0" rc_is 0
+check "a commit with no git sign-in: says it is off" out_has "the git sign-in: off"
+check "a commit with no git sign-in: its units taken away" sh -c "[ ! -e '$UNITS/gp-key-inst-git.socket' ] && [ ! -e '$UNITS/gp-key-inst-git@.service' ]"
+check "a commit with no git sign-in: its socket stopped and disabled" sh -c "[ ! -e '$T/state/keyunit.gp-key-inst-git.socket.active' ] && [ ! -e '$T/state/keyunit.gp-key-inst-git.socket.enabled' ]"
+check "a commit with no git sign-in: not probed" sh -c "! grep -q 'node gitprobe' '$T/state/calls'"
+check "a commit with no git sign-in: the others still answer" grep -qx "node probe buzz-mcp" "$T/state/calls"
+check "a commit with no git sign-in: its helper out of the agent's git" sh -c "! GIT_CONFIG_GLOBAL='$T/agent-home/.gitconfig' git config --global --get-all credential.https://relay.example.com.helper"
+ks --rollback --apply
+check "back to the git sign-in: exit 0" rc_is 0
+check "back to the git sign-in: its units again" sh -c "[ -f '$UNITS/gp-key-inst-git.socket' ] && grep -q 'serve git' '$UNITS/gp-key-inst-git@.service'"
 git -C "$GPF" reset -q --hard "$C1"
 
 # 8a. One run at a time: root takes a lock no other user can open, and a
@@ -1252,7 +1309,7 @@ install_ks
 check "answers: installed (exit 0)" rc_is 0
 check "answers: each socket probed, as the agent user, in a clean environment" sh -c "grep -q '^runuser agent env -i PATH=/usr/bin:/bin .*BUZZ_KEY_SOCKET=$T/run/ghost-protocol-key/inst .*launch.mjs probe channel\$' '$T/state/calls' && grep -q '^runuser agent env -i .*launch.mjs probe buzz-mcp\$' '$T/state/calls'"
 check "answers: with the root-owned copy's node and code" grep -qF " $OPT/$C1/bin/node --disable-sigusr1 $OPT/$C1/adapters/buzz/src/launch.mjs probe channel" "$T/state/calls"
-check "answers: only once the listeners are on" sh -c "awk '/^systemctl enable 4\$/ { on = NR } /^node probe channel\$/ { p = NR } END { exit !(on && p > on) }' '$T/state/calls'"
+check "answers: only once the listeners are on" sh -c "awk '/^systemctl enable 5\$/ { on = NR } /^node probe channel\$/ { p = NR } END { exit !(on && p > on) }' '$T/state/calls'"
 check "answers: says each one answered" sh -c "grep -q 'channel.sock answered (server stub-channel)' '$OUT' && grep -q 'buzz-mcp.sock answered (server stub-buzz-mcp)' '$OUT'"
 check "answers: recorded" out_has 'OK +answers +each socket answered a real connection, made as agent'
 setup
@@ -1357,7 +1414,7 @@ install_ks
 check "drop-ins: installed (exit 0)" rc_is 0
 I=verify   # the instance name a template is asked about by
 check "drop-ins: a template asked about by an instance's name" sh -c "grep -qx 'systemctl show FragmentPath gp-key-inst-channel@$I.service' '$T/state/calls' && grep -qx 'systemctl cat gp-key-inst-buzz-mcp@$I.service' '$T/state/calls'"
-check "drop-ins: each of the six units read with systemctl cat" [ "$(grep -c '^systemctl cat gp-key-inst-' "$T/state/calls")" = 6 ]
+check "drop-ins: each of the eight units read with systemctl cat" [ "$(grep -c '^systemctl cat gp-key-inst-' "$T/state/calls")" = 8 ]
 D="$UNITS/gp-key-inst-channel@.service.d"
 dropin() {   # file text: one drop-in (printf format), daemon-reloaded, then a run
     rm -rf "$UNITS"/gp-key-inst-*.d

@@ -115,6 +115,13 @@ check "the release workflow's two checkouts are one commit" [ "$(printf '%s\n' "
 check "no Homebrew" sh -c "! cat $CODE | grep -vE '^[[:space:]]*#' | grep -qiE '(^|[^a-z])brew[[:space:]]'"
 # shellcheck disable=SC2086
 check "no git config --global" sh -c "! cat $CODE | grep -qE 'config[[:space:]]+--global'"
+# The key service's git sign-in writes git settings, but only the agent user's
+# own file, as that user (ks_git_as_agent: runuser -u <agent>, env -i).
+ks_git_lines="$(grep -nE 'git_as_agent[[:space:]]+config' "$SRC/install/lib/keyservice.sh" || true)"
+check "keyservice.sh: git settings only through ks_git_as_agent" [ -n "$ks_git_lines" ]
+check "keyservice.sh: and only the agent user's own file" sh -c "! printf '%s\n' \"\$1\" | grep -v 'config \"--file=\$KS_AGENT_HOME/.gitconfig\" ' | grep -q ." _ "$ks_git_lines"
+# shellcheck disable=SC2016  # the pattern names the script's own variables, literally
+check "keyservice.sh: ks_git_as_agent runs git as the agent user, in a clean environment" grep -qE '^    ks_root runuser -u "\$KS_AGENT" -- env -i HOME="\$KS_AGENT_HOME" ' "$SRC/install/lib/keyservice.sh"
 
 # 8. sudo only where allowed:
 #    - boot.sh's apt helper;

@@ -1,0 +1,79 @@
+# One git sign-in (gp-key-<name>-git@.service) of the Ghost Protocol instance
+# @NAME@, started by its socket for each connection.
+# install/keyservice/setup makes it from install/service/key-git@.service for
+# GHOST Protocol commit @COMMIT@.
+#
+# It runs as @KEY_USER@, the key's user: never the instance's own user, so the
+# model's processes cannot read this process's memory or environment. The key
+# arrives as a file descriptor systemd opens as root (OpenFile=); that user
+# cannot open the file itself. launch.mjs serve reads it, closes it, and sets
+# it from inside this one process (adapters/buzz/README.md, "Key service").
+#
+# What it signs (adapters/buzz/src/git-auth.mjs): one NIP-98 sign-in for git
+# over HTTP to one repository on the instance's own relay (BUZZ_RELAY_URL),
+# https://<relay>/git/<owner>/<repo>, which the relay honours for about a
+# minute. It builds the event itself; the request names only the repository.
+# It never answers with the key, and never signs for another address. Each
+# sign-in leaves one line in the journal:
+#   journalctl -u 'gp-key-@NAME@-git@*'
+#
+# Signing needs no network: the unit has none.
+
+[Unit]
+Description=Ghost Protocol instance @NAME@: the git sign-in, as the key's user
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=@KEY_USER@
+Group=@KEY_USER@
+ExecStart=@NODE@ --disable-sigusr1 @CODE@/adapters/buzz/src/launch.mjs serve git
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+OpenFile=@ETC@/buzz-key:buzz-key:read-only
+@TAG_CREDENTIAL@
+EnvironmentFile=@ETC@/buzz.env
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_COMPILE_CACHE LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT OPENSSL_CONF OPENSSL_MODULES OPENSSL_ENGINES
+WorkingDirectory=/
+UMask=0077
+LimitCORE=0
+# One request: it ends well before this.
+RuntimeMaxSec=1min
+
+# No privileges: no capabilities, none to gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+# Read-only everywhere; home folders are not there at all, nor the folders the
+# session shares with the key's user.
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-@SRV@
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+KeyringMode=private
+# Other processes are hidden, and /proc shows only process folders.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# No network: it only signs. Local sockets only (its own connection).
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

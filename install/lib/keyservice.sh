@@ -141,6 +141,19 @@
 # The key's user, when it is there, must carry this setup's comment for this
 # instance too: a user made for another role or instance is never taken.
 #
+# The git sign-in (on for every commit that has adapters/buzz/src/git-auth.mjs):
+# a socket of its own, git.sock, served as the key's user like buzz-mcp, with
+# one fixed action and no network: one NIP-98 sign-in for git over HTTP to one
+# repository on the instance's own relay (BUZZ_RELAY_URL). The agent user's git
+# reaches it through git-credential.mjs, a credential helper with no key that
+# runs from the root-owned copy; setup names it in the agent user's global git
+# settings for the relay's address only (an empty helper first, so no other
+# helper answers for that address, and useHttpPath), and changes nothing else
+# there. The last check asks the socket, as the agent user, for its key's
+# public key, which must be the instance's. A rollback to a commit without it
+# takes its units away; the git settings stay, and git then says it cannot
+# reach the key service.
+#
 # Sourced by install/keyservice/setup only.
 
 KS_TEMPLATES="$GP_DIR/install/service"
@@ -182,6 +195,10 @@ KS_RE_OWN_LOGIN='^[A-Za-z0-9][A-Za-z0-9-]{0,38}\[bot\]$'
 KS_RE_OWN_EMAIL='^[0-9]{1,12}\+[A-Za-z0-9][A-Za-z0-9-]{0,38}\[bot\]@users\.noreply\.github\.com$'
 KS_GH_FP=""; KS_GH_FP_PREV=""; KS_GH_CHANGED=0; KS_GH_ANSWERED=""; KS_GH_USER=""; KS_GH_EXISTS=0
 KS_GH_CODE="adapters/buzz/src/github-review.mjs"
+# The git sign-in: on (1) when the commit has its code (ks_git_state).
+KS_GIT=0; KS_GIT_CHANGED=0; KS_GIT_ORIGIN=""; KS_AGENT_HOME=""
+KS_GIT_CODE="adapters/buzz/src/git-auth.mjs"
+KS_GIT_HELPER="adapters/buzz/src/git-credential.mjs"
 KS_RE_FP='^SHA256:[A-Za-z0-9+/]{43}=$'
 
 ks_problem() { KS_PROBLEMS="${KS_PROBLEMS}$*
@@ -197,10 +214,16 @@ ks_root() { as_root "$@" </dev/null; }
 # The unit names, from the template names (key-channel.socket -> gp-key-<name>-channel.socket).
 KS_TEMPLATE_FILES="key-channel.socket key-channel@.service key-buzz-mcp.socket key-buzz-mcp@.service key-outbox.path key-outbox.service"
 KS_GH_TEMPLATE_FILES="key-github.socket key-github@.service"
-ks_templates() { printf '%s' "$KS_TEMPLATE_FILES"; [ "$KS_GH" = 0 ] || printf ' %s' "$KS_GH_TEMPLATE_FILES"; }
+KS_GIT_TEMPLATE_FILES="key-git.socket key-git@.service"
+ks_templates() {
+    printf '%s' "$KS_TEMPLATE_FILES"
+    [ "$KS_GIT" = 0 ] || printf ' %s' "$KS_GIT_TEMPLATE_FILES"
+    [ "$KS_GH" = 0 ] || printf ' %s' "$KS_GH_TEMPLATE_FILES"
+}
 ks_unit_name() { printf 'gp-key-%s-%s' "$KS_NAME" "${1#key-}"; }
 ks_listeners() {
     printf '%s ' "$(ks_unit_name key-channel.socket)" "$(ks_unit_name key-buzz-mcp.socket)" "$(ks_unit_name key-outbox.path)"
+    [ "$KS_GIT" = 0 ] || printf '%s ' "$(ks_unit_name key-git.socket)"
     [ "$KS_GH" = 0 ] || printf '%s ' "$(ks_unit_name key-github.socket)"
 }
 
@@ -331,6 +354,7 @@ ks_check_agent() {
     if [ -z "$line" ]; then ks_problem "the agent user $KS_AGENT does not exist (make it first: it runs the instance's Claude Code)"; return; fi
     uid="$(printf '%s' "$line" | cut -d: -f3)"; gid="$(printf '%s' "$line" | cut -d: -f4)"
     KS_AGENT_UID="$uid"
+    KS_AGENT_HOME="$(printf '%s' "$line" | cut -d: -f6)"
     KS_AGENT_GROUP="$(getent group "$gid" 2>/dev/null | cut -d: -f1)"
     if [ "$uid" = 0 ]; then ks_problem "the agent user $KS_AGENT is root"; return; fi
     if [ "$KS_AGENT" = "$KS_ME" ]; then
@@ -1629,6 +1653,21 @@ ks_answers() {
         KS_WHY="no answer on${failed} as $KS_AGENT, so the session would hear nothing. Its key units say why: journalctl -u 'gp-key-$KS_NAME-channel@*' -u 'gp-key-$KS_NAME-buzz-mcp@*'"
         return 1
     fi
+    if [ "$KS_GIT" = 1 ]; then
+        out="$(ks_git_probe 2>&1)"; rc=$?
+        out="$(printf '%s\n' "$out" | head -n 3)"
+        [ -n "$out" ] || out="probe: $KS_RUN/git.sock: no answer, and nothing said why"
+        say "$out"
+        case "$out" in
+            *" answered (key $KS_PUBKEY)"*) [ "$rc" = 0 ] && [ -n "$KS_PUBKEY" ] || failed=" git" ;;
+            *) failed=" git" ;;
+        esac
+        if [ -n "$failed" ]; then
+            KS_ANSWERED=fail
+            KS_WHY="the git socket did not answer as $KS_AGENT with the instance's public key ($KS_PUBKEY), so git could not sign in to the relay. Its unit says why: journalctl -u 'gp-key-$KS_NAME-git@*'"
+            return 1
+        fi
+    fi
     KS_ANSWERED=ok
     return 0
 }
@@ -1652,11 +1691,12 @@ ks_listening() {
 # a pipe cannot hand a running MCP session to a new server, so the whole
 # instance starts again.
 ks_restart() {
-    local unit="$KS_NAME.service" gh=""
+    local unit="$KS_NAME.service" gh="" git=""
     [ "$KS_GH" = 0 ] || gh="gp-key-$KS_NAME-github@*.service"
+    [ "$KS_GIT" = 0 ] || git="gp-key-$KS_NAME-git@*.service"
     # shellcheck disable=SC2046  # three or four unit names, no spaces in them
     ks_root systemctl stop $(ks_listeners) || warn "could not stop the key service's listeners"
-    ks_root systemctl stop "gp-key-$KS_NAME-channel@*.service" "gp-key-$KS_NAME-buzz-mcp@*.service" ${gh:+"$gh"} \
+    ks_root systemctl stop "gp-key-$KS_NAME-channel@*.service" "gp-key-$KS_NAME-buzz-mcp@*.service" ${git:+"$git"} ${gh:+"$gh"} \
         || warn "could not stop the key service's open connections"
     # shellcheck disable=SC2046
     if ! ks_root systemctl start $(ks_listeners); then KS_WHY="could not start the key service's listeners again"; return 1; fi
@@ -1673,6 +1713,121 @@ ks_restart() {
     fi
     say "restarting $unit, so the session connects to the key service again"
     ks_root systemctl try-restart "$unit" || { KS_WHY="systemctl try-restart $unit failed"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------- the git sign-in
+
+# On when the commit has the git sign-in's code (and its helper).
+ks_git_state() {
+    KS_GIT=0
+    [ -n "$KS_SRC_GIT" ] && [ -n "$KS_COMMIT" ] || return 0
+    ks_src cat-file -e "$KS_COMMIT:$KS_GIT_CODE" 2>/dev/null && ks_src cat-file -e "$KS_COMMIT:$KS_GIT_HELPER" 2>/dev/null && KS_GIT=1
+    return 0
+}
+
+# The session's side of the probe: the helper, as the agent user, asks the
+# git socket for its key's public key (no sign-in is made). One line.
+ks_git_probe() {
+    local t=""
+    [ "${GP_TEST:-}" = 1 ] && t="STUB_STATE=${STUB_STATE:-}"
+    ks_root runuser -u "$KS_AGENT" -- env -i PATH=/usr/bin:/bin ${t:+"$t"} \
+        "$KS_NODE" --disable-sigusr1 "$KS_OPT/$KS_COMMIT/$KS_GIT_HELPER" --socket "$KS_RUN/git.sock" probe
+}
+
+# The relay's git address from BUZZ_RELAY_URL in the settings:
+# <https|http>://<host[:port]>, as git names it in its credential settings.
+ks_git_origin() {
+    local u s h
+    u="$(printf '%s\n' "$KS_ENV_LINES" | sed -n 's/^BUZZ_RELAY_URL=//p' | head -n 1)"
+    case "$u" in wss://*|https://*) s=https ;; ws://*|http://*) s=http ;; *) return 1 ;; esac
+    h="${u#*://}"; h="${h%%/*}"; h="${h##*@}"
+    [[ $h =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+    # The scheme's own port is left out, as git leaves it out of the address.
+    case "$s:$h" in https:*:443) h="${h%:443}" ;; http:*:80) h="${h%:80}" ;; esac
+    printf '%s://%s' "$s" "$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+}
+
+# git as the agent user, in a clean environment. Its callers name the agent
+# user's own file (--file=<its home>/.gitconfig), never --global: this setup
+# runs as the admin, whose own git settings it never touches.
+ks_git_as_agent() {
+    # -C the agent's home: git looks for a repository in the folder it starts
+    # in, and the admin's own folder is one the agent user cannot read.
+    ks_root runuser -u "$KS_AGENT" -- env -i HOME="$KS_AGENT_HOME" PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 git -C "$KS_AGENT_HOME" "$@"
+}
+
+# The agent user's git settings for the relay's address: an empty helper
+# (so no helper set elsewhere answers for it), then the root-owned helper
+# with the git socket, and useHttpPath (the sign-in names the repository).
+# Nothing else in its git settings changes. Sets KS_GIT_CHANGED when it
+# wrote, KS_GIT_ORIGIN, or KS_WHY.
+ks_git_config() {
+    local origin helper want cur
+    KS_GIT_CHANGED=0
+    origin="$(ks_git_origin)" || { KS_WHY="BUZZ_RELAY_URL gives no git address (https://<host> or http://<host>)"; return 1; }
+    KS_GIT_ORIGIN="$origin"
+    case "$KS_AGENT_HOME" in /*) ;; *) KS_WHY="the agent user $KS_AGENT has no home folder for its git settings"; return 1 ;; esac
+    helper="!$KS_NODE --disable-sigusr1 $KS_OPT/$KS_COMMIT/$KS_GIT_HELPER --socket $KS_RUN/git.sock"
+    want="$(printf '\n%s' "$helper")"
+    cur="$(ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --get-all "credential.$origin.helper" 2>/dev/null)"
+    if [ "$cur" != "$want" ]; then
+        # Status 5: there was none to take away.
+        ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --unset-all "credential.$origin.helper" >/dev/null 2>&1
+        if ! ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --add "credential.$origin.helper" "" >/dev/null 2>&1 \
+            || ! ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --add "credential.$origin.helper" "$helper" >/dev/null 2>&1; then
+            KS_WHY="could not write credential.$origin.helper in $KS_AGENT's git settings ($KS_AGENT_HOME/.gitconfig)"; return 1
+        fi
+        KS_GIT_CHANGED=1
+    fi
+    local gv
+    gv="$(ks_git_as_agent --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p')"
+    if [ -n "$gv" ] && ! version_at_least "$gv" "${GIT_MIN_VERSION:-2.46}"; then
+        warn "$KS_AGENT's git is $gv: the git sign-in needs ${GIT_MIN_VERSION:-2.46} or newer (capability[]=authtype); until then its git cannot sign in to the relay"
+    fi
+    if [ "$(ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --get "credential.$origin.useHttpPath" 2>/dev/null)" != true ]; then
+        ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" "credential.$origin.useHttpPath" true >/dev/null 2>&1 \
+            || { KS_WHY="could not write credential.$origin.useHttpPath in $KS_AGENT's git settings"; return 1; }
+        KS_GIT_CHANGED=1
+    fi
+    return 0
+}
+
+# A commit without the git sign-in (a rollback past its start): its units,
+# if an earlier run installed them, stopped, disabled and taken away.
+ks_drop_git_units() {
+    local s n gone=0
+    s="$(ks_unit_name key-git.socket)"
+    for n in "$s" "$(ks_unit_name key-git@.service)"; do
+        [ -e "$KS_UNITDIR/$n" ] || continue
+        if [ "$gone" = 0 ]; then
+            ks_root systemctl disable --now "$s" >/dev/null 2>&1 || warn "could not stop $s"
+            ks_root systemctl stop "gp-key-$KS_NAME-git@*.service" >/dev/null 2>&1 || true
+            gone=1
+        fi
+        say "removing $KS_UNITDIR/$n (this commit has no git sign-in)"
+        ks_root rm -f "$KS_UNITDIR/$n" || { KS_WHY="could not remove $KS_UNITDIR/$n"; return 1; }
+    done
+    [ "$gone" = 0 ] || ks_root systemctl daemon-reload || { KS_WHY="systemctl daemon-reload failed"; return 1; }
+    ks_git_unconfig
+    return 0
+}
+
+# The agent user's git settings for the relay taken away again, but only when
+# they are this setup's own (an empty helper, then the git sign-in's helper for
+# this instance's socket): a helper someone else set is left as it is.
+ks_git_unconfig() {
+    local origin cur
+    origin="$(ks_git_origin)" || return 0
+    case "$KS_AGENT_HOME" in /*) ;; *) return 0 ;; esac
+    cur="$(ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --get-all "credential.$origin.helper" 2>/dev/null)"
+    case "$cur" in
+        $'\n!'*"/$KS_GIT_HELPER --socket $KS_RUN/git.sock") ;;
+        *) return 0 ;;
+    esac
+    say "taking the git sign-in out of $KS_AGENT's git settings for $origin (this commit has none)"
+    ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --unset-all "credential.$origin.helper" >/dev/null 2>&1
+    ks_git_as_agent config "--file=$KS_AGENT_HOME/.gitconfig" --unset-all "credential.$origin.useHttpPath" >/dev/null 2>&1
     return 0
 }
 
