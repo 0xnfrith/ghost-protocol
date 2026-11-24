@@ -47,6 +47,16 @@ An instance's name can't be one of the shared folders' names (`repos`, `worktree
   - A worktree made with `git worktree add` in a shell: follow rule 3 by hand.
   - Claude Code asks before it enters an existing worktree outside `.claude/worktrees/` by path. Making a new worktree never asks.
 
+## The shared folders in Claude Code's settings
+
+Claude Code works in the home, so on its own it asks before it reads or edits a file in the shared folders. The installer's layout step and the move script put them in the user's Claude Code settings (`~/.claude/settings.json`), in `permissions.additionalDirectories`: `<root>/repos`, `<root>/worktrees`, `<root>/media`, `<root>/desk` and `<root>/scratch`, as absolute paths. The home is not added; it is already where Claude Code runs.
+
+- **A merge:** the edit is made with jq. Every other key of the file stays, and so does every other entry of the list. The old file is kept beside it as `settings.json.bak-<time>`.
+- **Once each:** a folder already in the list is not added again, and a second copy of one is dropped. A second run changes nothing.
+- **A new root:** a parent folder that has all five shared folders in the list, and is not this root, is taken for an old root (after a move, or a new `root` in the manifest): its five entries are replaced by the new root's. Other entries stay.
+- **Without jq** nothing is written; the installer warns and goes on.
+- **Rollback:** `install/layout/move --rollback` takes out the entries the move added and puts back the ones it replaced.
+
 ## Moving an old single-folder instance
 
 Before this layout, an instance lived in one folder, usually `~/<repo>`. [`install/layout/move`](../install/layout/move) moves it to `<root>/<name>`:
@@ -58,7 +68,7 @@ Before this layout, an instance lived in one folder, usually `~/<repo>`. [`insta
   - the old path's project entry in `~/.claude.json` (its trust included);
   - plugin and marketplace paths that named the old folder;
   - the repo's worktrees.
-- **The hook:** it builds the shared folders and wires the worktree hook.
+- **The hook:** it builds the shared folders, wires the worktree hook, and puts the shared folders in `permissions.additionalDirectories` (above).
 - **Rollback:** `--rollback` undoes it from a state file.
 - **What it refuses:** it never stops anything itself. It refuses to run while any Claude Code session runs, since Claude Code rewrites `~/.claude.json` when it exits, or while the instance's service is active.
 - **Links:** a Claude Code file that is a link (a dotfiles setup) stays a link; the file it names is edited, with its mode kept.

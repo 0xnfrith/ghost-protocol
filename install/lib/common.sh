@@ -104,6 +104,22 @@ real_file() {
     printf '%s' "$f"
 }
 
+# Write the JSON text $2 to the file $1 names (it must exist). A link is
+# followed, so the link stays and its file changes. The new text goes through
+# a temp file beside that file, made as a copy of it (so it keeps its mode);
+# the old text is kept as <$1>.bak-<time>, beside the path as named (not
+# inside a dotfiles repo a link points into). Used by install/lib/layout.sh
+# and install/layout/worktree-hook.
+write_json_file() {
+    local f tmp
+    f="$(real_file "$1")" || return 1
+    tmp="$(mktemp "$(dirname "$f")/.settings.XXXXXX")" || return 1
+    if ! { cp -p "$f" "$tmp" && printf '%s\n' "$2" >"$tmp" && cp -p "$f" "$1.bak-$(date +%Y%m%d-%H%M%S)"; }; then
+        rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$f"
+}
+
 sha256_of() {
     if command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | cut -d' ' -f1

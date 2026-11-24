@@ -38,11 +38,16 @@
 #        ~/.claude/plugins/known_marketplaces.json  marketplaces read from it
 #        ~/.claude/settings.json                    extraKnownMarketplaces read from it
 #   5. repairs the repo's linked worktrees (git worktree repair);
-#   6. wires the worktree hook (install/layout/worktree-hook wire).
+#   6. wires the worktree hook (install/layout/worktree-hook wire);
+#   7. puts the shared folders under <root> into permissions.additionalDirectories
+#      of ~/.claude/settings.json (a jq merge: other keys and entries are kept;
+#      the five entries of an old root are replaced).
 # Each step is written to ~/.local/state/ghost-protocol/move-<name>.state as it
-# runs. --rollback undoes them from that file: an edited file nothing else
-# changed since is copied back from its .bak-move copy, one that changed gets
-# the reverse jq edit; then the folders move back and empty new folders go.
+# runs. --rollback undoes them from that file: the shared folders it added
+# leave additionalDirectories (the entries they replaced come back); an edited
+# file nothing else changed since is copied back from its .bak-move copy, one
+# that changed gets the reverse jq edit; then the folders move back and empty
+# new folders go.
 #
 # Left as they are: other links in the home folder that point into <folder>
 # (they keep working through the <folder> link), and the project folders of
@@ -74,7 +79,7 @@ while [ $# -gt 0 ]; do
         --apply)    MODE=apply; DRY=0; shift ;;
         --rollback) MODE=rollback; DRY=0; shift ;;
         --dry-run)  WANT_DRY=1; shift ;;
-        -h|--help)  sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          usage_error "unknown option: $1" ;;
     esac
 done
@@ -164,6 +169,18 @@ JQ_DEFS='def mvpath($o; $n): if type == "string" and (. == $o or startswith($o +
 # shellcheck disable=SC2016
 F_CJ='if (.projects | type) == "object" and (.projects[$old] != null) and (.projects[$new] == null)
       then .projects[$new] = .projects[$old] else . end'
+# The reverse of step 7: a list nothing changed since is put back as it was;
+# else the paths it added go and the old entries it replaced come back at the
+# end. A key it made goes again when it is left empty.
+# shellcheck disable=SC2016
+F_DIRS_UNDO='if (.permissions.additionalDirectories | type) == "array"
+      then (if .permissions.additionalDirectories == $after then $before
+            else (.permissions.additionalDirectories | map(select(. as $e | any($added[]; . == $e) | not))) as $k
+                 | $k + [$dropped[] | select(. as $d | any($k[]; . == $d) | not)] end) as $l
+         | .permissions.additionalDirectories = $l
+         | (if .permissions.additionalDirectories == [] and $made != "none" then del(.permissions.additionalDirectories) else . end)
+         | (if $made == "permissions" and .permissions == {} then del(.permissions) else . end)
+      else . end'
 # shellcheck disable=SC2016
 F_CJ_UNDO='if (.projects | type) == "object" then del(.projects[$new]) else . end'
 # shellcheck disable=SC2016
@@ -235,6 +252,31 @@ undo_edit() {   # file bak sha-after(- = unknown) label
         settings) edit_json "$label" "$f" "$F_ST" --arg old "$NEW" --arg new "$FROM" ;;
         *) bad "no reverse edit for $label" ;;
     esac
+}
+
+# Undo step 7 from the state file's dirs- lines. The file is written with
+# write_json_file (a .bak-<time> copy kept), not edit_json, so the rollback
+# adds no edit of its own to the state file.
+undo_dirs() {
+    local made existed added dropped before after out
+    made="$(grep '^dirs-made|' "$STATE" | head -n 1 | cut -d'|' -f2)"
+    existed="$(grep '^dirs-made|' "$STATE" | head -n 1 | cut -d'|' -f3)"
+    added="$(grep '^dirs-added|' "$STATE" | cut -d'|' -f2- | jq -R . | jq -sc .)"
+    dropped="$(grep '^dirs-dropped|' "$STATE" | cut -d'|' -f2- | jq -R . | jq -sc .)"
+    before="$(grep '^dirs-before|' "$STATE" | head -n 1 | cut -d'|' -f2-)"
+    after="$(grep '^dirs-after|' "$STATE" | tail -n 1 | cut -d'|' -f2-)"
+    if [ ! -f "$ST" ]; then ok "no $ST, nothing to take out"; return 0; fi
+    out="$(jq --argjson added "$added" --argjson dropped "$dropped" --argjson before "${before:-[]}" \
+        --argjson after "${after:-null}" --arg made "${made:-none}" "$F_DIRS_UNDO" "$ST")" \
+        || { bad "jq could not edit $ST"; return 1; }
+    if printf '%s\n' "$out" | jq -e --slurpfile a "$ST" '. == $a[0]' >/dev/null 2>&1; then
+        ok "nothing to take out of $ST"; return 0
+    fi
+    write_json_file "$ST" "$out" || { bad "could not write $ST"; return 1; }
+    ok "took the shared folders the move added out of $ST"
+    if [ "$existed" = "0" ] && ! in_state wired && jq -e '. == {}' "$ST" >/dev/null 2>&1; then
+        rm -f "$ST" && ok "removed $ST (it did not exist before the move)"
+    fi
 }
 
 # ---------------------------------------------------------------- worktrees
@@ -317,14 +359,14 @@ checks() {
 
 do_apply() {
     local d existed out rc had_new
-    printf '\n== 1/6 the root and its folders\n'
+    printf '\n== 1/7 the root and its folders\n'
     layout_make_dirs "$ROOT" "$DRY" || { bad "a folder's place under $ROOT holds something else"; return 1; }
     while IFS= read -r d; do [ -n "$d" ] && rec made-dir "$d"; done <<EOF
 $LAYOUT_MADE
 EOF
     [ -n "$LAYOUT_MADE" ] || ok "every folder is there"
 
-    printf '\n== 2/6 the repo\n'
+    printf '\n== 2/7 the repo\n'
     case "$(where_now)" in
         old)
             would "mv $FROM $NEW, then link $FROM -> $NEW"
@@ -342,7 +384,7 @@ EOF
         *) bad "unexpected layout"; return 1 ;;
     esac
 
-    printf '\n== 3/6 Claude Code project folder (transcripts, memory)\n'
+    printf '\n== 3/7 Claude Code project folder (transcripts, memory)\n'
     # The names start with a dash: "--" keeps ln from reading one as an option.
     if [ -d "$P_OLD" ] && [ ! -L "$P_OLD" ] && { [ -e "$P_NEW" ] || [ -L "$P_NEW" ]; }; then
         bad "both $P_OLD and $P_NEW exist; merge them by hand first"
@@ -368,7 +410,7 @@ EOF
         note "no project folder for $FROM (${P_OLD##*/}); nothing to carry"
     fi
 
-    printf '\n== 4/6 Claude Code files\n'
+    printf '\n== 4/7 Claude Code files\n'
     had_new=1
     if [ -f "$CJ" ] && ! jq -e --arg new "$NEW" '.projects[$new] != null' "$CJ" >/dev/null 2>&1; then had_new=0; fi
     edit_json claude.json "$CJ" "$F_CJ" --arg old "$FROM" --arg new "$NEW" || return 1
@@ -380,14 +422,14 @@ EOF
     edit_json known_marketplaces "$KM" "$F_KM" --arg old "$FROM" --arg new "$NEW" || return 1
     edit_json settings "$ST" "$F_ST" --arg old "$FROM" --arg new "$NEW" || return 1
 
-    printf '\n== 5/6 worktrees\n'
+    printf '\n== 5/7 worktrees\n'
     if [ "$DRY" = "1" ] && [ "$(where_now)" = "old" ]; then
         fix_worktrees "$FROM" "$FROM" "$NEW"
     else
         fix_worktrees "$NEW" "$FROM" "$NEW"
     fi
 
-    printf '\n== 6/6 the worktree hook\n'
+    printf '\n== 6/7 the worktree hook\n'
     existed=0; [ -e "$ST" ] && existed=1
     if [ "$DRY" = "1" ]; then out="$("$HOOK" wire --root "$ROOT" --dry-run 2>&1)"
     else out="$("$HOOK" wire --root "$ROOT" 2>&1)"; fi
@@ -398,6 +440,28 @@ EOF
         "0:"*) ;;
         *) note "the worktree hook is not wired; new worktrees go to Claude Code's default place" ;;
     esac
+
+    printf '\n== 7/7 the shared folders in additionalDirectories\n'
+    existed=0; [ -e "$ST" ] && existed=1
+    layout_add_dirs "$ROOT" "$DRY"
+    printf '  %s\n' "$DIRS_LINE"
+    case "$DIRS_STATE" in
+        added)
+            # What it changed, for the rollback: the key it made, each path it
+            # added, each old entry it replaced.
+            rec dirs-made "${LAYOUT_DIRS_MADE:-none}" "$existed"
+            rec dirs-before "$LAYOUT_DIRS_BEFORE"
+            rec dirs-after "$LAYOUT_DIRS_AFTER"
+            while IFS= read -r d; do [ -n "$d" ] && rec dirs-added "$d"; done <<EOF
+$LAYOUT_DIRS_ADDED
+EOF
+            while IFS= read -r d; do [ -n "$d" ] && rec dirs-dropped "$d"; done <<EOF
+$LAYOUT_DIRS_DROPPED
+EOF
+            ;;
+        already|would) ;;
+        *) note "the shared folders are not in additionalDirectories; a session in $NEW asks before it reads or edits them" ;;
+    esac
     rec complete
 }
 
@@ -406,6 +470,12 @@ EOF
 do_rollback() {
     local kind a b c d records
     records="$(awk '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }' "$STATE")"
+
+    printf '\n== rollback: the shared folders in additionalDirectories\n'
+    if in_state dirs-made; then
+        if [ "$DRY" = "1" ]; then would "take the shared folders the move added out of $ST"
+        else undo_dirs; fi
+    else ok "none added by the move"; fi
 
     printf '\n== rollback: the worktree hook\n'
     if in_state wired; then

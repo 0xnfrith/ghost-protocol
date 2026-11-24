@@ -303,21 +303,6 @@ do_remove() {
 MARK="/install/layout/worktree-hook "
 settings_file() { printf '%s' "${SETTINGS:-$HOME/.claude/settings.json}"; }
 
-# Write $2 (JSON text) to the file $1 names. A link is followed, so the link
-# stays and its file changes. The new text goes through a temp file beside
-# that file, made as a copy of it (so it keeps its mode); the old text is kept
-# as <$1>.bak-<time>, beside the path as named (not inside a dotfiles repo a
-# link points into).
-replace_json() {
-    local f tmp
-    f="$(real_file "$1")" || return 1
-    tmp="$(mktemp "$(dirname "$f")/.settings.XXXXXX")" || return 1
-    if ! { cp -p "$f" "$tmp" && printf '%s\n' "$2" >"$tmp" && cp -p "$f" "$1.bak-$(date +%Y%m%d-%H%M%S)"; }; then
-        rm -f "$tmp"; return 1
-    fi
-    mv -f "$tmp" "$f"
-}
-
 do_wire() {
     local f create remove merged re='^/[A-Za-z0-9._/-]+$'
     f="$(settings_file)"
@@ -357,7 +342,7 @@ do_wire() {
         | .hooks.WorktreeRemove = ([.hooks.WorktreeRemove[]? | select(ours | not)] + [{hooks: [{type: "command", command: $r}]}])' "$f")" \
         || { echo "not wired: jq could not merge the hooks into $f"; return 3; }
     if [ "$DRY" = "1" ]; then echo "would wire: add the WorktreeCreate and WorktreeRemove hooks to $f"; return 0; fi
-    replace_json "$f" "$merged" || return 1
+    write_json_file "$f" "$merged" || return 1
     echo "wired: added the hooks to $f (the old copy is beside it as .bak-<time>)"
 }
 
@@ -379,7 +364,7 @@ do_unwire() {
         | if .hooks == {} then del(.hooks) else . end' "$f")" \
         || { echo "not unwired: jq could not edit $f"; return 3; }
     if [ "$DRY" = "1" ]; then echo "would unwire: take the worktree-hook entries out of $f"; return 0; fi
-    replace_json "$f" "$out" || return 1
+    write_json_file "$f" "$out" || return 1
     echo "unwired: took the worktree-hook entries out of $f"
 }
 

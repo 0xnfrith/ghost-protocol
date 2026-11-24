@@ -11,7 +11,8 @@
 #    3. instance    clone the instance at main into <root>/<name> (an existing
 #                   clone is left as it is)
 #    4. manifest    read and check the manifest; then the GitHub account check
-#    5. layout      the root layout's folders and the worktree hook (docs/layout.md)
+#    5. layout      the root layout's folders, the worktree hook, and the shared
+#                   folders in Claude Code's additionalDirectories (docs/layout.md)
 #    6. setup       the instance's setup hook (setup.command in the manifest)
 #    7. claude      the pinned Claude Code, then the Claude sign-in check
 #   7b. statusline  GHOST Protocol's status line in the user's Claude Code settings
@@ -95,7 +96,7 @@ LIB="$GP_DIR/install/lib"
 # shellcheck source=lib/memory-backup.sh
 . "$LIB/memory-backup.sh"
 
-usage() { sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; }
 usage_error() { echo "install: $*" >&2; echo "Try: install/install --help" >&2; exit 2; }
 
 INSTANCE=""
