@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,7 @@ process.env.GP_DATA = data;
 process.env.GP_IMAGE_VERSION = "1.0.0";
 const { L } = await import("../layout.mjs");
 const { readJson, writeJson } = await import("../files.mjs");
-const { cmp, newest, registryOf, listTags, manifestDigest, check, nextNote, deliver } = await import("../watch.mjs");
+const { cmp, newest, registryOf, listTags, manifestDigest, check, nextNote, deliver, transcriptHas, typeIntoClaude, noteToken, CONFIRM_MS, TRIES, HELPER_GRACE_MS } = await import("../watch.mjs");
 const { createHash } = await import("node:crypto");
 mkdirSync(join(data, ".gp"), { recursive: true });
 test.after(() => rmSync(data, { recursive: true, force: true }));
@@ -161,11 +161,15 @@ test("the confirm after an update, a way back and a failed one, given once, only
   writeFileSync(L.agentState, "needs-claude 2026-01-01T00:00:00Z\n");
   assert.equal(deliver({ idle: () => ({ idle: true }), type }), false, "claude not running");
   writeFileSync(L.agentState, "running 2026-01-01T00:00:00Z\n");
-  assert.equal(deliver({ idle: () => ({ idle: false }), type }), false, "busy: later");
-  assert.equal(deliver({ idle: () => ({ idle: true }), type }), true);
+  const at = { started: 0, helper: true };
+  assert.equal(deliver({ ...at, idle: () => ({ idle: false }), type }), false, "busy: later");
+  assert.equal(deliver({ ...at, idle: () => ({ idle: true }), type, taken: () => false }), "typed");
   assert.equal(typed.length, 1);
+  assert.equal(readJson(L.handoff).told, false, "not told until a turn took it");
+  assert.equal(deliver({ ...at, idle: () => ({ idle: true }), type, taken: () => true }), "given");
   assert.equal(readJson(L.handoff).told, true);
-  assert.equal(deliver({ idle: () => ({ idle: true }), type }), false, "given once");
+  assert.equal(deliver({ ...at, idle: () => ({ idle: true }), type, taken: () => true }), false, "given once");
+  assert.equal(typed.length, 1);
 });
 
 test("a check against a registry over HTTP: the digest Docker-Content-Digest gives, on offer and in gp status --json", async () => {
@@ -183,4 +187,210 @@ test("a check against a registry over HTTP: the digest Docker-Content-Digest giv
   } finally {
     server.close();
   }
+});
+
+// --- the first ask at a start: a note typed into a claude that cannot take it yet is not lost ---
+
+/** A fresh agent with <version> on offer and nothing asked or pending; claude running and idle. */
+function freshOffer(version) {
+  writeJson(L.handoff, null);
+  writeJson(L.updateAsked, { versions: [] });
+  writeJson(L.notePending, null);
+  writeJson(L.updateAvailable, { version });
+  writeFileSync(L.agentState, "running 2026-01-01T00:00:00Z\n");
+}
+const asked = () => readJson(L.updateAsked, { versions: [] }).versions;
+const idle = () => ({ idle: true });
+
+test("the first ask, typed before claude can take it: not marked asked, typed again, given once a turn took it", () => {
+  freshOffer("1.3.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  let turn = false;
+  const taken = (frag, since) => turn && typed.at(-1).endsWith(frag) && Number.isFinite(since);
+  const t0 = 1_000_000;
+  const at = (ms) => ({ now: t0 + ms, started: t0, helper: true, idle, type, taken });
+  // The keys go to a claude still starting: they are lost, and no turn follows.
+  assert.equal(deliver(at(0)), "typed");
+  assert.deepEqual(asked(), [], "not asked yet: no turn took the note");
+  assert.equal(readJson(L.notePending).key, "ask 1.3.0");
+  assert.equal(deliver(at(10_000)), false, "within CONFIRM_MS: waits, types nothing");
+  assert.equal(typed.length, 1);
+  // No turn within CONFIRM_MS: typed again.
+  assert.equal(deliver(at(CONFIRM_MS + 1)), "typed");
+  assert.equal(typed.length, 2);
+  assert.equal(readJson(L.notePending).tries, 2);
+  // This time a turn takes it: given, once.
+  turn = true;
+  assert.equal(deliver(at(CONFIRM_MS + 15_000)), "given");
+  assert.deepEqual(asked(), ["1.3.0"]);
+  assert.equal(readJson(L.notePending, null), null);
+  assert.equal(deliver(at(CONFIRM_MS + 30_000)), false, "once per version");
+  assert.equal(deliver(at(10 * CONFIRM_MS)), false);
+  assert.equal(typed.length, 2);
+  assert.match(typed[0], /^\[GHOST Protocol\] Version 1\.3\.0 .*gp update request/);
+});
+
+test("after a restart: a version given is never asked again; a pending note is marked if a turn took it, typed again if not", () => {
+  freshOffer("1.4.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const t0 = 2_000_000;
+  assert.equal(deliver({ now: t0, started: t0, helper: true, idle, type, taken: () => false }), "typed");
+  // A restart before any turn: the new watch finds the note pending, no turn took it, and types it again once CONFIRM_MS passed.
+  const t1 = t0 + 20_000;
+  assert.equal(deliver({ now: t1, started: t1, helper: true, idle, type, taken: () => false }), false, "waits out CONFIRM_MS");
+  assert.equal(deliver({ now: t0 + CONFIRM_MS + 1, started: t1, helper: true, idle, type, taken: () => false }), "typed");
+  assert.equal(typed.length, 2);
+  // Another restart: the transcript shows a turn took it. Marked, not typed a third time.
+  const t2 = t0 + CONFIRM_MS + 5_000;
+  assert.equal(deliver({ now: t2, started: t2, helper: true, idle, type, taken: () => true }), "given");
+  assert.deepEqual(asked(), ["1.4.0"]);
+  // And after one more restart, nothing for 1.4.0.
+  const t3 = t2 + 60_000;
+  assert.equal(deliver({ now: t3, started: t3, helper: true, idle, type, taken: () => true }), false);
+  assert.equal(typed.length, 2);
+  // A later version: one note of its own.
+  writeJson(L.updateAvailable, { version: "1.5.0" });
+  assert.equal(deliver({ now: t3 + 1, started: t3, helper: true, idle, type, taken: () => false }), "typed");
+  assert.equal(deliver({ now: t3 + 2_000, started: t3, helper: true, idle, type, taken: () => true }), "given");
+  assert.deepEqual(asked(), ["1.4.0", "1.5.0"]);
+  assert.equal(typed.length, 3);
+});
+
+test("a newer version while a note is pending: the pending one is dropped, the newer one is asked about", () => {
+  freshOffer("1.6.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  assert.equal(deliver({ now: 1, started: 0, helper: true, idle, type, taken: () => false }), "typed");
+  writeJson(L.updateAvailable, { version: "1.7.0" });
+  assert.equal(deliver({ now: 2, started: 0, helper: true, idle, type, taken: () => false }), "typed");
+  assert.equal(readJson(L.notePending).key, "ask 1.7.0");
+  assert.match(typed[1], /Version 1\.7\.0/);
+});
+
+test("at most TRIES notes when no turn ever shows: then marked given, never typed again", () => {
+  freshOffer("1.8.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const logs = [];
+  for (let i = 0; i < 20; i++) deliver({ now: i * (CONFIRM_MS + 1), started: 0, helper: true, idle, type, taken: () => false, log: (l) => logs.push(l) });
+  assert.equal(typed.length, TRIES);
+  assert.deepEqual(asked(), ["1.8.0"]);
+  assert.ok(logs.some((l) => /no turn took the note \(ask 1\.8\.0\) after \d+ tries; marked as given/.test(l)), logs.join("|"));
+});
+
+test("not typed while the keys cannot go in (no pane): nothing pending, nothing marked", () => {
+  freshOffer("1.9.0");
+  assert.equal(deliver({ now: 1, started: 0, helper: true, idle, type: () => false, taken: () => false }), false);
+  assert.equal(readJson(L.notePending, null), null);
+  assert.deepEqual(asked(), []);
+});
+
+test("the first HELPER_GRACE_MS of the watch: no note while the helper was not seen, so the note says the right thing", () => {
+  freshOffer("2.0.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const t0 = 5_000_000;
+  assert.equal(deliver({ now: t0 + 1_000, started: t0, helper: false, idle, type, taken: () => false }), false, "the helper may not have polled yet");
+  assert.equal(typed.length, 0);
+  assert.equal(deliver({ now: t0 + 2_000, started: t0, helper: true, idle, type, taken: () => false }), "typed", "seen: at once");
+  assert.match(typed[0], /run `gp update request`/);
+  freshOffer("2.1.0");
+  assert.equal(deliver({ now: t0 + HELPER_GRACE_MS + 1, started: t0, helper: false, idle, type, taken: () => false }), "typed", "no helper after the grace");
+  assert.match(typed[1], /no update helper, so they update by hand/);
+});
+
+test("the transcript: a turn took the note when a transcript written since holds its token", () => {
+  const dir = join(data, "transcripts");
+  mkdirSync(dir, { recursive: true });
+  const tok = noteToken(Date.now());
+  assert.match(tok, /^\[note [0-9a-z]+\]$/);
+  assert.notEqual(noteToken(1), noteToken(1), "each typing its own");
+  const text = `[GHOST Protocol] Version 3.0.0 of GHOST Protocol is out; you run 1.0.0. Ask your operator once. ${tok}`;
+  const f = join(dir, "s1.jsonl");
+  writeFileSync(f, JSON.stringify({ type: "user", message: { role: "user", content: text } }) + "\n");
+  const since = Date.now() - 5_000;
+  assert.equal(transcriptHas(tok, since, { dir }), true);
+  assert.equal(transcriptHas(noteToken(Date.now()), since, { dir }), false, "another typing's token");
+  utimesSync(f, new Date(since - 60_000), new Date(since - 60_000));
+  assert.equal(transcriptHas(tok, since, { dir }), false, "a transcript older than the note does not count");
+  assert.equal(transcriptHas(tok, since, { dir: join(data, "nowhere") }), false, "no transcripts: not taken");
+  writeFileSync(join(dir, "s2.jsonl"), JSON.stringify({ type: "user", message: { content: [{ type: "text", text: 'a "quoted" ' + text }] } }) + "\n");
+  assert.equal(transcriptHas(tok, since, { dir }), true, "inside a content block too");
+  assert.equal(L.transcripts, join(data, ".claude", "projects", join(data, "work", "agent").replace(/[^A-Za-z0-9]/g, "-")),
+    "the project folder install/service/start names (PROJECT_DIR: the home, every other character as -)");
+});
+
+// --- the review's cases ---
+
+/** A transcript of the instance's home (L.transcripts) with one prompt. */
+function prompt(name, content) {
+  mkdirSync(L.transcripts, { recursive: true });
+  writeFileSync(join(L.transcripts, name), JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
+}
+
+test("a note whose first keys were lost still counts: the transcript holds only its tail", () => {
+  freshOffer("2.2.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const t0 = Date.now();
+  assert.equal(deliver({ now: t0, started: 0, helper: true, idle, type }), "typed");
+  prompt("tail.jsonl", typed[0].slice(40)); // claude took the note without its first 40 characters
+  assert.equal(deliver({ now: t0 + 15_000, started: 0, helper: true, idle, type }), "given");
+  assert.deepEqual(asked(), ["2.2.0"]);
+  assert.equal(typed.length, 1, "not typed again: no second DM");
+});
+
+test("an earlier copy of the same words (a resumed session, a handoff that comes again) is not this note taken", () => {
+  freshOffer("2.3.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const t0 = Date.now();
+  assert.equal(deliver({ now: t0, started: 0, helper: true, idle, type }), "typed");
+  const words = typed[0].replace(/ \[note [0-9a-z]+\]$/, "");
+  prompt("old.jsonl", `${words} [note earlier]`); // the same note, from an earlier typing, in a transcript written now
+  assert.equal(deliver({ now: t0 + CONFIRM_MS + 1, started: 0, helper: true, idle, type }), "typed", "not taken: typed again");
+  assert.deepEqual(asked(), []);
+  // A turn that took the first try late still counts: every try's token is looked for.
+  prompt("late.jsonl", typed[0]);
+  assert.equal(deliver({ now: t0 + CONFIRM_MS + 15_000, started: 0, helper: true, idle, type }), "given");
+  assert.deepEqual(asked(), ["2.3.0"]);
+});
+
+test("a pending ask a turn took, replaced by a newer version before its confirm: still marked asked", () => {
+  freshOffer("2.4.0");
+  const typed = [];
+  const type = (t) => (typed.push(t), true);
+  const t0 = Date.now();
+  assert.equal(deliver({ now: t0, started: 0, helper: true, idle, type }), "typed");
+  prompt("took.jsonl", typed[0]);
+  writeJson(L.updateAvailable, { version: "2.5.0" });
+  deliver({ now: t0 + 5_000, started: 0, helper: true, idle, type });
+  assert.deepEqual(asked(), ["2.4.0"], "the ask a turn took is asked");
+  assert.match(typed.at(-1), /Version 2\.5\.0/, "and the newer one is typed");
+  writeJson(L.updateAvailable, { version: "2.4.0" });
+  writeJson(L.notePending, null);
+  assert.equal(nextNote({ helper: true }), null, "2.4.0 never again");
+});
+
+test("before the keys, claude's input line is cleared: a try whose Enter was lost is not typed after itself", () => {
+  mkdirSync(L.startState, { recursive: true });
+  writeFileSync(join(L.startState, "pane-id"), "%3\n");
+  const calls = [];
+  assert.equal(typeIntoClaude("hello\nthere", { exec: (cmd, args) => calls.push([cmd, ...args].join(" ")) }), true);
+  assert.deepEqual(calls, ["tmux -L agent send-keys -t %3 C-u", "tmux -L agent send-keys -t %3 -l hello there", "tmux -L agent send-keys -t %3 Enter"]);
+});
+
+test("after an upgrade from a release that lost an ask: the check never offers that older version, and asks about the next", async () => {
+  writeJson(L.handoff, null);
+  writeJson(L.notePending, null);
+  writeJson(L.updateAsked, { versions: ["1.0.5"] }); // lost by the old release: marked as asked, never shown
+  writeJson(L.updateAvailable, null);
+  const repo = "ghcr.io/0xnfrith/ghost-protocol-staging";
+  const digestOf = async () => "sha256:" + "ab".repeat(32);
+  assert.equal(await check({ repo, current: "1.1.0", list: async () => ["1.0.4", "1.0.5", "1.1.0"], digestOf }), null, "nothing newer than 1.1.0");
+  assert.equal(nextNote({ current: "1.1.0", helper: true }), null);
+  assert.equal((await check({ repo, current: "1.1.0", list: async () => ["1.0.5", "1.1.0", "1.2.0"], digestOf })).version, "1.2.0");
+  assert.match(nextNote({ current: "1.1.0", helper: true }).text, /Version 1\.2\.0 /, "the next release: asked about");
 });

@@ -14,6 +14,7 @@
 //   .gp/updater-seen           when the update helper last polled (ISO time)
 //   .gp/handoff.json           how the last update or way back went, for the agent
 //   .gp/update-asked.json      the versions the agent was asked about (once each)
+//   .gp/note-pending.json      the note last typed into claude, until a turn took it (watch.mjs)
 //   .gp/profile.json           the agent's profile the relay last took (gp profile)
 //   work/agent/            the instance's home, a git checkout with its manifest
 //   .config/ghost-protocol/agent.json   the instance's settings file (start's GP_SETTINGS)
@@ -41,6 +42,7 @@ export const L = {
   updaterSeen: join(GPDIR, "updater-seen"),
   handoff: join(GPDIR, "handoff.json"),
   updateAsked: join(GPDIR, "update-asked.json"),
+  notePending: join(GPDIR, "note-pending.json"),
   previousVersion: join(GPDIR, "previous-version"),
   profile: join(GPDIR, "profile.json"),
   home: join(ROOT, NAME),
@@ -48,6 +50,8 @@ export const L = {
   settings: join(DATA, ".config", "ghost-protocol", `${NAME}.json`),
   startState: join(DATA, ".local", "state", "ghost-protocol", NAME),
   claudeJson: join(DATA, ".claude.json"),
+  // Claude Code's transcripts of the instance's home (its project folder: the path, every other character as -).
+  transcripts: join(DATA, ".claude", "projects", join(ROOT, NAME).replace(/[^A-Za-z0-9]/g, "-")),
   claudeSettings: join(DATA, ".claude", "settings.json"),
   claudeCredentials: join(DATA, ".claude", ".credentials.json"),
 };
