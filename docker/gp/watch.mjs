@@ -3,7 +3,9 @@
 // release; every few seconds it hands the agent's claude its notes:
 //
 //   - a newer release (U1): once per version, a note asks the agent to ask
-//     its operator on Buzz whether to update, and on a yes to run
+//     its operator on Buzz (named by their key, the owner in config.json, so
+//     that a note that is the first prompt of a session still says who that
+//     is) whether to update, and on a yes to run
 //     `gp update request`. With no update helper, the note asks it to tell
 //     the operator instead, who updates by hand.
 //   - after an update, a way back or a failed one (U5): a note asks the agent
@@ -165,9 +167,12 @@ export function nextNote({ current = currentVersion(), helper = updaterSeen() } 
   const avail = readJson(L.updateAvailable, null)?.version;
   const asked = readJson(L.updateAsked, { versions: [] });
   if (avail && avail !== current && !asked.versions.includes(avail)) {
+    // Who the operator is, by key: at a first prompt (a start with a release already out) nothing else in the conversation says.
+    const owner = readJson(L.config, {})?.owner;
+    const who = /^[0-9a-f]{64}$/i.test(owner ?? "") ? `your operator (their Buzz key is ${owner.toLowerCase()}; open the DM with that key if there is none yet)` : "your operator";
     const text = helper
-      ? `[GHOST Protocol] Version ${avail} of GHOST Protocol is out; you run ${current}. Ask your operator once, in your DM with them on Buzz, whether to update now. If they say yes, run \`gp update request\`: the update waits until your turn has ended, then you come back on ${avail} with this conversation and your memory. If they say no, do nothing; you will not be asked about ${avail} again.`
-      : `[GHOST Protocol] Version ${avail} of GHOST Protocol is out; you run ${current}. Tell your operator once, in your DM with them on Buzz. This install has no update helper, so they update by hand, as the quick start says; your key, memory and sign-ins are kept.`;
+      ? `[GHOST Protocol] Version ${avail} of GHOST Protocol is out; you run ${current}. Ask ${who} once, in your DM with them on Buzz, whether to update now. If they say yes, run \`gp update request\`: the update waits until your turn has ended, then you come back on ${avail} with this conversation and your memory. If they say no, do nothing; you will not be asked about ${avail} again.`
+      : `[GHOST Protocol] Version ${avail} of GHOST Protocol is out; you run ${current}. Tell ${who} once, in your DM with them on Buzz. This install has no update helper, so they update by hand, as the quick start says; your key, memory and sign-ins are kept.`;
     return { key: `ask ${avail}`, text, mark: () => writeJson(L.updateAsked, { versions: [...asked.versions, avail].slice(-50) }, 0o644) };
   }
   return null;

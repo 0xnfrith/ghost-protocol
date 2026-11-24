@@ -394,3 +394,21 @@ test("after an upgrade from a release that lost an ask: the check never offers t
   assert.equal((await check({ repo, current: "1.1.0", list: async () => ["1.0.5", "1.1.0", "1.2.0"], digestOf })).version, "1.2.0");
   assert.match(nextNote({ current: "1.1.0", helper: true }).text, /Version 1\.2\.0 /, "the next release: asked about");
 });
+
+test("the ask names the operator by their key (the owner in config.json): a first prompt knows nobody else", () => {
+  const owner = "52".repeat(32);
+  writeJson(L.handoff, null);
+  writeJson(L.notePending, null);
+  writeJson(L.updateAsked, { versions: [] });
+  writeJson(L.updateAvailable, { version: "3.1.0" });
+  writeJson(L.config, { name: "GHOST", owner });
+  const k = `your operator (their Buzz key is ${owner}; open the DM with that key if there is none yet)`;
+  assert.ok(nextNote({ helper: true }).text.includes(`Ask ${k} once, in your DM with them on Buzz`), nextNote({ helper: true }).text);
+  assert.ok(nextNote({ helper: false }).text.includes(`Tell ${k} once, in your DM with them on Buzz`));
+  writeJson(L.config, { name: "GHOST", owner: "5A" + "52".repeat(31) });
+  assert.ok(nextNote({ helper: true }).text.includes(`their Buzz key is 5a${"52".repeat(31)};`), "an upper-case key: named, in lower case");
+  writeJson(L.config, { name: "GHOST", owner: "not-a-key" });
+  assert.match(nextNote({ helper: true }).text, /Ask your operator once, in your DM/, "no key that is one: as before");
+  writeJson(L.config, {});
+  assert.match(nextNote({ helper: false }).text, /Tell your operator once, in your DM/);
+});
