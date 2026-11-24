@@ -1,7 +1,7 @@
 {
   "name": "ghost-protocol",
   "displayName": "Ghost Protocol",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "description": "A personal agent system for Claude Code. First adapter: Buzz, a channel that pushes Buzz mentions into a running session.",
   "author": {
     "name": "0xnfrith"
