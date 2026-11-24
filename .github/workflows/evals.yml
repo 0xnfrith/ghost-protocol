@@ -35,10 +35,16 @@ on:
       GP_EVAL_CHANNEL_ID:
         description: The eval channel on that relay.
         required: false
-  # By hand, both inputs empty: the evals of the commit, as on a pull request. Both set: stranger-install alone, against that
-  # published release, the quick start's way on a clean VM (evals/run --release --version; evals/ci/run says more).
+  # By hand, every input empty: the evals of the commit, as on a pull request. release and version set: stranger-install alone,
+  # against that published release, the quick start's way on a clean VM (evals/run --release --version). image set:
+  # update-ask-once alone, on that published image, with its own release check (evals/run --image). Not image with release or
+  # version: evals/ci/run refuses that, and says more.
   workflow_dispatch:
     inputs:
+      image:
+        description: "A published release's image, <release repository>:<x.y.z>@sha256:<digest>, for update-ask-once alone (its own release check); empty for the usual evals. Not with release or version"
+        required: false
+        default: ""
       release:
         description: "A published release to install, as owner/repo (with version); empty for the usual evals"
         required: false
@@ -166,6 +172,7 @@ jobs:
           # A run by hand's inputs (empty otherwise), handed on in the environment, never put into the script's text.
           GP_EVAL_CI_RELEASE: ${{ inputs.release }}
           GP_EVAL_CI_RELEASE_VERSION: ${{ inputs.version }}
+          GP_EVAL_CI_IMAGE: ${{ inputs.image }}
           # The job's own token, read-only: evals/ci/run asks the API whether the run that made another CI eval's VM has
           # finished, so that a VM a teardown left does not hold up every eval after it.
           GP_EVAL_GITHUB_TOKEN: ${{ github.token }}
