@@ -6,20 +6,27 @@ This gets a GHOST Protocol agent running on your own computer, answering you on 
 
 - **Docker.** Docker Desktop on macOS and Windows, Docker Engine on Linux. `docker version` must print a server version. See [Docker Desktop on a laptop](#docker-desktop-on-a-laptop) first if you are on macOS or Windows.
 - **A Claude subscription** that Claude Code can sign in to. The agent uses it for every answer.
-- **A Buzz relay** you can reach, and your own Buzz account. You need the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`). The agent becomes yours: it answers you and nobody else.
+- **A Buzz relay** you can reach, and your own Buzz account. The agent becomes yours: it answers you and nobody else. The Buzz way takes the relay and your key from Buzz. The terminal way needs the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`).
 - **Hosted:** coming soon. For now the agent runs on a computer you own.
 
 ## Install, the Buzz way
 
-With the GHOST Protocol plugin installed in Buzz:
+This needs the Buzz **desktop** app: the browser build cannot install plugins or start Docker. Buzz uses the relay you are on and your own key, so you type neither.
 
-1. Make sure Docker is running.
-2. New agent, **Create a new agent**, **GHOST Protocol**. Choose **This computer**. (**Hosted** is shown as coming soon and cannot be chosen.)
-3. Give it a name and press **Create**. Buzz pulls the image, sets the agent up, signs its attestation as you, and starts it. No terminal is needed.
-4. Connect Claude from the agent's screen: sign in, or paste a setup token.
-5. When its status says **running**, mention it in a channel.
+1. Install the GHOST Protocol plugin. In Buzz, open **Settings → Plugins → Manage plugins** and press **Add**. Put `https://github.com/0xnfrith/buzz-plugins` in **Git or GitHub repository** and press **Find**. Pick **GHOST Protocol**, press **Continue**, read what it asks for (every program it may run is `docker`), and press **Install plugin**. The [plugin's README](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol) shows each screen.
+2. Make sure Docker is running. The plugin's **GHOST Protocol** page (press **Cmd+K**, or Ctrl+K, and type `GHOST`) says **Docker is running** when Buzz can reach it.
+3. **Agents → New agent → Create a new agent**, and choose **GHOST Protocol** as the **Harness**. Choose **This computer**. (**Hosted** is shown as coming soon and cannot be chosen.)
+4. Give it a name, and answer the form's two questions. **Create agent** is held back until both are answered:
+   - **Your Claude account**: paste a setup token (run `claude setup-token` on a computer with Claude Code), or choose to sign in at an address.
+   - **Let GHOST Protocol update itself?** Yes starts the update helper (see [Update](#update)). No starts none, and you update by hand.
+5. Press **Create agent**. Buzz downloads the image (about 1 GB on disk, so the first time takes a while), makes the agent's key, starts it, signs its attestation as you and, with a token, signs it in to Claude. No terminal is needed. If you chose the address, open the agent's **GHOST Protocol** tab and sign in there.
+6. When its status says **Running**, mention it in a channel.
 
 If its status says the relay refused the attestation, go to [the relay setting](#the-relay-setting-and-the-member-fallback).
+
+In Docker the agent has the terminal way's names: the container `gp-<name>` and the data volume `gp-<name>-data`, where `<name>` is the agent's name in lower case with dashes. So the commands below work on it too, such as `docker exec gp-<name> gp status`.
+
+**Delete agent** in Buzz removes the container, its update helper and its data volume: the agent's key and its memory, for good. To keep the memory, stop the agent and copy its volume first. The plugin's README shows how. If Buzz has lost the agent's container name (its storage was cleared), Delete leaves the container and the volume in Docker: remove them with the commands in [Stop, restart, remove](#stop-restart-remove).
 
 ## Install, the terminal way
 

@@ -20,6 +20,27 @@ check "says Hosted is coming soon" grep -q "coming soon" "$DOC"
 check "names both fallbacks: the option and the member" bash -c "grep -q 'owner-attestation option' '$DOC' && grep -q 'Add the agent as a member' '$DOC'"
 check "has no work-in-progress label" bash -c "! grep -qi 'work in progress' '$DOC'"
 
+# The Buzz way is enough for someone who has only the Buzz app: where the plugin is, the form as the plugin draws it, the agent's
+# names in Docker, and what Delete removes.
+BUZZ=$(sed -n '/^## Install, the Buzz way$/,/^## Install, the terminal way$/p' "$DOC")
+check "the Buzz way says it needs the desktop app" grep -q 'Buzz \*\*desktop\*\* app' <<<"$BUZZ"
+check "the Buzz way gives the plugin's repository" grep -qF 'https://github.com/0xnfrith/buzz-plugins' <<<"$BUZZ"
+check "the Buzz way gives the install's buttons" bash -c "grep -q 'Manage plugins' <<<\"\$1\" && grep -q 'Install plugin' <<<\"\$1\"" _ "$BUZZ"
+check "the Buzz way names the Harness" grep -q 'as the \*\*Harness\*\*' <<<"$BUZZ"
+# at <text>: the number of the Buzz section's first line holding <text> (empty when none does).
+at() { grep -nF -e "$1" <<<"$BUZZ" | head -n 1 | cut -d: -f1; }
+claude_q=$(at '**Your Claude account**')
+update_q=$(at '**Let GHOST Protocol update itself?**')
+press=$(at 'Press **Create agent**')
+check "the Buzz way names the button Create agent, never a bare Create" bash -c "[ -n \"\$1\" ] && ! grep -qF '**Create**' <<<\"\$2\"" _ "$press" "$BUZZ"
+check "the Buzz way asks the Claude and update questions before Create agent is pressed" \
+  bash -c "[ -n \"\$1\" ] && [ -n \"\$2\" ] && [ -n \"\$3\" ] && [ \"\$1\" -lt \"\$3\" ] && [ \"\$2\" -lt \"\$3\" ]" _ "$claude_q" "$update_q" "$press"
+check "the Buzz way says Create agent waits for both questions" grep -qF '**Create agent** is held back until both are answered' <<<"$BUZZ"
+check "the Buzz way names the container and the volume" bash -c "grep -qF '\`gp-<name>\`' <<<\"\$1\" && grep -qF '\`gp-<name>-data\`' <<<\"\$1\"" _ "$BUZZ"
+check "the Buzz way says, on Delete agent's own line, that it removes the memory" grep -qE '^\*\*Delete agent\*\* .*data volume.*memory' <<<"$BUZZ"
+check "the Buzz way says Delete leaves the container and volume when Buzz lost the name" \
+  bash -c "grep -E '^\*\*Delete agent\*\* ' <<<\"\$1\" | grep -qF 'Delete leaves the container and the volume in Docker'" _ "$BUZZ"
+
 # Every `gp <command>` it shows is one that gp has.
 cmds=$(sed -n '/^const COMMANDS = {/,/^};/p' "$ROOT/docker/gp/gp.mjs" | sed -n 's/^  "\{0,1\}\([a-z-]*\)"\{0,1\}: .*/\1/p')
 for c in $(grep -oE '(docker exec( -i)? gp-[a-z-]+ gp|docker run --rm [^ ]+ gp) [a-z-]+' "$DOC" | awk '{print $NF}' | sort -u); do
