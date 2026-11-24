@@ -64,10 +64,12 @@ test("the states, from the volume", async () => {
   assert.equal((await run({ claude: false, probe: "refused-not-member" })).state, "needs-claude");
   s = await run({ probe: "refused-not-member" });
   assert.equal(s.state, "connecting");
-  // A refused login does not get in by waiting: the error says so, and names the member fallback.
+  // A refused login does not get in by waiting: the error says so, and says what the relay needs: owner attestations on, and the
+  // owner a relay member. It never offers the agent as a relay member, a way that is not supported.
   assert.equal(s.error.code, "relay-refused");
-  assert.match(s.error.message, /relay member/);
-  assert.ok(s.error.message.includes(s.agent_pubkey), "the message names the agent's key to add");
+  assert.match(s.error.message, /the relay must have owner attestations on \(BUZZ_ALLOW_NIP_OA_AUTH=true\), and the owner must be a relay member there/);
+  assert.doesNotMatch(s.error.message, /\badd\b|this agent .* as a relay member|agent as a (relay )?member/i);
+  assert.ok(s.error.message.includes(s.agent_pubkey), "the message names the agent's key");
   assert.equal((await run({ claude: false, probe: "refused-not-member" })).error, null, "needs-claude waits on the user, not the relay");
   s = await run({ probe: "unreachable" });
   assert.equal(s.state, "connecting");

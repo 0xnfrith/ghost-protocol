@@ -16,11 +16,10 @@ check() {
 }
 [ -f "$DOC" ] || { echo "FAIL  docs/quick-start.md is missing"; exit 1; }
 
-for h in "What you need" "Install, the Buzz way" "Install, the terminal way" "The relay setting and the member fallback" "Docker Desktop on a laptop" "Update" "The way back" "Stop, restart, remove"; do
+for h in "What you need" "Install, the Buzz way" "Install, the terminal way" "The relay setting: owner attestations on" "Docker Desktop on a laptop" "Update" "The way back" "Stop, restart, remove"; do
   check "has the section: $h" grep -qx "## $h" "$DOC"
 done
 check "says Hosted is coming soon" grep -q "coming soon" "$DOC"
-check "names both fallbacks: the option and the member" bash -c "grep -q 'owner-attestation option' '$DOC' && grep -q 'Add the agent as a member' '$DOC'"
 check "has no work-in-progress label" bash -c "! grep -qi 'work in progress' '$DOC'"
 
 # The Buzz way is enough for someone who has only the Buzz app: where the plugin is, the form as the plugin draws it, the agent's
@@ -47,14 +46,23 @@ check "the Buzz way says Delete leaves the container and volume when Buzz lost t
 # What a stranger needs, said in the quick start itself: a paid Claude plan, where a relay comes from and the relay admin's step, when
 # Claude is connected, and the links to the plugin's README and to AGENTS.md.
 NEED=$(sed -n '/^## What you need$/,/^## Install, the Buzz way$/p' "$DOC")
-RELAY=$(sed -n '/^## The relay setting and the member fallback$/,/^## Docker Desktop on a laptop$/p' "$DOC")
+RELAY=$(sed -n '/^## The relay setting: owner attestations on$/,/^## Docker Desktop on a laptop$/p' "$DOC")
 check "What you need: a paid Claude plan, not the free plan" \
   bash -c 'grep -qF "**A paid Claude plan**: Pro, Max, Ultra, Team or Enterprise. The free plan does not include Claude Code" <<<"$1"' _ "$NEED"
 check "What you need: where a relay comes from" \
   bash -c 'grep -qF "**Or create a community** in Buzz (it needs an account)" <<<"$1" && grep -qF "(https://github.com/block/buzz#i-want-my-own-hosted-relay)" <<<"$1"' _ "$NEED"
-check "What you need: the relay's admin turns owner attestations on (off by default) or adds the agent as a member" \
-  bash -c 'grep -qF "its admin turns owner attestations on, which is off by default, or adds the agent as a member" <<<"$1"' _ "$NEED"
+check "What you need: the relay must have owner attestations on (off by default); a relay without it is not supported yet" \
+  bash -c 'grep -qF "The relay must have owner attestations on: its admin sets \`BUZZ_ALLOW_NIP_OA_AUTH=true\`, which is off by default" <<<"$1" && grep -qF "A relay without it is not supported yet" <<<"$1"' _ "$NEED"
 check "the relay setting names the relay's option" grep -qF '`BUZZ_ALLOW_NIP_OA_AUTH=true`' <<<"$RELAY"
+check "the relay setting says owner attestations are needed, and a relay without them is not supported yet" \
+  bash -c 'grep -qF "GHOST Protocol needs a relay with owner attestations on" <<<"$1" && grep -qF "A relay without it is not supported yet." <<<"$1"' _ "$RELAY"
+check "the relay setting keeps the symptom: not a relay member, refused-not-member" \
+  bash -c 'grep -qF "is refused with \"not a relay member\"" <<<"$1" && grep -qF "GP_RELAY=refused-not-member" <<<"$1"' _ "$RELAY"
+check "the relay setting gives one cure: turn owner attestations on, then restart the agent" \
+  bash -c 'grep -qF "The cure is to **turn owner attestations on** at the relay" <<<"$1" && grep -qF "docker restart gp-my-agent" <<<"$1"' _ "$RELAY"
+check "the relay setting has no numbered list of ways out" bash -c '! grep -qE "^[0-9]+\. " <<<"$1"' _ "$RELAY"
+check "every link to the relay setting points at its heading" \
+  bash -c 'grep -qF "](#the-relay-setting-owner-attestations-on)" "$1" && ! grep -oE "\]\(#the-relay-setting[a-z-]*\)" "$1" | grep -qvF "(#the-relay-setting-owner-attestations-on)"' _ "$DOC"
 check "the Buzz way says when Claude is connected, for each way" \
   bash -c 'grep -qF "**When Claude is connected:** with a setup token pasted in the form, **Create agent** signs the agent in to Claude itself, after it hands the agent your attestation" <<<"$1" && grep -qF "With the address, **Create agent** leaves the agent waiting for Claude" <<<"$1"' _ "$BUZZ"
 check "the Buzz way links the plugin's README" grep -qF '](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol)' <<<"$BUZZ"
@@ -103,8 +111,9 @@ both() { grep -qF -e "$1" "$3" && grep -qF -e "$2" "$3"; }
 check "README: the quick start links the plugin's README" grep -qF "]($PLUGIN_README)" <<<"$QS"
 check "README: the quick start says a paid Claude plan, and not the free plan" bash -c 'grep -qF "**A paid Claude plan** (Pro, Max, Ultra, Team or Enterprise)" <<<"$1" && grep -qF "The free plan does not include Claude Code" <<<"$1"' _ "$QS"
 check "README: the quick start says where a relay comes from" bash -c 'grep -qF "**Or create a community** in Buzz (it needs an account)" <<<"$1" && grep -qF "(https://github.com/block/buzz#i-want-my-own-hosted-relay)" <<<"$1"' _ "$QS"
-check "README: the relay's admin turns owner attestations on (off by default) or adds the agent as a member" \
-  bash -c 'grep -qF "BUZZ_ALLOW_NIP_OA_AUTH=true" <<<"$1" && grep -qF "that is off by default" <<<"$1" && grep -qF "the admin adds the agent as a member" <<<"$1"' _ "$QS"
+check "README: the relay must have owner attestations on (off by default); a relay without it is not supported yet" \
+  bash -c 'grep -qF "The relay must have owner attestations on: its admin sets \`BUZZ_ALLOW_NIP_OA_AUTH=true\`, and that is off by default." <<<"$1" && grep -qF "A relay without it is not supported yet" <<<"$1" && grep -qF "the one cure is turning owner attestations on" <<<"$1"' _ "$QS"
+check "README: links the relay setting by its heading" grep -qF '](docs/quick-start.md#the-relay-setting-owner-attestations-on)' "$README"
 check "README: a pasted token is signed in by Create agent, an address afterwards on the tab" \
   bash -c 'grep -qF "**Create agent** signs the agent in to Claude itself" <<<"$1" && grep -qF "you sign in afterwards on the agent'"'"'s **GHOST Protocol** tab" <<<"$1"' _ "$QS"
 check "README: the quick start links AGENTS.md" grep -qF '](AGENTS.md)' <<<"$QS"
@@ -119,8 +128,11 @@ check "AGENTS.md gives the whole chain, in order" bash -c '
   a=$(n "| 1. Add the plugin |" "$f"); b=$(n "| 2. Check Docker |" "$f"); c=$(n "| 3. The create form |" "$f"); d=$(n "| 4. Create agent |" "$f"); e=$(n "| 5. Running |" "$f")
   [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] && [ -n "$e" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] && [ "$c" -lt "$d" ] && [ "$d" -lt "$e" ]' _ "$AGENTS"
 check "AGENTS.md says a paid Claude plan" both '**A paid Claude plan:** Pro, Max, Ultra, Team or Enterprise.' 'The free plan does not include Claude Code.' "$AGENTS"
-check "AGENTS.md gives the relay's admin step: owner attestations on (off by default) or a member" \
-  bash -c 'grep -qF "\`BUZZ_ALLOW_NIP_OA_AUTH=true\`, which is **off by default**" "$1" && grep -qF "**The agent is added as a relay member,** by the relay'"'"'s admin" "$1"' _ "$AGENTS"
+check "AGENTS.md: the relay must have owner attestations on (off by default); a relay without it is not supported yet" \
+  bash -c 'grep -qF "The relay must have owner attestations on: the relay setting \`BUZZ_ALLOW_NIP_OA_AUTH=true\`, which is **off by default**" "$1" && grep -qF "A relay without it is not supported yet." "$1"' _ "$AGENTS"
+check "AGENTS.md: the refusal keeps its symptom and its one cure" \
+  both '("not a relay member")' 'The one cure is for the relay'"'"'s admin to turn owner attestations on' "$AGENTS"
+check "AGENTS.md: links the relay setting by its heading" grep -qF '](docs/quick-start.md#the-relay-setting-owner-attestations-on)' "$AGENTS"
 check "AGENTS.md says when Claude is connected, for each way" \
   both '**Create agent** signs the agent in itself, as step 7' 'step 7 is skipped and the agent waits at `needs-claude`' "$AGENTS"
 check "AGENTS.md gives the terminal way" grep -qx '## The other way: a terminal' "$AGENTS"
@@ -128,6 +140,43 @@ check "AGENTS.md names the Buzz app's button: Or create a community, which needs
 check "AGENTS.md: the relay's refusal ends Create agent with a token; with the address Create agent does not report it, the tab does" \
   bash -c 'row=$(grep -F "| 4. Create agent |" "$1"); grep -qF "With a token, a relay that refuses the attestation ends the wait" <<<"$row" && grep -qF "With the address, Create agent ends at the Claude sign-in (\"Waiting for you to sign in to Claude\") and does not report the refusal." <<<"$row" && grep -qF "the relay row says *Refused: not a member*, with the agent'"'"'s public key, even while the agent still waits for its sign-in" <<<"$row"' _ "$AGENTS"
 check "AGENTS.md says the desktop route has not run yet" grep -qF 'the whole Buzz desktop route' "$AGENTS"
+
+# Owner attestations are required: no doc offers admitting the agent as a relay member as a way that works. A sentence that names that
+# way must say, after it, the docs' own words for it: ": that way is not supported for now". Any other "not supported" (one that says
+# it works after all, say) does not count. The old anchor and section name of the member fallback are gone everywhere.
+MEMBER_WAY='(add|adds|added|adding|make|makes|making|made)\b[^.]{0,30}\b(as )?a (relay )?member\b|\bmembership\b|\bmembers? needs? no tag|member.fallback|auth-tag set` can be skipped|tag is then not needed'
+NOT_SUPPORTED=': that way is not supported for now'
+# member_offers [file]: the sentences of the file (or of stdin) that name the member way without the docs' words for it after it.
+member_offers() {
+  sed 's/\([.!?]\) /\1\n/g' "${1:-/dev/stdin}" | grep -iE -e "$MEMBER_WAY" | grep -viE -e "($MEMBER_WAY).*$NOT_SUPPORTED"
+}
+no_member_offers() { [ -z "$(member_offers "$1")" ]; }
+offers_member() { [ -n "$(printf '%s\n' "$1" | member_offers)" ]; }
+lets_through() { [ -z "$(printf '%s\n' "$1" | member_offers)" ]; }
+# The check itself: these must be caught, and the docs' own sentences must not be.
+for m in "Or ask the admin to add the agent as a member: not supported elsewhere but works." \
+  "2. **Add the agent as a member.** The tag is then not needed." "Or give the agent membership of the relay." \
+  "Members need no tag." "A member needs no tag, so ask the admin." "See the member fallback." \
+  "Add it as a relay member: that way is not supported elsewhere."; do
+  check "the member check catches: $m" offers_member "$m"
+done
+for m in "The Buzz plugin's refusal text also suggests making the agent a relay member: that way is not supported for now." \
+  "The owner key that signs the attestation must itself be a member of the relay (your own Buzz account there is)."; do
+  check "the member check lets through: $m" lets_through "$m"
+done
+for f in "$DOC" "$README" "$AGENTS"; do
+  check "${f#"$ROOT"/}: offers no member admission as a supported way" no_member_offers "$f"
+  check "${f#"$ROOT"/}: says a relay without owner attestations is not supported yet" \
+    bash -c 'grep -qF "BUZZ_ALLOW_NIP_OA_AUTH=true" "$1" && grep -qF "A relay without it is not supported yet" "$1"' _ "$f"
+  check "${f#"$ROOT"/}: says the owner key that signs the attestation must itself be a member of the relay" \
+    grep -qiF "owner key that signs the attestation must itself be a member of the relay" "$f"
+done
+check "the relay setting: gp attest --relay checks the owner's key" \
+  bash -c 'grep -qF "\`gp attest\` checks it with \`--relay <relay address>\`: \`GP_RELAY_OWNER=refused-not-member\` means the owner is not a member there" <<<"$1"' _ "$RELAY"
+check "gp attest has --relay and prints GP_RELAY_OWNER" bash -c 'grep -qF "\"--relay\"" "$1" && grep -qF "out.kv(\"RELAY_OWNER\"" "$1"' _ "$ROOT/docker/gp/attest.mjs"
+check "the relay setting: no restart needed, the agent gets in within about a minute" grep -qF 'then restart the agent, or wait about a minute: `docker restart gp-my-agent`' <<<"$RELAY"
+check "AGENTS.md: no restart needed, the agent gets in within about a minute" grep -qF 'then restart the agent, or wait about a minute: `docker restart gp-<name>`' "$AGENTS"
+check "What you need: your own key must be a member of the relay" grep -qF 'Your own key, which signs that attestation, must be a member of the relay' <<<"$NEED"
 
 # The public words: scan the file in a temporary repository.
 T=$(mktemp -d)

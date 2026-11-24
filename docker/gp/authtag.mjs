@@ -77,7 +77,7 @@ export async function authTag(argv, out, { stdin = readStdin, check = relayCheck
       // unreachable
     }
     out.kv("RELAY", r.relay);
-    if (r.relay === "refused-not-member") out.log("the relay refused the agent's login with this tag: it does not accept owner attestations, or the owner is not a relay member there");
+    if (r.relay === "refused-not-member") out.log("the relay refused the agent's login with this tag: the relay must have owner attestations on (BUZZ_ALLOW_NIP_OA_AUTH=true), and the owner must be a relay member there");
   }
   secret.fill(0);
   return 0;

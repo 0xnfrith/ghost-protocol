@@ -6,7 +6,7 @@ This gets a GHOST Protocol agent running on your own computer, answering you on 
 
 - **Docker.** Docker Desktop on macOS and Windows, Docker Engine on Linux. `docker version` must print a server version. See [Docker Desktop on a laptop](#docker-desktop-on-a-laptop) first if you are on macOS or Windows.
 - **A paid Claude plan**: Pro, Max, Ultra, Team or Enterprise. The free plan does not include Claude Code, so it is not enough. The agent uses the plan for every answer. It signs in with a setup token (`claude setup-token`, on any computer with Claude Code) or at an address it shows. It takes no API key.
-- **A Buzz relay** you can reach, and your own Buzz account. A community comes from **Or create a community** in Buzz (it needs an account), or from [a relay of your own](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay must admit the agent: its admin turns owner attestations on, which is off by default, or adds the agent as a member (see [the relay setting](#the-relay-setting-and-the-member-fallback)). Otherwise the relay refuses the attestation Buzz signs for you. Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. The agent becomes yours: it answers you and nobody else. The Buzz way takes the relay and your key from Buzz. The terminal way needs the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`).
+- **A Buzz relay** you can reach, and your own Buzz account. A community comes from **Or create a community** in Buzz (it needs an account), or from [a relay of your own](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay must have owner attestations on: its admin sets `BUZZ_ALLOW_NIP_OA_AUTH=true`, which is off by default (see [the relay setting](#the-relay-setting-owner-attestations-on)). A relay without it is not supported yet: it refuses the attestation Buzz signs for you, and the agent never runs. Your own key, which signs that attestation, must be a member of the relay: your own Buzz account in that community is. Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. The agent becomes yours: it answers you and nobody else. The Buzz way takes the relay and your key from Buzz. The terminal way needs the relay's address (it starts with `wss://` or `ws://`) and your public key (64 hex characters, or `npub1...`).
 - **Hosted:** coming soon. For now the agent runs on a computer you own.
 
 ## Install, the Buzz way
@@ -24,7 +24,7 @@ This needs the Buzz **desktop** app: the browser build cannot install plugins or
    **When Claude is connected:** with a setup token pasted in the form, **Create agent** signs the agent in to Claude itself, after it hands the agent your attestation and before it waits for the agent to run. With the address, **Create agent** leaves the agent waiting for Claude, and you sign in afterwards on the agent's **GHOST Protocol** tab.
 6. When its status says **Running**, mention it in a channel.
 
-If its status says the relay refused the attestation, go to [the relay setting](#the-relay-setting-and-the-member-fallback).
+If its status says the relay refused the attestation, go to [the relay setting](#the-relay-setting-owner-attestations-on).
 
 In Docker the agent has the terminal way's names: the container `gp-<name>` and the data volume `gp-<name>-data`, where `<name>` is the agent's name in lower case with dashes. So the commands below work on it too, such as `docker exec gp-<name> gp status`.
 
@@ -91,16 +91,17 @@ Then mention the agent in a channel on your relay. It answers in the thread.
 | --- | --- |
 | `needs-auth-tag` | Step 2. |
 | `needs-claude` | Step 3. |
-| `connecting` | Wait a moment. If `GP_RELAY` is `refused-not-member`, see [the relay setting](#the-relay-setting-and-the-member-fallback). If it is `unreachable`, check the relay address and that this computer can reach it. |
+| `connecting` | Wait a moment. If `GP_RELAY` is `refused-not-member`, see [the relay setting](#the-relay-setting-owner-attestations-on). If it is `unreachable`, check the relay address and that this computer can reach it. |
 | `running` | Nothing. |
 | `error` | `GP_ERROR_MESSAGE` says what. `docker logs gp-my-agent` has more. |
 
-## The relay setting and the member fallback
+## The relay setting: owner attestations on
 
-A Buzz relay admits a key that is not a member only when the relay's owner-attestation option is on, and that option is **off by default**. Without it, the agent connects, is refused with "not a relay member", and `gp status` shows `GP_RELAY=refused-not-member`. You have two ways out:
+GHOST Protocol needs a relay with owner attestations on: the relay setting `BUZZ_ALLOW_NIP_OA_AUTH=true`. A relay without it is not supported yet. The setting is **off by default**. While it is off, the agent connects, is refused with "not a relay member", and `gp status` shows `GP_RELAY=refused-not-member`.
 
-1. **Turn the option on** at the relay (its admin does this: `BUZZ_ALLOW_NIP_OA_AUTH=true` in the relay's settings), then restart the agent: `docker restart gp-my-agent`.
-2. **Add the agent as a member.** Give the relay's admin the agent's public key (`GP_AGENT_PUBKEY` from the install, also in `gp status`) and ask for it to be added as a member. The tag is then not needed, and `gp auth-tag set` can be skipped.
+The cure is to **turn owner attestations on** at the relay (its admin does this: `BUZZ_ALLOW_NIP_OA_AUTH=true` in the relay's settings), then restart the agent, or wait about a minute: `docker restart gp-my-agent`. The agent tries again by itself, so it reaches `running` at its next try.
+
+The same refusal has one other cause: the owner key that signs the attestation must itself be a member of the relay (your own Buzz account there is). `gp attest` checks it with `--relay <relay address>`: `GP_RELAY_OWNER=refused-not-member` means the owner is not a member there, and the relay will refuse the tag too. This is the owner's key, not the agent's. The Buzz plugin's refusal text also suggests making the agent a relay member: that way is not supported for now.
 
 If you own the relay, you are the admin.
 

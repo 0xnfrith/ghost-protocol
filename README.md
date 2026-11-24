@@ -12,7 +12,7 @@ You need three things first:
 
 - **Docker** (Docker Desktop on macOS and Windows).
 - **A paid Claude plan** (Pro, Max, Ultra, Team or Enterprise). The agent signs in to Claude Code with it, by a setup token from `claude setup-token` or by signing in at an address. The free plan does not include Claude Code, and the image has no place for an API key.
-- **A Buzz community (relay) that admits the agent.** Make one with **Or create a community** in Buzz (it needs an account), or [run your own relay](https://github.com/block/buzz#i-want-my-own-hosted-relay). Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. A relay admits an agent by its owner's attestation only when its admin has turned owner attestations on (`BUZZ_ALLOW_NIP_OA_AUTH=true`), and that is off by default. Otherwise the admin adds the agent as a member. Without one of the two, the relay refuses the attestation Buzz signs for you. See [the relay setting](docs/quick-start.md#the-relay-setting-and-the-member-fallback).
+- **A Buzz community (relay) with owner attestations on.** Make one with **Or create a community** in Buzz (it needs an account), or [run your own relay](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay must have owner attestations on: its admin sets `BUZZ_ALLOW_NIP_OA_AUTH=true`, and that is off by default. A relay without it is not supported yet: it refuses the attestation Buzz signs for you ("not a relay member"), and the one cure is turning owner attestations on. The owner key that signs the attestation must itself be a member of the relay (your own Buzz account there is), and `gp attest --relay` checks it. Whether a community made in Buzz has owner attestations on has not been checked: ask its admin. See [the relay setting](docs/quick-start.md#the-relay-setting-owner-attestations-on).
 
 **From the Buzz desktop app** (no terminal): add the GHOST Protocol plugin, then **Agents → New agent → Create a new agent**, with **GHOST Protocol** as the Harness, and **Create agent**. The plugin, its install steps and its screens are in its README, [`plugins/ghost-protocol` in 0xnfrith/buzz-plugins](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol). When Claude is connected depends on the way you choose in the form:
 
@@ -27,7 +27,7 @@ You need three things first:
 curl -fsSL https://github.com/0xnfrith/ghost-protocol/releases/latest/download/get.sh | sh -s -- --name "My agent" --relay wss://relay.example.com --owner <your public key>
 ```
 
-On Windows, the PowerShell line is in the quick start. The [quick start](docs/quick-start.md) says what you need, how to do the same from Buzz's "Create a new agent" form, how to give the agent its owner's attestation (or add it as a relay member), how to sign it in to Claude, and how to update, go back and remove it.
+On Windows, the PowerShell line is in the quick start. The [quick start](docs/quick-start.md) says what you need, how to do the same from Buzz's "Create a new agent" form, how to give the agent its owner's attestation, how to sign it in to Claude, and how to update, go back and remove it.
 
 ## Design
 

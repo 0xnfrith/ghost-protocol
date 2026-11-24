@@ -21,8 +21,9 @@
 // A new agent is needs-auth-tag first and needs-claude after it, whichever is
 // done first; then connecting, then running. With a tag, a relay that refuses
 // or cannot be reached keeps it connecting; the relay field says why. A refusal
-// also sets error, {code: "relay-refused"}, whose message names the fallback
-// (the agent as a relay member): the login will not get in by waiting.
+// also sets error, {code: "relay-refused"}, whose message says what the relay
+// needs (owner attestations on, and the owner a relay member): the login will
+// not get in by waiting until then.
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { INTERFACE, GpError } from "./out.mjs";
@@ -106,9 +107,9 @@ async function relayProbe(cfg, now) {
   return relay;
 }
 
-/** Why a refused login does not get in by waiting, and the two ways in. */
+/** Why a refused login does not get in by waiting, and what the relay needs. */
 export const refusedMessage = (agentPubkey) =>
-  `the relay refused the agent's login with the owner's attestation: ask the relay's admin to accept owner attestations, or to add this agent (${agentPubkey}) as a relay member`;
+  `the relay refused the agent's login with the owner's attestation: the relay must have owner attestations on (BUZZ_ALLOW_NIP_OA_AUTH=true), and the owner must be a relay member there; then the agent (${agentPubkey}) gets in at its next try, within about a minute`;
 
 export async function collect({ now = Date.now(), probe = relayProbe, claude = claudeActive } = {}) {
   // A swap to this version is done once this container answers (the plugin

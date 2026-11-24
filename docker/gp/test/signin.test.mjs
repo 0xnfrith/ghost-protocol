@@ -40,6 +40,16 @@ test("auth-tag set keeps a tag the owner signed for this agent", async () => {
   assert.deepEqual(seen.tag, tag);
 });
 
+test("auth-tag set keeps a tag the relay refuses, and says what the relay needs, never the agent as a relay member", async () => {
+  const tag = signAuthTag(OWNER_SK, AGENT, "created_at<1900000000");
+  const c = capture();
+  const rc = await authTag(["set"], c.o, { stdin: () => JSON.stringify(tag) + "\n", check: async () => ({ relay: "refused-not-member" }) });
+  assert.equal(rc, 0);
+  assert.equal(c.out, "GP_INTERFACE=1\nGP_AUTH_TAG=accepted\nGP_RELAY=refused-not-member\n");
+  assert.match(c.err, /the relay must have owner attestations on \(BUZZ_ALLOW_NIP_OA_AUTH=true\), and the owner must be a relay member there/);
+  assert.doesNotMatch(c.err, /\badd\b|agent as a (relay )?member|does not accept owner attestations, or/i);
+});
+
 test("auth-tag set refuses a bad tag, one for another key, and one from another owner", async () => {
   const other = new Uint8Array(32).fill(8);
   for (const input of [

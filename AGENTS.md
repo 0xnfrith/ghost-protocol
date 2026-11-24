@@ -8,11 +8,9 @@ GHOST Protocol is one container that runs a person's own agent on their own comp
 
 1. **Docker.** Docker Desktop on macOS and Windows, Docker Engine on Linux. It must be running: `docker version` prints a server version.
 2. **A paid Claude plan:** Pro, Max, Ultra, Team or Enterprise. The free plan does not include Claude Code. The agent signs in to Claude Code in one of two ways: with a setup token made by `claude setup-token` on any computer with Claude Code, or by signing in at an address the agent shows. The image has no place for an API key.
-3. **A Buzz community (relay) that admits the agent.** It comes from **Or create a community** in the Buzz app (it needs an account), or from running a relay from [block/buzz](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay admits the agent in one of two ways:
-   - **Owner attestations are on.** This is the relay setting `BUZZ_ALLOW_NIP_OA_AUTH=true`, which is **off by default**. Then the attestation Buzz signs for the person is enough.
-   - **The agent is added as a relay member,** by the relay's admin, using the agent's public key.
+3. **A Buzz community (relay) with owner attestations on.** It comes from **Or create a community** in the Buzz app (it needs an account), or from running a relay from [block/buzz](https://github.com/block/buzz#i-want-my-own-hosted-relay). The relay must have owner attestations on: the relay setting `BUZZ_ALLOW_NIP_OA_AUTH=true`, which is **off by default**. Then the attestation Buzz signs for the person is enough. A relay without it is not supported yet.
 
-   Without either, the relay refuses the agent ("not a relay member") and it never reaches **Running**. Whether a community made in the Buzz app has owner attestations on has not been checked: ask its admin. The quick start's [relay setting](docs/quick-start.md#the-relay-setting-and-the-member-fallback) has both ways out.
+   Without owner attestations, the relay refuses the agent ("not a relay member") and it never reaches **Running**. The one cure is for the relay's admin to turn owner attestations on, then restart the agent, or wait about a minute: `docker restart gp-<name>`. The same refusal has one other cause: the owner key that signs the attestation must itself be a member of the relay (the person's own Buzz account there is), and `gp attest --relay` checks it. This is the owner's key, not the agent's. The Buzz plugin's refusal text also suggests making the agent a relay member: that way is not supported for now, so do not offer it. Whether a community made in the Buzz app has owner attestations on has not been checked: ask its admin. The quick start's [relay setting](docs/quick-start.md#the-relay-setting-owner-attestations-on) has the steps.
 4. **For the Buzz way, the Buzz desktop app,** signed in to that community. The browser build of Buzz cannot install plugins or start Docker.
 
 ## The chain, the Buzz way
@@ -38,7 +36,7 @@ Either way, the sign-in lives in the agent's data volume and survives restarts.
 
 ## The other way: a terminal
 
-`get.sh` (Linux and macOS) or `get.ps1` (Windows) makes the same container with no Buzz app. The person then gives the agent the owner's attestation (or has it added as a relay member) and signs it in to Claude with `gp claude login` or `gp claude token`. The [quick start](docs/quick-start.md), "Install, the terminal way", has every command, and "Check it" has the states and what to do in each.
+`get.sh` (Linux and macOS) or `get.ps1` (Windows) makes the same container with no Buzz app. The person then gives the agent the owner's attestation (the relay must have owner attestations on) and signs it in to Claude with `gp claude login` or `gp claude token`. The [quick start](docs/quick-start.md), "Install, the terminal way", has every command, and "Check it" has the states and what to do in each.
 
 ## Where each doc lives
 
