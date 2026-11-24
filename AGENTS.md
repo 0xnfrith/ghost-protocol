@@ -38,6 +38,16 @@ Either way, the sign-in lives in the agent's data volume and survives restarts.
 
 `get.sh` (Linux and macOS) or `get.ps1` (Windows) makes the same container with no Buzz app. The person then gives the agent the owner's attestation (the relay must have owner attestations on) and signs it in to Claude with `gp claude login` or `gp claude token`. The [quick start](docs/quick-start.md), "Install, the terminal way", has every command, and "Check it" has the states and what to do in each.
 
+## What the agent starts with
+
+Both ways make an agent that starts the same:
+
+- **Claude Opus 5.5 at medium effort** (`claude-opus-5-5`), unless its owner picks otherwise with `docker exec gp-<name> gp claude model <model> --effort <level>` (`gp claude model` alone shows both; `default` gives Claude Code's own). The model is a full id such as `claude-sonnet-5-5`, not an alias such as `opus`. An effort needs a model: the one named with it, else the one set now; `--effort` alone fails with `effort-needs-model` when no model is set. The pick is kept across restarts and updates.
+- **GHOST Protocol's workspace layout** under `/data/work` in its data volume: its home `/data/work/agent`, and `repos/`, `worktrees/`, `media/`, `desk/` and `scratch/` beside it.
+- **A `CLAUDE.md` in its home** that describes the layout. GHOST Protocol never replaces one the owner wrote or edited.
+
+The quick start's [model and workspace](docs/quick-start.md#the-model-and-the-workspace) has the details.
+
 ## Where each doc lives
 
 | What | Where |

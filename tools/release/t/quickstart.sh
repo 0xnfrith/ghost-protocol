@@ -16,7 +16,7 @@ check() {
 }
 [ -f "$DOC" ] || { echo "FAIL  docs/quick-start.md is missing"; exit 1; }
 
-for h in "What you need" "Install, the Buzz way" "Install, the terminal way" "The relay setting: owner attestations on" "Docker Desktop on a laptop" "Update" "The way back" "Stop, restart, remove"; do
+for h in "What you need" "Install, the Buzz way" "Install, the terminal way" "The relay setting: owner attestations on" "Docker Desktop on a laptop" "The model and the workspace" "Update" "The way back" "Stop, restart, remove"; do
   check "has the section: $h" grep -qx "## $h" "$DOC"
 done
 check "says Hosted is coming soon" grep -q "coming soon" "$DOC"
@@ -76,6 +76,22 @@ done
 for w in request rollback; do check "gp update $w exists" grep -q "$w" "$ROOT/docker/gp/update.mjs"; done
 for w in login token status; do check "gp claude $w exists" grep -q "$w" "$ROOT/docker/gp/claude.mjs"; done
 check "gp auth-tag set exists" grep -q "set" "$ROOT/docker/gp/authtag.mjs"
+check "gp claude model exists" grep -q 'sub === "model"' "$ROOT/docker/gp/claude.mjs"
+
+# The model and effort the docs name are the ones the image sets, and the efforts are the ones gp claude model takes.
+DEFAULTS=$(grep -m1 '^export const CLAUDE_DEFAULTS = ' "$ROOT/docker/gp/setup.mjs")
+MW=$(sed -n '/^## The model and the workspace$/,/^## Update$/p' "$DOC")
+check "the image's defaults are claude-opus-5-5 at medium" grep -qF '{ model: "claude-opus-5-5", effort: "medium" }' <<<"$DEFAULTS"
+check "the quick start says Opus 5.5 at medium effort, unless the owner picks otherwise" grep -qF '**Claude Opus 5.5 at medium effort** (`claude-opus-5-5`), unless you pick otherwise' <<<"$MW"
+check "AGENTS.md says Opus 5.5 at medium effort, and how the owner picks otherwise" bash -c 'grep -qF -e "$1" "$3" && grep -qF -e "$2" "$3"' _ '**Claude Opus 5.5 at medium effort** (`claude-opus-5-5`), unless its owner picks otherwise' 'gp claude model <model> --effort <level>' "$ROOT/AGENTS.md"
+check "the quick start shows how to pick another model and effort" grep -qF 'docker exec gp-my-agent gp claude model claude-sonnet-5-5 --effort high' <<<"$MW"
+check "the quick start says an effort needs a model, and names the error" bash -c 'grep -qF "so an effort needs a model" <<<"$1" && grep -qF "\`--effort\` alone fails with \`effort-needs-model\` when no model is set" <<<"$1" && grep -q "\"effort-needs-model\"" "$2"' _ "$MW" "$ROOT/docker/gp/claude.mjs"
+check "AGENTS.md says an effort needs a model, and names the error" grep -qF '`--effort` alone fails with `effort-needs-model` when no model is set' "$ROOT/AGENTS.md"
+check "the quick start and AGENTS.md say a full model id, not an alias, as gp claude model takes" bash -c 'grep -qF "An alias such as \`opus\` is refused" <<<"$1" && grep -qF "not an alias such as \`opus\`" "$2" && grep -qF "an alias is not taken" "$3"' _ "$MW" "$ROOT/AGENTS.md" "$ROOT/docker/gp/claude.mjs"
+check "the efforts the quick start names are the ones gp claude model takes" bash -c 'grep -qF "export const EFFORTS = [\"low\", \"medium\", \"high\", \"xhigh\", \"max\"];" "$1" && grep -qF "An effort is \`low\`, \`medium\`, \`high\`, \`xhigh\` or \`max\`" <<<"$2"' _ "$ROOT/docker/gp/claude.mjs" "$MW"
+check "the quick start names the layout's shared folders, the installer's" bash -c 'for d in $(sed -n "s/^LAYOUT_DIRS=\"\(.*\)\"$/\1/p" "$1"); do grep -qF "\`$d/\`" <<<"$2" || exit 1; done' _ "$ROOT/install/lib/instance.sh" "$MW"
+check "the quick start says the home has a CLAUDE.md that describes the layout" grep -qF '**A `CLAUDE.md` in its home** (`/data/work/agent/CLAUDE.md`) that describes that layout' <<<"$MW"
+check "the home's CLAUDE.md comes from the image's persona/agent-workspace.md" bash -c 'test -s "$1/persona/agent-workspace.md" && grep -qF "persona\", \"agent-workspace.md\"" "$1/docker/gp/setup.mjs"' _ "$ROOT"
 
 # The installer options it shows are the installers'.
 for o in --name --relay --owner --updater; do

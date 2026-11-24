@@ -16,7 +16,11 @@
 //   .gp/update-asked.json      the versions the agent was asked about (once each)
 //   .gp/note-pending.json      the note last typed into claude, until a turn took it (watch.mjs)
 //   .gp/profile.json           the agent's profile the relay last took (gp profile)
-//   work/agent/            the instance's home, a git checkout with its manifest
+//   .gp/claude-defaults.json   the Claude Code settings the image set once (model, effort), and those it found set or the owner picked
+//   .gp/claude-md.json         the sha256 of the CLAUDE.md the image last wrote in the home
+//   work/                  the workspace root, in GHOST Protocol's layout (docs/layout.md):
+//   work/agent/            the instance's home, a git checkout with its manifest and a CLAUDE.md
+//   work/repos/, worktrees/, media/, desk/, scratch/   the layout's shared folders
 //   .config/ghost-protocol/agent.json   the instance's settings file (start's GP_SETTINGS)
 //   .local/state/ghost-protocol/agent/  start's own state (session id, turn, pane)
 import { join } from "node:path";
@@ -45,7 +49,10 @@ export const L = {
   notePending: join(GPDIR, "note-pending.json"),
   previousVersion: join(GPDIR, "previous-version"),
   profile: join(GPDIR, "profile.json"),
+  claudeDefaults: join(GPDIR, "claude-defaults.json"),
+  claudeMdState: join(GPDIR, "claude-md.json"),
   home: join(ROOT, NAME),
+  claudeMd: join(ROOT, NAME, "CLAUDE.md"),
   manifest: join(ROOT, NAME, ".ghost-protocol", "instance.toml"),
   settings: join(DATA, ".config", "ghost-protocol", `${NAME}.json`),
   startState: join(DATA, ".local", "state", "ghost-protocol", NAME),

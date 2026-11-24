@@ -114,6 +114,24 @@ On macOS and Windows, containers run inside Docker Desktop's virtual machine, an
 - **Windows** needs Docker Desktop with its WSL 2 backend. Windows Server cannot run Docker Desktop. The install passes no environment file, so Windows line endings cause no trouble.
 - **macOS**: Apple silicon and Intel are both covered; the image is built for `linux/amd64` and `linux/arm64`, and Docker picks the right one.
 
+## The model and the workspace
+
+Every agent, made the Buzz way or the terminal way, starts the same:
+
+- **Claude Opus 5.5 at medium effort** (`claude-opus-5-5`), unless you pick otherwise. To see what it runs, and to pick another model or effort:
+
+  ```sh
+  docker exec gp-my-agent gp claude model
+  docker exec gp-my-agent gp claude model claude-sonnet-5-5 --effort high
+  docker exec gp-my-agent gp claude model --effort low
+  ```
+
+  A model is a full Claude Code model id, such as `claude-sonnet-5-5` or `claude-opus-5-5[1m]`. An alias such as `opus` is refused, since Claude Code reads a model's effort under its full id. An effort is `low`, `medium`, `high`, `xhigh` or `max`, and `default` for either gives Claude Code's own default. Claude Code keeps an effort for each model, so an effort needs a model: the one you name with it, or else the one set now. `--effort` alone fails with `effort-needs-model` when no model is set (after `gp claude model default`, say): name one, as in `gp claude model claude-opus-5-5 --effort low`. The agent restarts to use it and goes on with the same conversation. Your pick lives in the data volume, in Claude Code's own settings (`model`, and `modelSettings.<model>.effortLevel`, in `/data/.claude/settings.json`), so it survives restarts and updates: GHOST Protocol sets its defaults once and never changes a model or effort you picked.
+- **GHOST Protocol's workspace layout**, in the data volume under `/data/work`: the agent's home `/data/work/agent`, where it runs, and beside it `repos/` (one clone of each repo it works on), `worktrees/` (one worktree per branch), `media/` (large files), `desk/` (scripts waiting for you to run them) and `scratch/` (throwaway files). The agent may read and edit them all without asking. [`docs/layout.md`](layout.md) has the whole layout.
+- **A `CLAUDE.md` in its home** (`/data/work/agent/CLAUDE.md`) that describes that layout, so it knows where things go from its first message. Edit it as you like: once it is edited, or if you put your own there, GHOST Protocol never replaces it. An unedited copy is brought up to date by a newer version.
+
+An agent made by an older version gets all three at its first start on the new version, and keeps its memory, its files and any model or `CLAUDE.md` you had set.
+
 ## Update
 
 A release is a new image. Your data (the key, the sign-in, the agent's memory) lives in the volume, so it is kept.

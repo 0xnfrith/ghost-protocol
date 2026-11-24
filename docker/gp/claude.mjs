@@ -13,12 +13,31 @@
 //                      is tried once (one short claude -p) before it is kept
 //                      in the volume (0600); GP_CLAUDE=active, or
 //                      GP_ERROR=claude-token-invalid. Never printed.
-// After a new sign-in the agent's claude restarts to use it.
+//   gp claude model    the model and effort the agent's claude runs at:
+//                      GP_CLAUDE_MODEL=<model> and GP_CLAUDE_EFFORT=<level>
+//                      ("default" for Claude Code's own default). The image
+//                      sets claude-opus-5-5 at medium once (setup.mjs).
+//   gp claude model <model> [--effort <level>]
+//   gp claude model --effort <level>
+//                      picks others, in Claude Code's own settings
+//                      (~/.claude/settings.json: model, and the effort per
+//                      model, modelSettings.<model>.effortLevel), which the
+//                      image then never changes. <model> is a full model id
+//                      such as claude-sonnet-5-5 (or claude-opus-5-5[1m]); an
+//                      alias such as opus is refused, since Claude Code reads
+//                      the effort under the full id and a full-id entry beats
+//                      an alias's. <level> is low, medium, high, xhigh or max;
+//                      "default" for either takes the key out. An effort alone
+//                      is for the model set now, which must be a full id. A
+//                      settings file that is not a JSON object is refused, and
+//                      nothing is written.
+// After a new sign-in or model the agent's claude restarts to use it, and
+// resumes its conversation.
 import { spawn, execFile } from "node:child_process";
-import { unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { GpError } from "./out.mjs";
 import { L, PLUGIN_ID } from "./layout.mjs";
-import { writeFileAtomic } from "./setup.mjs";
+import { CLAUDE_DEFAULTS, dropEffort, effortOf, readJson, setEffort, writeFileAtomic, writeJson } from "./setup.mjs";
 import { claudeActive } from "./status.mjs";
 import { firstLine, readStdin, restartAgent } from "./agentctl.mjs";
 
@@ -153,9 +172,86 @@ export function login(out, { claude = CLAUDE(), stdin = process.stdin, active = 
   });
 }
 
+// A full model id, with an optional date (-YYYYMMDD or @YYYYMMDD) and [1m].
+// Claude Code reads the effort under the plain id (group 1): an entry under
+// claude-opus-5-5[1m] loses to one under claude-opus-5-5, and so does an alias's.
+const MODEL_ID = /^(claude-[a-z0-9]+(?:-[a-z0-9]+)*?)(?:-\d{8}|@\d{8})?(?:\[1m\])?$/;
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+/** The modelSettings key Claude Code reads a model's effort from, or null for what is not a full model id. */
+export function effortKey(m) {
+  const r = typeof m === "string" && m.length <= 100 ? MODEL_ID.exec(m) : null;
+  return r ? r[1] : null;
+}
+
+/** ~/.claude/settings.json, strictly: {} when there is none, else a JSON object, or a bad-settings refusal. */
+function readSettingsStrict() {
+  if (!existsSync(L.claudeSettings)) return {};
+  let v;
+  try {
+    const text = readFileSync(L.claudeSettings, "utf8");
+    v = text.trim() ? JSON.parse(text) : {};
+  } catch {
+    throw new GpError("bad-settings", `${L.claudeSettings} is not valid JSON; fix it by hand first (nothing was written)`);
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new GpError("bad-settings", `${L.claudeSettings} is not a JSON object; fix it by hand first (nothing was written)`);
+  return v;
+}
+
+/** gp claude model [<model>] [--effort <level>]: shows, or picks, the model and effort. */
+export function model(argv, out, { restart = restartAgent, now = new Date() } = {}) {
+  let want;
+  let effort;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--effort") {
+      if (effort !== undefined || i + 1 >= argv.length) throw new GpError("usage", "usage: gp claude model [<model>] [--effort <level>]", 2);
+      effort = argv[++i];
+    } else if (want === undefined && !a.startsWith("-")) want = a;
+    else throw new GpError("usage", "usage: gp claude model [<model>] [--effort <level>]", 2);
+  }
+  if (want !== undefined && want !== "default" && !effortKey(want))
+    throw new GpError("bad-model", `use a full model id such as claude-sonnet-5-5 or ${CLAUDE_DEFAULTS.model}, not ${want.slice(0, 100)} (an alias is not taken: Claude Code reads the effort under the full id)`);
+  if (effort !== undefined && effort !== "default" && !EFFORTS.includes(effort)) throw new GpError("bad-effort", `the effort is one of ${EFFORTS.join(", ")}, or default`);
+  const s = readSettingsStrict();
+  if (s.modelSettings !== undefined && (typeof s.modelSettings !== "object" || s.modelSettings === null || Array.isArray(s.modelSettings)))
+    throw new GpError("bad-settings", `modelSettings in ${L.claudeSettings} is not an object; fix it by hand first`);
+  // Claude Code keeps an effort per model, under its plain id: the model named,
+  // else the one set now.
+  const target = effortKey(want !== undefined && want !== "default" ? want : want === undefined ? s.model : undefined);
+  if (effort !== undefined && !target)
+    throw new GpError("effort-needs-model", `Claude Code keeps an effort per model: name a full model id too, for example gp claude model ${CLAUDE_DEFAULTS.model} --effort ${effort}`);
+  if (want !== undefined || effort !== undefined) {
+    const seen = readJson(L.claudeDefaults);
+    if (want !== undefined) {
+      if (want === "default") delete s.model;
+      else s.model = want;
+      // The owner's pick: the image's setup never sets this again.
+      seen.model = { owner: want, at: now.toISOString() };
+    }
+    if (effort !== undefined) {
+      if (effort === "default") dropEffort(s, target);
+      else setEffort(s, target, effort);
+      if (target === CLAUDE_DEFAULTS.model) seen.effort = { owner: effort, at: now.toISOString() };
+    }
+    writeJson(L.claudeSettings, s);
+    writeJson(L.claudeDefaults, seen);
+  }
+  out.kv("CLAUDE_MODEL", s.model ?? "default");
+  // For a model set by hand as an alias, the effort Claude Code uses cannot be told from here.
+  const shown = s.model === undefined ? "default" : effortKey(s.model) ? effortOf(s, effortKey(s.model)) || "default" : "unknown";
+  out.kv("CLAUDE_EFFORT", shown);
+  if ((want !== undefined || effort !== undefined) && restart()) out.log("the agent restarts to use it, and resumes its conversation");
+  return 0;
+}
+
 export async function claude(argv, out) {
   const [sub, ...rest] = argv;
-  if (!["status", "login", "token"].includes(sub) || rest.length) throw new GpError("usage", "usage: gp claude status | login | token", 2);
+  if (sub === "model") {
+    out.header();
+    return model(rest, out);
+  }
+  if (!["status", "login", "token"].includes(sub) || rest.length) throw new GpError("usage", "usage: gp claude status | login | token | model [<model>] [--effort <level>]", 2);
   out.header();
   if (sub === "status") {
     out.kv("CLAUDE", claudeActive() ? "active" : "not-active");

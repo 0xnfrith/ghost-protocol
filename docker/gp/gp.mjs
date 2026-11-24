@@ -6,7 +6,7 @@
 //   gp status [--json]             the agent's state (status.mjs)
 //   gp init --name --relay --owner set up the agent in its volume; gp slug <name> (init.mjs)
 //   gp auth-tag set|show           the owner's tag, on stdin (authtag.mjs)
-//   gp claude status|login|token   the Claude sign-in (claude.mjs)
+//   gp claude status|login|token   the Claude sign-in; gp claude model, its model and effort (claude.mjs)
 //   gp update request|rollback|... updates and the way back (update.mjs)
 //   gp updater --target <container> the update helper, in a container of its own (updater.mjs)
 //   gp profile publish [--retry]   the agent's own Buzz profile, its name (profile.mjs)

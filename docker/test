@@ -4,6 +4,7 @@
 # Usage: docker/test            (from the repository root; tool-tests runs it)
 #   GP_TEST_IMAGE=<ref>  check an image already built instead of building one
 #   GP_TEST_KEEP=1       keep the image and volumes it made
+#   GP_TEST_OLD_IMAGE=<ref>  also start a volume an older release made with this image
 #
 # It builds docker/Dockerfile from the repository root, then runs the image's
 # own commands in throwaway containers and volumes, and removes them on exit.
@@ -39,6 +40,42 @@ check() { local n="$1"; shift; if "$@"; then pass "$n"; else fail "$n"; fi; }
 volume() { v="$run_id-$1"; volumes+=("$v"); }
 # run_in <volume> <args...>: one throwaway container of the image on that volume.
 run_in() { local v="$1"; shift; docker run --rm -i -v "$v:/data" "$IMAGE" "$@"; }
+
+# How a new agent starts (docker/gp/setup.mjs), in a container that runs:
+#   1. the model and effort: claude-opus-5-5 at medium in Claude Code's user
+#      settings (model, and the effort per model, modelSettings.<model>.effortLevel),
+#      and what claude itself reads from them (/context, offline);
+#   2. GHOST Protocol's workspace layout around the home (docs/layout.md): the
+#      shared folders, the worktree hook, the folders in additionalDirectories;
+#   3. a CLAUDE.md in the home that describes the layout, which claude loads.
+# settings_is <container> <jq filter>: the filter holds for ~/.claude/settings.json.
+settings_is() { docker exec "$1" jq -e "$2" /data/.claude/settings.json >/dev/null 2>&1; }
+# shellcheck disable=SC2016 # $d expands in the container
+layout_is_there() {
+    docker exec "$1" sh -c 'for d in repos worktrees media desk scratch; do [ -d "/data/work/$d" ] && [ ! -L "/data/work/$d" ] || exit 1; done' &&
+        settings_is "$1" '.permissions.additionalDirectories == ["/data/work/repos","/data/work/worktrees","/data/work/media","/data/work/desk","/data/work/scratch"]' &&
+        settings_is "$1" '.hooks.WorktreeCreate[0].hooks[0].command == "/opt/ghost-protocol/install/layout/worktree-hook create --root /data/work" and .hooks.WorktreeRemove[0].hooks[0].command == "/opt/ghost-protocol/install/layout/worktree-hook remove --root /data/work"'
+}
+# shellcheck disable=SC2016 # $d expands in the container
+claude_md_is_there() {
+    docker exec "$1" sh -c 'f=/data/work/agent/CLAUDE.md; grep -qx "# Your workspace" "$f" && ! grep -q "{{" "$f" && for d in repos/ worktrees/ media/ desk/ scratch/; do grep -qF "\`/data/work/$d" "$f" || exit 1; done && grep -qF "\`/data/work/agent/\`" "$f"'
+}
+# context_of <container>: claude's own /context in the home, offline (no
+# plugin, no MCP server, a made-up token): the model and the memory files it loads.
+context_of() {
+    docker exec -u node -w /data/work/agent -e CLAUDE_CODE_OAUTH_TOKEN=not-a-real-token "$1" timeout 90 \
+        claude -p /context --strict-mcp-config --settings '{"enabledPlugins":{"ghost-protocol@ghost-protocol":false}}' 2>/dev/null
+}
+# starts_right <container> <how it was made>
+starts_right() {
+    local ctx
+    check "$2: Claude Code's settings say claude-opus-5-5 at medium effort" settings_is "$1" '.model == "claude-opus-5-5" and .modelSettings["claude-opus-5-5"].effortLevel == "medium"'
+    check "$2: the workspace layout: the shared folders, the worktree hook, the folders in additionalDirectories" layout_is_there "$1"
+    check "$2: the home's CLAUDE.md describes the layout" claude_md_is_there "$1"
+    ctx="$(context_of "$1")" || true
+    check "$2: claude's /context: the model is claude-opus-5-5" grep -q 'Model:\*\* claude-opus-5-5' <<<"$ctx"
+    check "$2: claude's /context: it loads the home's CLAUDE.md" grep -q '| Project | /data/work/agent/CLAUDE.md |' <<<"$ctx"
+}
 
 # Shell scripts first: they need no image.
 if command -v shellcheck >/dev/null 2>&1; then
@@ -184,6 +221,70 @@ out2="$(GP_IMAGE="$IMAGE" GP_NO_PULL=1 sh docker/get.sh --name "$name" --relay w
 check "get.sh again keeps the helper an earlier install chose" test "$(docker inspect -f '{{.State.Running}}' "gp-$slug.updater" 2>/dev/null)" = true
 check "get.sh still prints only the key" test "$out2" = "$out"
 check "get.sh refuses a missing setting" sh -c "! GP_IMAGE='$IMAGE' GP_NO_PULL=1 sh docker/get.sh --name x >/dev/null 2>&1"
+for _ in $(seq 1 30); do docker exec "gp-$slug" grep -q '^needs-claude ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+starts_right "gp-$slug" "get.sh"
+
+# The Buzz Desktop path (This computer): init, then the agent's container with
+# nothing else, as the plugin runs them; the sign-in stands in as a file.
+# (Not $out: the get.sh lines below still read the agent's key from it.)
+volume desk
+d="$run_id-desk"
+containers+=("$d")
+run_in "$v" init --name "Desk Test" --relay ws://127.0.0.1:9 --owner "$owner" >/dev/null
+docker run -d --restart unless-stopped --name "$d" -v "$v:/data" "$IMAGE" >/dev/null
+for _ in $(seq 1 30); do docker exec "$d" grep -q '^needs-claude ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+starts_right "$d" "the Buzz Desktop path"
+# The status line is told what the running claude uses: a probe writes it down.
+# (Medium is also what this claude picks for opus with a made-up sign-in, so the
+# settings check above and the owner's pick below are what show the effort is
+# the image's: claude follows its settings to high.)
+# probe <model id> <effort>: the running claude's status line names both.
+probe() { local _; for _ in $(seq 1 90); do docker exec "$d" jq -e --arg m "$1" --arg e "$2" '.model.id == $m and .effort.level == $e' /data/.gp/statusline.json >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+# shellcheck disable=SC2016 # expands in the container
+docker exec -u node "$d" sh -c 'f=/data/.claude/settings.json; jq ".statusLine = {\"type\": \"command\", \"command\": \"cat > /data/.gp/statusline.json; echo probe\"}" "$f" > "$f.t" && mv "$f.t" "$f" && printf "not-a-real-token\n" > /data/.gp/claude-token'
+check "the Buzz Desktop path: the running claude is claude-opus-5-5 at medium (its status line)" probe claude-opus-5-5 medium
+mo="$(docker exec "$d" gp claude model)" || true
+check "gp claude model shows claude-opus-5-5 at medium" test "$mo" = "$(printf 'GP_INTERFACE=1\nGP_CLAUDE_MODEL=claude-opus-5-5\nGP_CLAUDE_EFFORT=medium')"
+docker exec -u node "$d" rm -f /data/.gp/statusline.json
+mo="$(docker exec "$d" gp claude model claude-sonnet-5-5 --effort high 2>/dev/null)" || true
+check "gp claude model picks another model and effort" test "$mo" = "$(printf 'GP_INTERFACE=1\nGP_CLAUDE_MODEL=claude-sonnet-5-5\nGP_CLAUDE_EFFORT=high')"
+check "the owner's pick reaches the running claude (it restarts)" probe claude-sonnet-5-5 high
+docker restart "$d" >/dev/null
+for _ in $(seq 1 30); do docker exec "$d" grep -q '^running ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+check "a restart keeps the owner's pick" settings_is "$d" '.model == "claude-sonnet-5-5" and .modelSettings["claude-sonnet-5-5"].effortLevel == "high"'
+# An alias is refused: Claude Code reads the effort under the full id, and the
+# image's own entry for it would win over the alias's. The 1M-context spelling
+# is taken, its effort written under the plain id, and claude runs at it.
+mo="$(docker exec "$d" gp claude model opus --effort high 2>/dev/null)" || true
+check "gp claude model refuses an alias, and changes nothing" sh -c "printf '%s\n' \"\$1\" | grep -qx 'GP_ERROR=bad-model' && docker exec '$d' jq -e '.model == \"claude-sonnet-5-5\"' /data/.claude/settings.json >/dev/null" - "$mo"
+docker exec -u node "$d" rm -f /data/.gp/statusline.json
+mo="$(docker exec "$d" gp claude model 'claude-opus-5-5[1m]' --effort low 2>/dev/null)" || true
+check "gp claude model takes the 1M-context id, with its effort under the plain id" sh -c "[ \"\$1\" = \"\$(printf 'GP_INTERFACE=1\nGP_CLAUDE_MODEL=claude-opus-5-5[1m]\nGP_CLAUDE_EFFORT=low')\" ] && docker exec '$d' jq -e '.modelSettings[\"claude-opus-5-5\"].effortLevel == \"low\" and (.modelSettings | has(\"claude-opus-5-5[1m]\") | not)' /data/.claude/settings.json >/dev/null" - "$mo"
+check "the running claude reads that effort for the 1M-context model" probe claude-opus-5-5 low
+docker exec -u node "$d" sh -c 'printf "\n- a note of my own\n" >> /data/work/agent/CLAUDE.md'
+docker restart "$d" >/dev/null
+for _ in $(seq 1 30); do docker exec "$d" grep -q '^running ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+check "a restart keeps an edited CLAUDE.md" docker exec "$d" grep -qx -- '- a note of my own' /data/work/agent/CLAUDE.md
+docker rm -f "$d" >/dev/null
+
+# An older version's volume (GP_TEST_OLD_IMAGE=<an older release's image>,
+# when one is given): made and started by that image, then started by this
+# one, it gets the defaults, the layout and CLAUDE.md, and keeps the rest.
+if [ -n "${GP_TEST_OLD_IMAGE:-}" ]; then
+    volume old
+    o="$run_id-old"
+    containers+=("$o")
+    docker run --rm -v "$v:/data" "$GP_TEST_OLD_IMAGE" init --name "Old Test" --relay ws://127.0.0.1:9 --owner "$owner" >/dev/null
+    docker run -d --name "$o" -v "$v:/data" "$GP_TEST_OLD_IMAGE" >/dev/null
+    for _ in $(seq 1 30); do docker exec "$o" grep -q '^needs-claude ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+    docker exec -u node "$o" sh -c 'printf "%s\n" "- an old task" > /data/work/agent/tasks.md'
+    docker rm -f "$o" >/dev/null
+    docker run -d --name "$o" -v "$v:/data" "$IMAGE" >/dev/null
+    for _ in $(seq 1 30); do docker exec "$o" grep -q '^needs-claude ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+    starts_right "$o" "an older version's volume, upgraded"
+    check "an older version's volume keeps the agent's own files and its plugin options" sh -c "docker exec '$o' grep -qx -- '- an old task' /data/work/agent/tasks.md && docker exec '$o' jq -e '.pluginConfigs[\"ghost-protocol@ghost-protocol\"].options.unattended == \"on\"' /data/.claude/settings.json >/dev/null"
+    docker rm -f "$o" >/dev/null
+fi
 
 # After start, with no terminal: the owner's tag and the Claude sign-in.
 agent="${out#GP_AGENT_PUBKEY=}"

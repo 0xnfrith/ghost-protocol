@@ -18,6 +18,8 @@ An instance's machine keeps its work under one folder, the **root**. The instanc
 - **Instance** is the instance's repo and its setup: they decide what goes there.
 - **Operator** is the person who runs the instance.
 
+**In the container** (the image, made the Buzz way or with `get.sh`) the root is `/data/work` and the home `/data/work/agent`, in the data volume. The image runs the installer's own layout step at every start: the shared folders, the worktree hook and the folders in `permissions.additionalDirectories` (below), each left as it is once there. It also writes a `CLAUDE.md` in the home that describes the layout, and never replaces one the owner wrote or edited. The home there is the agent's own working folder, with no remote: its task list and notes live in it.
+
 An instance's name can't be one of the shared folders' names (`repos`, `worktrees`, `media`, `desk`, `scratch`). The root can't be the home folder or a folder above it.
 
 ## The rules
