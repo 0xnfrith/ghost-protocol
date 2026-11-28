@@ -10,6 +10,8 @@
 //   gp update request|rollback|... updates and the way back (update.mjs)
 //   gp updater --target <container> the update helper, in a container of its own (updater.mjs)
 //   gp profile publish [--retry]   the agent's own Buzz profile, its name (profile.mjs)
+//   gp allow list|add|remove       the senders besides the owner, in a file the adapter reads again (allow.mjs)
+//   gp hosted start|sync|report    an agent made by an order service: its boot, config, skills pack and status (hosted.mjs)
 import { GpError, makeOut } from "./out.mjs";
 
 const COMMANDS = {
@@ -22,6 +24,8 @@ const COMMANDS = {
   update: async (argv, out) => (await import("./update.mjs")).update(argv, out),
   updater: async (argv, out) => (await import("./updater.mjs")).updater(argv, out),
   profile: async (argv, out) => (await import("./profile.mjs")).profile(argv, out),
+  allow: async (argv, out) => (await import("./allow.mjs")).allow(argv, out),
+  hosted: async (argv, out) => (await import("./hosted.mjs")).hosted(argv, out),
 };
 
 export async function main(argv, out = makeOut()) {

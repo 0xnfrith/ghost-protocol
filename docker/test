@@ -375,6 +375,19 @@ check "a version that fails its check: the handoff note says the update failed" 
 check "and the helper went back to 1.0.0" wait_for version '"1.0.0"' 30
 check "after the failed update gp status says update-failed" test "$(status_field state) $(status_field error.code)" = '"error" "update-failed"'
 
+# A hosted container (docker/gp/hosted.mjs) whose order service does not answer: the entrypoint says why and goes to error, with no agent key made. It sleeps before it
+# exits, so a restart policy does not spin. And what gp hosted and gp allow say where no order service made the agent.
+volume hosted
+h="$run_id-hosted"
+containers+=("$h")
+docker run -d --name "$h" -v "$v:/data" -e GP_BOOT_TOKEN="$(printf '%032d' 0 | tr 0 a)" -e GP_ORDER_URL=http://127.0.0.1:9 "$IMAGE" >/dev/null
+for _ in $(seq 1 30); do docker exec "$h" grep -q '^error ' /data/.gp/agent-state 2>/dev/null && break; sleep 1; done
+check "a hosted container whose order service does not answer ends in error and says why" grep -q "hosted: order-unreachable" <<<"$(docker logs "$h" 2>&1)"
+check "and made no agent key" docker exec "$h" test ! -e /data/.gp/agent.key
+volume plain
+check "gp hosted start does nothing where no order service made the agent" grep -qx 'GP_HOSTED=none' <<<"$(run_in "$v" gp hosted start)"
+check "gp allow list says there is no owner yet" grep -qx 'GP_OWNER=none' <<<"$(run_in "$v" gp allow list)"
+
 if command -v pwsh >/dev/null 2>&1; then
     # shellcheck disable=SC2016 # PowerShell's own variables
     check "get.ps1 parses" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path docker/get.ps1), [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'

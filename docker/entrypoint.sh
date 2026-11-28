@@ -11,6 +11,8 @@
 #   shell    a bash shell.
 #   gp …     one of the image's commands (docker/gp/gp.mjs).
 #   init …   set up the agent in the volume: gp init (docker/gp/init.mjs).
+#   A container started with GP_BOOT_TOKEN and GP_ORDER_URL is an agent an order
+#            service made: agent first runs gp hosted start (docker/gp/hosted.mjs).
 #   updater --target <container>   the update helper (docker/gp/updater.mjs),
 #            in a container of its own with the Docker socket. It alone runs as
 #            root; everything else drops to the user node first.
@@ -49,6 +51,18 @@ esac
 umask 077
 log "starting (claude $(claude --version 2>/dev/null | head -1))"
 state starting
+# A container an order service made (docker/gp/hosted.mjs) starts with GP_BOOT_TOKEN and GP_ORDER_URL and nothing else. The first start spends the token and keeps the
+# agent's key in the volume; every start pulls the config and the skills pack. With neither set and no earlier boot it prints GP_HOSTED=none and changes nothing.
+if ! h=$(gp hosted start); then
+    state error
+    log "hosted: $(printf '%s\n' "$h" | sed -n 's/^GP_ERROR=//p' | head -1): $(printf '%s\n' "$h" | sed -n 's/^GP_ERROR_MESSAGE=//p' | head -1)"
+    # Slowly, so a container that restarts on exit does not spin.
+    sleep 30
+    exit 2
+fi
+unset GP_BOOT_TOKEN GP_ORDER_URL # hosted.json keeps the address
+hosted=0
+[ -e "$GPDIR/hosted.json" ] && hosted=1
 r=$(node /opt/gp/setup.mjs) || true
 if [ "$r" != ok ]; then
     state "error"
@@ -94,14 +108,22 @@ fi
 gp update watch 2>>"$GPDIR/update-watch.log" >/dev/null &
 watch_pid=$!
 
+# A hosted agent pulls its config again every few minutes (new senders, a new pack) and tells its order service how it is: error after a failed pull, online after a good one.
+sync_pid=""
+if [ "$hosted" = 1 ]; then
+    ( while :; do sleep 300; gp hosted heartbeat >/dev/null 2>&1 || true; done ) &
+    sync_pid=$!
+fi
+
 stopping=0
 pid=""
 # shellcheck disable=SC2317,SC2329 # run by the trap
 stop() {
     stopping=1
     log "stopping"
+    [ "$hosted" = 0 ] || timeout 5 gp hosted report stopping >/dev/null 2>&1 || true
     [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
-    kill -TERM "$watch_pid" "$profile_pid" 2>/dev/null || true
+    kill -TERM "$watch_pid" "$profile_pid" ${sync_pid:+"$sync_pid"} 2>/dev/null || true
     tmux -L "$NAME" kill-server 2>/dev/null || true
 }
 trap stop TERM INT
@@ -113,6 +135,7 @@ while [ "$stopping" = 0 ]; do
     if [ -s "$GPDIR/claude-token" ]; then CLAUDE_CODE_OAUTH_TOKEN=$(cat "$GPDIR/claude-token"); export CLAUDE_CODE_OAUTH_TOKEN; fi
     if [ -s "$GPDIR/auth-tag" ]; then BUZZ_AUTH_TAG=$(cat "$GPDIR/auth-tag"); export BUZZ_AUTH_TAG; fi
     state running
+    [ "$hosted" = 0 ] || gp hosted report online >/dev/null 2>&1 &
     began=$(date +%s)
     "$GP_ROOT/install/service/start" --root "$ROOT" --name "$NAME" &
     pid=$!

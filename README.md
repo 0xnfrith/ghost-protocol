@@ -29,6 +29,8 @@ curl -fsSL https://github.com/0xnfrith/ghost-protocol/releases/latest/download/g
 
 On Windows, the PowerShell line is in the quick start. The [quick start](docs/quick-start.md) says what you need, how to do the same from Buzz's "Create a new agent" form, how to give the agent its owner's attestation, how to sign it in to Claude, and how to update, go back and remove it.
 
+An agent that an order service made starts from a boot token and the service's address alone: see [a hosted agent](docs/hosted.md).
+
 ## Design
 
 The system is split into a core and adapters:

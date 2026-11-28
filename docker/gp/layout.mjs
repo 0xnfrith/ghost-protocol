@@ -18,6 +18,9 @@
 //   .gp/profile.json           the agent's profile the relay last took (gp profile)
 //   .gp/claude-defaults.json   the Claude Code settings the image set once (model, effort), and those it found set or the owner picked
 //   .gp/claude-md.json         the sha256 of the CLAUDE.md the image last wrote in the home
+//   .gp/allowlist.json     the senders besides the owner, which the adapter reads again when it changes (gp allow, allow.mjs)
+//   .gp/hosted.json        {order_url, agent_pubkey, booted_at}: the agent was made by an order service (gp hosted, hosted.mjs)
+//   .gp/pack.json          {name, sha256, skills, installed_at}: the skills pack that is installed (pack.mjs)
 //   work/                  the workspace root, in GHOST Protocol's layout (docs/layout.md):
 //   work/agent/            the instance's home, a git checkout with its manifest and a CLAUDE.md
 //   work/repos/, worktrees/, media/, desk/, scratch/   the layout's shared folders
@@ -51,6 +54,10 @@ export const L = {
   profile: join(GPDIR, "profile.json"),
   claudeDefaults: join(GPDIR, "claude-defaults.json"),
   claudeMdState: join(GPDIR, "claude-md.json"),
+  allowlist: join(GPDIR, "allowlist.json"),
+  hosted: join(GPDIR, "hosted.json"),
+  pack: join(GPDIR, "pack.json"),
+  skills: join(DATA, ".claude", "skills"),
   home: join(ROOT, NAME),
   claudeMd: join(ROOT, NAME, "CLAUDE.md"),
   manifest: join(ROOT, NAME, ".ghost-protocol", "instance.toml"),

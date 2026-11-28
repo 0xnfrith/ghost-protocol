@@ -194,6 +194,19 @@ check "the relay setting: no restart needed, the agent gets in within about a mi
 check "AGENTS.md: no restart needed, the agent gets in within about a minute" grep -qF 'then restart the agent, or wait about a minute: `docker restart gp-<name>`' "$AGENTS"
 check "What you need: your own key must be a member of the relay" grep -qF 'Your own key, which signs that attestation, must be a member of the relay' <<<"$NEED"
 
+# docs/hosted.md: the commands it shows exist, the values it names are the ones the code reads, and the limits it states are the code's.
+HOSTED=$ROOT/docs/hosted.md
+check "docs/hosted.md is there" test -f "$HOSTED"
+for c in $(grep -oE '(docker exec gp-agent gp|^gp) [a-z-]+' "$HOSTED" | awk '{print $NF}' | sort -u); do
+  check "hosted.md: gp has the command '$c'" grep -qx "$c" <<<"$cmds"
+done
+for w in start sync report; do check "hosted.md: gp hosted $w exists" grep -qF "\"$w\"" "$ROOT/docker/gp/hosted.mjs"; done
+for w in list add remove; do check "hosted.md: gp allow $w exists" grep -qF "\"$w\"" "$ROOT/docker/gp/allow.mjs"; done
+for v in GP_BOOT_TOKEN GP_ORDER_URL; do check "hosted.md: $v is read by gp hosted" grep -qF "env.$v" "$ROOT/docker/gp/hosted.mjs"; done
+check "hosted.md: the pack's limits are the code's" bash -c 'grep -qF "64 * 2 ** 20, unpacked: 128 * 2 ** 20, file: 16 * 2 ** 20, files: 2000, depth: 8" "$1" && grep -qF "64 MiB downloaded, 128 MiB unpacked, 2,000 files, 16 MiB in a file or 8 folders deep" "$2"' _ "$ROOT/docker/gp/pack.mjs" "$HOSTED"
+check "hosted.md: the entrypoint runs gp hosted start" grep -qF 'gp hosted start' "$ROOT/docker/entrypoint.sh"
+check "hosted.md: the entrypoint unsets both values, as the doc says" bash -c 'grep -qF "unset GP_BOOT_TOKEN GP_ORDER_URL" "$1" && grep -qF "unsets both values" "$2"' _ "$ROOT/docker/entrypoint.sh" "$HOSTED"
+
 # The public words: scan the file in a temporary repository.
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -201,11 +214,12 @@ if command -v python3 >/dev/null && [ -x "$ROOT/tools/publish/scan" ]; then
   git init -q -b main "$T/r"
   mkdir -p "$T/r/docs"
   cp "$DOC" "$T/r/docs/"
+  cp "$HOSTED" "$T/r/docs/"
   cp "$README" "$T/r/"
   [ -f "$AGENTS" ] && cp "$AGENTS" "$T/r/"
   git -C "$T/r" add -A
   git -C "$T/r" -c user.name=t -c user.email=t@example.com commit -q -m t
-  check "the quick start, README.md and AGENTS.md pass the scan's public words" bash -c "cd '$T/r' && '$ROOT/tools/publish/scan' --public-only tree HEAD"
+  check "the quick start, hosted.md, README.md and AGENTS.md pass the scan's public words" bash -c "cd '$T/r' && '$ROOT/tools/publish/scan' --public-only tree HEAD"
 fi
 
 echo "$pass passed, $fail failed"

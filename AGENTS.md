@@ -53,6 +53,7 @@ The quick start's [model and workspace](docs/quick-start.md#the-model-and-the-wo
 | What | Where |
 |---|---|
 | The quick start: what you need, the Buzz way, the terminal way, the relay setting, update, remove | this repository, [`docs/quick-start.md`](docs/quick-start.md) |
+| A hosted agent: what an order service's container does at its start, what it refuses, who may speak to it, its skills pack | this repository, [`docs/hosted.md`](docs/hosted.md) |
 | This repository's overview and the rest of GHOST Protocol | this repository, [`README.md`](README.md) |
 | The plugin: install, the create form, the agent's tab, the Claude guide, what was and was not checked | [0xnfrith/buzz-plugins, `plugins/ghost-protocol/README.md`](https://github.com/0xnfrith/buzz-plugins/tree/main/plugins/ghost-protocol) |
 | How to add any plugin to Buzz, and the list of plugins | [0xnfrith/buzz-plugins, `README.md`](https://github.com/0xnfrith/buzz-plugins#readme) |

@@ -15,7 +15,7 @@
 // The agent's settings come from .gp/config.json (init writes it). For a start
 // with an env file instead, the older way, these seed the volume first:
 //   GP_RELAY_KEY (the agent's secret key), BUZZ_RELAY_URL, BUZZ_ALLOWED_PUBKEYS
-//   (its first key is the owner), BUZZ_AUTH_TAG, CLAUDE_CODE_OAUTH_TOKEN, GP_NAME.
+//   (its first key is the owner, the others go in the allowlist file), BUZZ_AUTH_TAG, CLAUDE_CODE_OAUTH_TOKEN, GP_NAME.
 // Prints one line, "ok", or "error <reason>", and never a secret.
 import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -24,6 +24,7 @@ import { dirname, join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { DATA, L, NAME, ROOT, PLUGIN_ID } from "./layout.mjs";
 import { GP_ROOT } from "./paths.mjs";
+import { addLocal, ensureAllowlist } from "./allow.mjs";
 
 export { readJson, writeFileAtomic, writeJson } from "./files.mjs";
 
@@ -44,13 +45,20 @@ export function seedFromEnv(env) {
   const cfg = readJson(L.config);
   let changed = false;
   if (v("BUZZ_RELAY_URL")) (cfg.relay_url = v("BUZZ_RELAY_URL")), (changed = true);
-  if (v("BUZZ_ALLOWED_PUBKEYS")) (cfg.owner = v("BUZZ_ALLOWED_PUBKEYS").split(",")[0].trim()), (changed = true);
+  // The first key is the owner. The others are senders and go in the allowlist file (allow.mjs), never in the owner's place.
+  const keys = v("BUZZ_ALLOWED_PUBKEYS").split(",").map((k) => k.trim()).filter(Boolean);
+  if (keys.length) (cfg.owner = keys[0]), (changed = true);
   if (v("BUZZ_CHANNELS")) (cfg.channels = v("BUZZ_CHANNELS")), (changed = true);
   if (v("GP_NAME")) (cfg.name = v("GP_NAME")), (changed = true);
   if (changed) {
     cfg.name ??= "GHOST";
     cfg.slug = slugOf(cfg.name);
     writeJson(L.config, cfg);
+  }
+  if (keys.length > 1) {
+    ensureAllowlist();
+    for (const k of keys.slice(1)) if (!/^[0-9a-f]{64}$/.test(k)) note("BUZZ_ALLOWED_PUBKEYS: a key after the owner's is not 64 lower-case hex characters, and is left out");
+    else addLocal(k, cfg.owner);
   }
 }
 
@@ -62,6 +70,7 @@ export function pluginOptions(cfg) {
     buzz_channels: cfg.channels || "*",
     buzz_dm_messages: "all",
     buzz_allowed_pubkeys: cfg.owner,
+    buzz_allowlist_file: L.allowlist,
     buzz_trusted_pubkeys: cfg.owner,
     buzz_operator_pubkeys: cfg.owner,
     unattended: "on",
@@ -234,6 +243,7 @@ export function setup(env = process.env) {
   for (const d of [dirname(L.key), L.buzz, L.home, dirname(L.manifest), dirname(L.claudeSettings), L.startState]) mkdirSync(d, { recursive: true, mode: 0o700 });
   const cfg = readJson(L.config);
   if (!cfg.relay_url || !cfg.owner) return "error not set up: run init first (no relay or owner)";
+  ensureAllowlist();
   if (!existsSync(L.key)) return "error not set up: run init first (no agent key)";
 
   const cj = readJson(L.claudeJson);
